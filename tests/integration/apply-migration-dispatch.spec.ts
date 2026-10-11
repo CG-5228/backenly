@@ -4,13 +4,14 @@ import { prisma } from '@/lib/db/prisma'
 import { createProvisionedProject } from '@/lib/projects/provision'
 import { applyMigrationToMain } from '@/lib/mcp/apply-migration'
 
-// Only the external model is stubbed. All project rows, DDL and catalog reads
-// use PostgreSQL through the real migration dispatch and executor.
-jest.mock('@/lib/ai/openai-service', () => ({
-  getOpenAIClient: jest.fn(),
-  trackCompletionCost: jest.fn(),
+// Only the model call is stubbed, at the executor's own import of it. All
+// project rows, DDL and catalog reads use PostgreSQL through the real
+// migration dispatch and executor.
+jest.mock('@/lib/ai/llm/chat', () => ({
+  ...jest.requireActual('@/lib/ai/llm/chat'),
+  chat: jest.fn(),
 }))
-import { getOpenAIClient } from '@/lib/ai/openai-service'
+import { chat } from '@/lib/ai/llm/chat'
 
 let ownerId: string
 let projectId: string
@@ -48,14 +49,13 @@ afterAll(async () => {
 }, 60_000)
 
 it('returns the real DDL error, preserves rows and stops before the next statement without replanning', async () => {
-  const model = jest.mocked(getOpenAIClient)
+  const model = jest.mocked(chat)
   model.mockClear()
-  model.mockReturnValue({ chat: { completions: { create: jest.fn().mockResolvedValue({
-    choices: [{ message: { content: JSON.stringify({
-      action: 'CREATE_TABLE',
-      params: { tableName: 'replacement_table', columns: [{ name: 'body', type: 'TEXT' }] },
-    }) } }],
-  }) } } } as unknown as ReturnType<typeof getOpenAIClient>)
+  const replacement = {
+    action: 'CREATE_TABLE',
+    params: { tableName: 'replacement_table', columns: [{ name: 'body', type: 'TEXT' }] },
+  }
+  model.mockResolvedValue({ text: JSON.stringify(replacement), json: replacement } as unknown as Awaited<ReturnType<typeof chat>>)
 
   const statement = 'CREATE UNIQUE INDEX posts_title_unique ON posts (title)'
   const nextStatement = 'CREATE TABLE comments (body text)'
