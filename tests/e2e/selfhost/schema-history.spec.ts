@@ -34,10 +34,13 @@ test('shows either versions or a stated empty state, never a blank pane', async 
 })
 
 test('asks which version to inspect before showing a snapshot', async ({ page }) => {
-  // The right-hand pane must say what it wants rather than sitting empty.
+  // The right-hand pane must say what it wants rather than sitting empty. It
+  // says so whenever nothing is selected, with or without versions. Matching
+  // "the prompt or the empty list" instead found both on a deployment with no
+  // versions, which is a strict-mode failure that depended on whether an
+  // earlier test in the run had changed the schema.
   const prompt = page.getByText('Select a version to see the schema it captured.')
-  const empty = page.getByText('No schema versions yet')
-  await expect(prompt.or(empty)).toBeVisible({ timeout: 30_000 })
+  await expect(prompt).toBeVisible({ timeout: 30_000 })
 })
 
 test('rollback needs the version number typed, not just a click', async ({ page }) => {
