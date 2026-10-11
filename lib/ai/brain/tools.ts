@@ -328,6 +328,12 @@ export interface ToolDispatchContext {
    */
   agentSurface?: boolean
   /**
+   * Schema migrations are a declared sequence of typed actions. A failed step
+   * must be reported to the caller, not replaced with an LLM-generated action.
+   * Other dispatcher callers retain the executor's normal replanning default.
+   */
+  allowReplan?: boolean
+  /**
    * In-turn ledger of tables this turn has CREATED. Used to block the LLM
    * from calling fix_backend(target='table', tableName=X) immediately after
    * create_table(X) succeeded — that was the "Repairing table" loop where
@@ -3170,7 +3176,14 @@ async function runExecutor(
   const params = (ctx.destructiveConfirmed || ctx.mcpOwnerConfirmed)
     ? { ...(action.params || {}), confirmed: true }
     : action.params
-  const result = await executeAction({ ...action, params }, ctx.projectId, ctx.sessionToken)
+  const result = await executeAction(
+    { ...action, params },
+    ctx.projectId,
+    ctx.sessionToken,
+    0,
+    undefined,
+    ctx.allowReplan ?? true,
+  )
   if (result.success) {
     // Engine-side confirmation gate: stop the loop and surface the prompt to
     // the user. The model must NOT keep chaining tools after this — the next

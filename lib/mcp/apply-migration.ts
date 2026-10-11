@@ -245,6 +245,9 @@ export async function applyMigrationToMain(
       destructiveConfirmed: false,
       mcpOwnerConfirmed: true,
       agentSurface: opts.agentSurface === true,
+      // The parser produced this exact action. On failure, return the source
+      // statement to the migration caller rather than model-replanning it.
+      allowReplan: false,
       createdThisTurn: new Set<string>(),
     }),
   )

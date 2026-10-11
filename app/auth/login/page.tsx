@@ -189,34 +189,34 @@ function LoginForm() {
                 error={errors.email}
               />
 
-              <div className="flex items-center justify-between -mb-2">
+              <div className="relative flex flex-col gap-2">
                 <FieldLabel htmlFor="password">Password</FieldLabel>
+                <FieldInput
+                  id="password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  disabled={isSubmitting}
+                  error={errors.password}
+                  trailing={
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((s) => !s)}
+                      className="rounded-sm text-zinc-500 hover:text-zinc-300 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300/60"
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      <Icon icon={showPassword ? 'ri:eye-off-line' : 'ri:eye-line'} width={16} />
+                    </button>
+                  }
+                />
                 <Link
                   href="/auth/forgot-password"
-                  className="text-[11px] text-violet-300 hover:text-violet-200 transition-colors"
+                  className="absolute top-0.5 right-0 text-[11px] text-violet-300 hover:text-violet-200 transition-colors focus-visible:outline-none focus-visible:underline"
                 >
                   Forgot password?
                 </Link>
               </div>
-              <FieldInput
-                id="password"
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                disabled={isSubmitting}
-                error={errors.password}
-                trailing={
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword((s) => !s)}
-                    className="text-zinc-500 hover:text-zinc-300 transition-colors"
-                    aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  >
-                    <Icon icon={showPassword ? 'ri:eye-off-line' : 'ri:eye-line'} width={16} />
-                  </button>
-                }
-              />
 
               <PrimaryButton type="submit" disabled={isSubmitting} loading={isSubmitting}>
                 {isSubmitting ? 'Signing in…' : 'Sign in'}

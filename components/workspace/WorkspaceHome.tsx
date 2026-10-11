@@ -72,8 +72,10 @@ import { useRouter } from 'next/navigation'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   ArrowRight, ArrowUpRight, Braces, ChevronRight, Database, HardDrive, ShieldCheck, User,
+  Eye, Search, GitBranch, CheckCircle2,
   type LucideIcon,
 } from 'lucide-react'
+import { ApplyMergeIcon } from '@/components/workspace/ApplyMergeIcon'
 import { BUTTON_BASE, BUTTON_VARIANTS, StatusDot } from '@/components/inspector/kit'
 import { FOCUS, FOCUS_INSET } from '@/components/console/tokens'
 import {
@@ -865,7 +867,7 @@ function ReceiptRow({ item }: { item: AutonomyLastAction }) {
  * snapshot, Apply/Verify a 30-day track record. Without that split "15 broken"
  * beside "100% proven fixed" reads as the loop contradicting itself.
  *
- * Each node also carries a one-sentence LOOP_EXPLAIN on hover and focus.
+ * Each node also carries a one-sentence LOOP_EXPLAIN for screen readers.
  *
  * Motion is telemetry, never theater: the lit node is the real derived phase,
  * the heal sweep fires only when a finding genuinely closed, OFF freezes the
@@ -875,6 +877,14 @@ function ReceiptRow({ item }: { item: AutonomyLastAction }) {
 // through (Detect → Propose → Apply → Verify, Observe is home). Driven by a
 // real state transition (healSignal), so the motion is telemetry, not theater.
 const HEAL_NODE_INDEX: Array<number | null> = [null, 1, 2, 3, 4, 4]
+
+const STAGE_ICONS: Record<LoopPhase, React.ComponentType<{ className?: string; size?: number | string }>> = {
+  observe: Eye,
+  detect: Search,
+  propose: GitBranch,
+  apply: ApplyMergeIcon,
+  verify: CheckCircle2,
+}
 
 function SelfHealingLoop({
   phase, off, stats, healSignal, onReview,
@@ -944,12 +954,12 @@ function SelfHealingLoop({
           the return arc below anchor to them at any viewport size. ──────── */}
         <div className="relative">
           {/* Rail — one hairline through the node centers (top = NODE/2). */}
-          <div className={`absolute left-[10%] right-[10%] top-[15px] h-px ${off ? 'bg-white/[0.05]' : 'bg-white/[0.10]'}`} />
+          <div className={`absolute left-[10%] right-[10%] top-[23px] h-px ${off ? 'bg-white/[0.05]' : 'bg-white/[0.10]'}`} />
 
           {/* The signal: one comet travelling the rail, clipped to a strip so
               it enters and leaves cleanly at the first and last node. */}
           {live && (
-            <div className="pointer-events-none absolute left-[10%] right-[10%] top-[14px] h-[3px] overflow-hidden">
+            <div className="pointer-events-none absolute left-[10%] right-[10%] top-[22px] h-[3px] overflow-hidden">
               <motion.span
                 className="absolute top-[1px] h-px w-32 bg-[linear-gradient(to_right,transparent,rgba(196,181,253,0.9),transparent)]"
                 animate={{ left: ['-20%', '104%'] }}
@@ -961,7 +971,7 @@ function SelfHealingLoop({
           {/* The heal signal: one bright pulse driving the fix down the rail
               from Detect to Verify. Fires once per real self-heal. */}
           {heal && !reduced && (
-            <div className="pointer-events-none absolute left-[10%] right-[10%] top-[14px] h-[3px] overflow-hidden">
+            <div className="pointer-events-none absolute left-[10%] right-[10%] top-[22px] h-[3px] overflow-hidden">
               <motion.span
                 key={heal.id}
                 className="absolute top-[1px] h-[1.5px] w-24 rounded-full bg-[linear-gradient(to_right,transparent,rgba(196,181,253,1),transparent)]"
@@ -972,7 +982,7 @@ function SelfHealingLoop({
             </div>
           )}
 
-          {/* Phase nodes — circles mask the rail with the panel ground. Propose
+          {/* Phase nodes — precision developer tool capsules mask the rail. Propose
               opens the queue when something is actually waiting. */}
           <div className="relative grid grid-cols-5">
             {LOOP_STAGES.map((s, idx) => {
@@ -980,23 +990,24 @@ function SelfHealingLoop({
               const active = !off && (healingIndex != null ? healingHere : s.key === phase)
               const r = readings[s.key]
               const clickable = s.key === 'propose' && (stats.pending ?? 0) > 0
+              const IconComponent = STAGE_ICONS[s.key]
               const valueClass = `text-[28px] font-semibold leading-none tabular-nums tracking-[-0.03em] ${
                 r.accent ? 'text-violet-200' : off ? 'text-zinc-600' : active ? 'text-zinc-50' : 'text-zinc-300'
               }`
               const node = (
                 <>
                   <span
-                    className={`relative flex h-[30px] w-[30px] items-center justify-center rounded-full border ${NODE_GROUND} transition-colors duration-300 ${
+                    className={`relative flex h-[46px] w-[46px] items-center justify-center rounded-xl border transition-all duration-300 select-none ${
                       active
-                        ? 'border-violet-300/50 shadow-[0_0_0_4px_rgba(167,139,250,0.08),0_0_24px_-4px_rgba(167,139,250,0.45)]'
-                        : off ? 'border-white/[0.06]' : 'border-white/[0.12]'
+                        ? 'border-violet-300/70 bg-[#12131a] shadow-[0_0_24px_rgba(167,139,250,0.35)]'
+                        : off ? 'border-white/[0.06] bg-[#101014]' : 'border-[#2D2D35] bg-[#101014]'
                     }`}
                   >
                     {active && !reduced && !healingHere && (
                       <motion.span
-                        animate={{ opacity: [0.1, 0.4, 0.1], scale: [1, 1.45, 1] }}
+                        animate={{ opacity: [0.1, 0.4, 0.1], scale: [1, 1.25, 1] }}
                         transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-                        className="absolute inset-0 rounded-full bg-violet-400/25"
+                        className="absolute inset-0 rounded-xl bg-violet-400/25 pointer-events-none"
                       />
                     )}
                     {/* One-shot ripple as the heal pulse reaches this node. */}
@@ -1004,20 +1015,32 @@ function SelfHealingLoop({
                       <motion.span
                         key={`ripple-${heal!.id}-${idx}`}
                         initial={{ opacity: 0.65, scale: 1 }}
-                        animate={{ opacity: 0, scale: 2.3 }}
+                        animate={{ opacity: 0, scale: 1.8 }}
                         transition={{ duration: 0.7, ease: 'easeOut' }}
-                        className="absolute inset-0 rounded-full bg-violet-400/45"
+                        className="absolute inset-0 rounded-xl border border-white/50 pointer-events-none"
                       />
                     )}
-                    <span
-                      className={`relative h-[8px] w-[8px] rounded-full transition-colors duration-300 ${
-                        active ? 'bg-violet-200' : off ? 'bg-zinc-700' : 'bg-zinc-500'
+                    <IconComponent
+                      className={`h-[18px] w-[18px] transition-colors ${
+                        active
+                          ? 'text-violet-200'
+                          : off ? 'text-zinc-600' : 'text-[#B4C6EE]'
                       }`}
                     />
+                    {/* Top-right micro stage index badge */}
+                    <span
+                      className={`absolute -top-2 -right-1.5 font-mono text-[9px] font-medium px-1.5 py-0.5 rounded-[3px] border transition-colors shadow-sm ${
+                        active
+                          ? 'bg-[#0d0e14] border-violet-400/50 text-violet-200'
+                          : 'bg-[#0A0A0C] border-[#2D2D35] text-[#E2E8F0]'
+                      }`}
+                    >
+                      {idx + 1}
+                    </span>
                   </span>
 
                   <span
-                    className={`mt-3 text-[12.5px] font-medium transition-colors ${
+                    className={`mt-2.5 text-[12.5px] font-medium transition-colors ${
                       active ? 'text-zinc-50' : 'text-zinc-400'
                     }`}
                   >
@@ -1027,7 +1050,7 @@ function SelfHealingLoop({
                   {/* The reading, stacked under its phase: numeral then unit,
                       so the numbers form one scannable row across the
                       instrument. */}
-                  <span className="mt-3 flex h-[28px] items-center">
+                  <span className="mt-2 flex h-[28px] items-center">
                     {reduced ? (
                       <span className={valueClass}>{r.value}</span>
                     ) : (
@@ -1048,28 +1071,12 @@ function SelfHealingLoop({
                     )}
                   </span>
 
-                  <span className="mt-2 max-w-[140px] px-1 text-center text-[12px] leading-[16px] text-zinc-500">
+                  <span className="mt-1.5 max-w-[140px] px-1 text-center text-[12px] leading-[16px] text-zinc-500">
                     {r.unit}
                   </span>
 
-                  {/* What the phase MEANS, on hover and keyboard focus. Edge
-                      columns anchor to their own edge instead of centring, so
-                      the widest popover stays inside the panel at every
-                      viewport. Always in the accessibility tree, so it is never
-                      a mouse-only explanation. */}
+                  {/* Accessible description for screen readers */}
                   <span className="sr-only">{LOOP_EXPLAIN[s.key]}</span>
-                  <span
-                    aria-hidden="true"
-                    className={`pointer-events-none absolute top-full z-20 mt-2 w-[min(260px,calc(100vw-3rem))] rounded-[10px] bg-[#141518] px-3.5 py-2.5 text-left text-[12.5px] leading-[19px] text-zinc-300 opacity-0 shadow-[0_0_0_1px_rgba(255,255,255,0.08),0_16px_40px_-12px_rgba(0,0,0,0.8)] transition-opacity duration-150 group-hover/node:opacity-100 group-focus-visible/node:opacity-100 ${
-                      idx === 0
-                        ? 'left-0'
-                        : idx === LOOP_STAGES.length - 1
-                          ? 'right-0'
-                          : 'left-1/2 -translate-x-1/2'
-                    }`}
-                  >
-                    {LOOP_EXPLAIN[s.key]}
-                  </span>
                 </>
               )
               if (clickable) {
@@ -1079,14 +1086,14 @@ function SelfHealingLoop({
                     type="button"
                     onClick={onReview}
                     title={`${stats.pending} change${stats.pending === 1 ? '' : 's'} waiting on your approval`}
-                    className={`group/node relative flex flex-col items-center rounded-[10px] pb-1 ${FOCUS}`}
+                    className={`group/node relative flex flex-col items-center rounded-[10px] pb-1 select-none ${FOCUS}`}
                   >
                     {node}
                   </button>
                 )
               }
               return (
-                <div key={s.key} className="group/node relative flex flex-col items-center pb-1">
+                <div key={s.key} className="group/node relative flex flex-col items-center pb-1 outline-none select-none">
                   {node}
                 </div>
               )
