@@ -37,7 +37,7 @@ const OPENAI_CACHE = { cacheReadMult: 0.25, cacheWrite5mMult: 1, cacheWrite1hMul
 const CLAUDE_CACHE = { cacheReadMult: 0.1, cacheWrite5mMult: 1.25, cacheWrite1hMult: 2 } as const
 
 const MODEL_PRICING: Record<string, ModelPricing> = {
-  // gpt-4.1 family — the brain's actual smart model (see lib/ai/model-router).
+  // gpt-4.1 family — the default model on the OpenAI provider (lib/ai/llm/config.ts).
   // Absent from this table until 2026-07-26, which made every brain call fall
   // through the prefix loop below onto legacy 'gpt-4' at $30/$60 and report
   // ~12x the real cost. 326,874 recorded tokens were billed at $9.87 when the
