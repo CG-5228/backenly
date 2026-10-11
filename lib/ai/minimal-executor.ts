@@ -12744,9 +12744,13 @@ async function executeAddFulltextSearch(params: any, projectId: string): Promise
 //   2. Adding an `embedding vector(1536)` column to the table (idempotent)
 //   3. Building an HNSW index for cosine similarity (idempotent; falls back
 //      to ivfflat if the installed pgvector predates HNSW)
-//   4. Recording the source-columns mapping in ApiDefinition.config.vectorSearch
-//      so runtimeApiExecutor can auto-embed on writes and the new
+//   4. Recording the source columns, model and dimensions in
+//      ApiDefinition.config.vectorSearch, so the
 //      /api/v1/{projectId}/db/{table}/vector-search endpoint can serve queries
+//      and refuse when the deployment's model no longer matches
+//
+// Nothing computes a row's embedding when it is written: writes go straight to
+// the data plane. Every surface that describes this tool says so.
 // ============================================================================
 
 async function executeEnableVectorSearch(params: any, projectId: string): Promise<ExecutionResult> {
@@ -12760,6 +12764,18 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
   const requested: string[] = Array.isArray(sourceColumns) && sourceColumns.length > 0
     ? sourceColumns
     : ['title', 'name', 'body', 'description', 'content', 'text']
+
+  // Before any DDL: a search column nothing can query is a feature that only
+  // looks enabled.
+  const { embeddingAvailability, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } = await import('@/lib/ai/embeddings')
+  const available = embeddingAvailability()
+  if ('reason' in available) {
+    return {
+      success: false,
+      message: `Vector search was not enabled on **${tableName}**: ${available.reason}`,
+      error: 'EMBEDDINGS_UNAVAILABLE',
+    }
+  }
 
   try {
     const { prisma } = await import('@/lib/db')
@@ -12815,7 +12831,7 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
 
     // 3. Add embedding column (idempotent).
     const EMBEDDING_COLUMN = 'embedding'
-    const DIMENSIONS = 1536  // text-embedding-3-small
+    const DIMENSIONS = EMBEDDING_DIMENSIONS
     await prisma.$executeRawUnsafe(`
       ALTER TABLE "${postgresSchema}"."${safeTable}"
       ADD COLUMN IF NOT EXISTS "${EMBEDDING_COLUMN}" vector(${DIMENSIONS})
@@ -12845,9 +12861,8 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
       `)
     }
 
-    // 5. Persist the source-columns mapping in ApiDefinition.config so:
-    //    a) the runtime executor knows to auto-embed on writes
-    //    b) the /vector-search endpoint knows which columns are searchable
+    // 5. Persist the mapping in ApiDefinition.config, so the /vector-search
+    //    endpoint knows the column, and the model and dimensions it must match.
     const tablePrisma = await prisma.table.findFirst({ where: { projectId, name: tableName } })
     if (tablePrisma) {
       const apiDef = await prisma.apiDefinition.findFirst({ where: { projectId, tableId: tablePrisma.id } })
@@ -12857,7 +12872,7 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
           enabled: true,
           embeddingColumn: EMBEDDING_COLUMN,
           dimensions: DIMENSIONS,
-          model: 'text-embedding-3-small',
+          model: EMBEDDING_MODEL,
           sourceColumns: validSources,
           indexName: idxName,
           indexKind,
@@ -12890,10 +12905,12 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
       message:
         `✅ Vector search enabled on **${tableName}**.\n\n` +
         `- **Indexed source**: ${validSources.join(', ')}\n` +
-        `- **Embedding column**: \`${EMBEDDING_COLUMN} vector(${DIMENSIONS})\` (text-embedding-3-small)\n` +
+        `- **Embedding column**: \`${EMBEDDING_COLUMN} vector(${DIMENSIONS})\` (${EMBEDDING_MODEL})\n` +
         `- **Index**: \`${idxName}\` (${indexKind}, cosine similarity)\n` +
         `- **Search endpoint**: \`GET /api/v1/${projectId}/db/${tableName}/vector-search?q=your+question&limit=10\`\n\n` +
-        `New and updated rows are auto-embedded — your app just writes plain text and asks natural-language questions.`,
+        `Only rows with an \`${EMBEDDING_COLUMN}\` value are searched, and Backenly does not compute it when a row ` +
+        `is written yet: write it with the row (${DIMENSIONS} numbers from ${EMBEDDING_MODEL} over ` +
+        `${validSources.join(', ')}). Queries are plain text; Backenly embeds them.`,
       data: {
         tableName,
         embeddingColumn: EMBEDDING_COLUMN,

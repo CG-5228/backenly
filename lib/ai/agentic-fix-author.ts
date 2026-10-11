@@ -17,9 +17,10 @@
  *   - Routed through `executeAction → mutate.ts` governance kernel.
  *
  * Bounds:
- *   - Model:   gpt-4o (AUTONOMY_FIX_MODEL to override)
+ *   - Model:   the gateway's build.fix_author route (Claude Opus 4.6 on Cloud;
+ *              AI_MODEL_BUILD_FIX_AUTHOR, or AUTONOMY_FIX_MODEL on OpenAI)
  *   - Budget:  ≤ MAX_AUTHORED_FIXES_PER_BUILD novel fixes per build run
- *   - Timeout: 12s (non-critical; loop continues if author times out)
+ *   - Timeout: 60s, cancelled not abandoned (loop continues if author times out)
  *
  * Gated by ENABLE_AGENTIC_FIX_AUTHOR. When the flag is off this module is
  * never called.
