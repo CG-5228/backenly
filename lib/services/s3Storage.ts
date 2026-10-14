@@ -500,6 +500,7 @@ export class S3StorageService implements StorageService {
         size: file.size, // Keep as BigInt
         mimeType: file.mimeType,
         isPublic: file.isPublic,
+        uploadedBy: file.uploadedBy ?? null,
         bucket: file.bucket.name,
         createdAt: file.createdAt,
         url: await this.getFileUrl(file.id, projectId, 3600),

@@ -29,6 +29,7 @@ export interface StorageService {
     size: bigint
     mimeType: string | null
     isPublic: boolean
+    uploadedBy: string | null
     bucket: string
     createdAt: Date
     url: string
@@ -498,6 +499,7 @@ class LocalStorageService implements StorageService {
       size: file.size, // Keep as BigInt
       mimeType: file.mimeType,
       isPublic: file.isPublic,
+      uploadedBy: file.uploadedBy ?? null,
       bucket: file.bucket.name,
       createdAt: file.createdAt,
       url: file.isPublic

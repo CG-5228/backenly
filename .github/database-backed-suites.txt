@@ -42,6 +42,7 @@ tests/integration/end-user-email-verification-opt-in.spec.ts
 tests/integration/signin-enumeration.spec.ts
 tests/integration/project-smtp-and-templates.spec.ts
 tests/integration/storage-bucket-policy.spec.ts
+tests/integration/storage-runtime-policy.spec.ts
 tests/integration/postgres-admin.spec.ts
 
 # Needs a real Postgres AND a git worktree of an older release.
