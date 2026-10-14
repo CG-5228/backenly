@@ -6969,15 +6969,34 @@ async function executeEnableRealtime(params: Record<string, any>, projectId: str
 
     const installedTables: string[] = []
     const failedTables: string[] = []
+    const skippedTables: Array<{ table: string; reason: string }> = []
 
     if (tableName) {
-      // Install on the specified table only
+      // Install on the specified table only. A refusal (internal or
+      // auth-managed table) and a failure (table missing, wrong case) are
+      // ANSWERS: reporting either under a "Realtime active" banner sent the
+      // agent away believing a stream existed while nothing was installed.
       try {
-        await installRealtimeTrigger(projectId, tableName)
+        const result = await installRealtimeTrigger(projectId, tableName)
+        if (!result.installed) {
+          return {
+            success: false,
+            message: `Realtime was NOT enabled for \`${tableName}\`: ${result.reason}.`,
+            error: 'REALTIME_TABLE_REFUSED',
+            data: { enabled: false, table: tableName, reason: result.reason },
+          }
+        }
         installedTables.push(tableName)
       } catch (err: any) {
         console.warn(`[enableRealtime] Failed to install trigger on ${tableName}:`, err?.message)
-        failedTables.push(tableName)
+        return {
+          success: false,
+          message:
+            `Realtime was NOT enabled for \`${tableName}\` — the trigger could not be installed: ` +
+            `${err?.message ?? err}. Check the table exists (names are case-sensitive as created).`,
+          error: 'REALTIME_TABLE_NOT_FOUND',
+          data: { enabled: false, table: tableName },
+        }
       }
     } else {
       // Install on every existing workspace table — query workspace schema directly
@@ -6999,8 +7018,10 @@ async function executeEnableRealtime(params: Record<string, any>, projectId: str
         tableNames = rows.map((t: { name: string }) => t.name)
       }
       if (tableNames.length > 0) {
-        await installRealtimeTriggersForAllTables(projectId, tableNames)
-        installedTables.push(...tableNames)
+        const batch = await installRealtimeTriggersForAllTables(projectId, tableNames)
+        installedTables.push(...batch.installed)
+        skippedTables.push(...batch.skipped)
+        failedTables.push(...batch.failed.map((f) => f.table))
       }
     }
 
@@ -7031,6 +7052,19 @@ async function executeEnableRealtime(params: Record<string, any>, projectId: str
     // the result of a single-table call is what made a scoped `enable_realtime`
     // on `orders` look like it had silently enabled `products` and `order_items`
     // too. Name the delta and the pre-existing set as different things.
+    // Single-table calls are additionally gated on the POST-INSTALL read-back:
+    // success means "the catalog shows the trigger", not "no exception thrown".
+    if (tableName && !verifiedTables.includes(tableName)) {
+      return {
+        success: false,
+        message:
+          `Realtime was NOT enabled for \`${tableName}\`: the install ran but the read-back ` +
+          `does not show a trigger on it. Nothing is streaming for this table.`,
+        error: 'REALTIME_NOT_VERIFIED',
+        data: { enabled: false, table: tableName, watchedTables: verifiedTables },
+      }
+    }
+
     const alreadyOn = verifiedTables.filter((t) => !installedTables.includes(t))
     const scope = tableName ? `\`${tableName}\`` : `${installedTables.length} table(s)`
     const changedList = installedTables.length > 0
@@ -7039,15 +7073,48 @@ async function executeEnableRealtime(params: Record<string, any>, projectId: str
     const alreadyList = alreadyOn.length > 0
       ? `\n\n**Already streaming before this call (unchanged):**\n${alreadyOn.map((t) => `- \`${t}\``).join('\n')}`
       : ''
-    const failNote = failedTables.length > 0
-      ? `\n\n⚠️ Could not install trigger on: ${failedTables.map(t => `\`${t}\``).join(', ')} — table may not exist yet.`
+    const skippedList = skippedTables.length > 0
+      ? `\n\n**Skipped (never streamed):**\n${skippedTables.map((s) => `- \`${s.table}\` — ${s.reason}`).join('\n')}`
       : ''
+
+    // A project-wide call that installed nothing is not "Realtime active".
+    if (!tableName && installedTables.length === 0 && failedTables.length === 0) {
+      return {
+        success: true,
+        message:
+          verifiedTables.length > 0
+            ? `Realtime is already active on ${verifiedTables.length} table(s); this call changed nothing.${skippedList}`
+            : `No realtime triggers were installed: this project has no streamable tables yet. Create a table first, then enable realtime.${skippedList}`,
+        data: { enabled: verifiedTables.length > 0, table: null, enabledNow: [], alreadyEnabled: verifiedTables, watchedTables: verifiedTables },
+      }
+    }
+
+    // Partial failure is FAILURE with a ledger — the apply_migration contract.
+    // "Active, with a footnote" sent agents away from tables that never streamed.
+    if (failedTables.length > 0) {
+      return {
+        success: false,
+        message:
+          `Realtime was only PARTIALLY enabled.\n\n` +
+          `**Installed (streaming now):**\n${installedTables.length ? installedTables.map((t) => `- \`${t}\``).join('\n') : '- (none)'}\n\n` +
+          `**Failed (NOT streaming):**\n${failedTables.map((t) => `- \`${t}\``).join('\n')}` +
+          skippedList,
+        error: 'REALTIME_PARTIAL',
+        data: {
+          enabled: installedTables.length > 0,
+          table: tableName ?? null,
+          enabledNow: installedTables,
+          failed: failedTables,
+          watchedTables: verifiedTables,
+        },
+      }
+    }
 
     const exampleTable = tableName ?? installedTables[0] ?? verifiedTables[0] ?? 'messages'
 
     return {
       success: true,
-      message: `✅ **Realtime active for ${scope}.**\n\nPostgreSQL NOTIFY triggers installed — live INSERT/UPDATE/DELETE events flow to subscribers immediately.\n\nSDK usage:\n\`\`\`js\nbackend.${exampleTable}.subscribe((event) => console.log(event))\n\`\`\`${changedList}${alreadyList}${failNote}`,
+      message: `✅ **Realtime active for ${scope}.**\n\nPostgreSQL NOTIFY triggers installed — live INSERT/UPDATE/DELETE events flow to subscribers immediately.\n\nSDK usage:\n\`\`\`js\nbackend.${exampleTable}.subscribe((event) => console.log(event))\n\`\`\`${changedList}${alreadyList}${skippedList}`,
       data: {
         enabled: true,
         table: tableName ?? null,
