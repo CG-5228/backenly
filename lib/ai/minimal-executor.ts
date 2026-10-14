@@ -7737,50 +7737,49 @@ async function executeDisableProvider(params: any, projectId: string): Promise<E
 
 /**
  * MONITORING: Get Metrics
+ *
+ * Reads what the runtime actually records: ApiRequestLog, through the same
+ * window-stats service the Monitoring page uses. The old implementation
+ * grouped `Log` rows of type 'api_request' — a type nothing in the codebase
+ * has ever written — so every project, however busy, was told "No API metrics
+ * available yet" while the docs promised latency percentiles and error rate.
  */
 async function executeGetMetrics(params: any, projectId: string): Promise<ExecutionResult> {
   try {
-    const { prisma } = await import('@/lib/db')
-    
-    // Get API metrics from logs
-    const metrics = await prisma.log.groupBy({
-      by: ['endpoint'],
-      where: {
-        projectId,
-        type: 'api_request',
-        timestamp: {
-          gte: new Date(Date.now() - 24 * 60 * 60 * 1000) // Last 24 hours
-        }
-      },
-      _count: true,
-      _avg: {
-        duration: true
-      },
-      orderBy: {
-        _count: {
-          endpoint: 'desc'
-        }
-      },
-      take: 10
-    })
-    
-    if (metrics.length === 0) {
+    const { getRuntimeWindowStats, getPerformanceBreakdown } = await import('@/lib/services/metrics')
+
+    const windowMinutes = Math.min(Math.max(Number(params?.windowMinutes) || 24 * 60, 5), 30 * 24 * 60)
+    const end = new Date()
+    const start = new Date(end.getTime() - windowMinutes * 60 * 1000)
+    const stats = await getRuntimeWindowStats(projectId, start, end)
+
+    if (stats.count === 0) {
       return {
         success: true,
-        message: "📊 No API metrics available yet.\n\nStart making API calls to see performance data.",
-        data: { metrics: [] }
+        message:
+          `📊 No runtime API traffic in the last ${windowMinutes >= 60 ? `${Math.round(windowMinutes / 60)}h` : `${windowMinutes}m`}.` +
+          `\n\nMetrics appear here once your app calls the project's API.`,
+        data: { windowMinutes, stats, endpoints: [] },
       }
     }
-    
-    const metricsList = metrics.map(m => {
-      const avgTime = m._avg.duration ? `${Math.round(m._avg.duration)}ms` : 'N/A'
-      return `📈 **${m.endpoint}** - ${m._count} calls, avg ${avgTime}`
-    }).join('\n')
-    
+
+    // Top endpoints over the service's nearest canonical range.
+    const range = windowMinutes <= 60 ? '1h' : windowMinutes <= 24 * 60 ? '24h' : windowMinutes <= 7 * 24 * 60 ? '7d' : '30d'
+    const endpoints = await getPerformanceBreakdown(range, 'api', projectId).catch(() => [])
+
+    const top = endpoints
+      .slice(0, 10)
+      .map((e) => `📈 **${e.id}** — ${e.requests} req · avg ${Math.round(e.avgResponseTime)}ms · p95 ${Math.round(e.p95)}ms · ${e.errorRate.toFixed(1)}% errors`)
+      .join('\n')
+
     return {
       success: true,
-      message: `📊 **API Metrics (Last 24h):**\n\n${metricsList}`,
-      data: { metrics }
+      message:
+        `📊 **API Metrics (last ${windowMinutes >= 60 ? `${Math.round(windowMinutes / 60)}h` : `${windowMinutes}m`}):**\n\n` +
+        `${stats.count} requests · error rate ${stats.errorRatePct.toFixed(1)}% (${stats.serverErrorCount} × 5xx)\n` +
+        `latency p50 ${Math.round(stats.p50)}ms · p95 ${Math.round(stats.p95)}ms · p99 ${Math.round(stats.p99)}ms` +
+        (top ? `\n\n**Top endpoints (${range}):**\n${top}` : ''),
+      data: { windowMinutes, stats, endpoints },
     }
   } catch (error: any) {
     return {
@@ -7793,47 +7792,65 @@ async function executeGetMetrics(params: any, projectId: string): Promise<Execut
 
 /**
  * MONITORING: Get Errors
+ *
+ * 5xx from the runtime's own record (ApiRequestLog), grouped by method + path
+ * with count and last-seen — what the tool has always promised. The old
+ * implementation read `Log` rows with severity 'error', which no runtime path
+ * writes, so it answered "No errors in the last hour! Your APIs are running
+ * smoothly." while request_logs showed the 500s.
  */
 async function executeGetErrors(params: any, projectId: string): Promise<ExecutionResult> {
   try {
     const { prisma } = await import('@/lib/db')
-    
-    const errors = await prisma.log.findMany({
-      where: {
-        projectId,
-        severity: 'error',
-        timestamp: {
-          gte: new Date(Date.now() - 60 * 60 * 1000) // Last hour
-        }
-      },
-      orderBy: { timestamp: 'desc' },
-      take: 10,
-      select: {
-        id: true,
-        message: true,
-        endpoint: true,
-        statusCode: true,
-        timestamp: true
-      }
-    })
-    
-    if (errors.length === 0) {
+
+    const windowMinutes = Math.min(Math.max(Number(params?.windowMinutes) || 60, 5), 30 * 24 * 60)
+    const limit = Math.min(Math.max(Number(params?.limit) || 10, 1), 50)
+    const since = new Date(Date.now() - windowMinutes * 60 * 1000)
+
+    const groups = await prisma.$queryRawUnsafe<Array<{
+      method: string
+      path: string
+      status_code: number
+      count: number
+      last_seen: Date
+    }>>(
+      `SELECT "method", "path", "statusCode" AS status_code,
+              COUNT(*)::int AS count,
+              MAX("timestamp") AS last_seen
+         FROM "api_request_logs"
+        WHERE "projectId" = $1 AND "statusCode" >= 500
+          AND "timestamp" >= ($2::timestamptz AT TIME ZONE 'UTC')
+          AND "branchId" IS NULL
+        GROUP BY "method", "path", "statusCode"
+        ORDER BY MAX("timestamp") DESC
+        LIMIT $3`,
+      projectId,
+      since.toISOString(),
+      limit
+    )
+
+    const windowLabel = windowMinutes >= 60 ? `${Math.round(windowMinutes / 60)}h` : `${windowMinutes}m`
+
+    if (groups.length === 0) {
       return {
         success: true,
-        message: "✅ No errors in the last hour!\n\nYour APIs are running smoothly.",
-        data: { errors: [], count: 0 }
+        message: `✅ No 5xx responses from the runtime API in the last ${windowLabel}.`,
+        data: { windowMinutes, errors: [], count: 0 },
       }
     }
-    
-    const errorList = errors.map(e => {
-      const time = new Date(e.timestamp).toLocaleTimeString()
-      return `❌ **[${time}]** ${e.endpoint || 'Unknown'} - ${e.statusCode || 500}: ${e.message.substring(0, 80)}`
-    }).join('\n')
-    
+
+    const total = groups.reduce((n, g) => n + g.count, 0)
+    const errorList = groups
+      .map((g) => {
+        const last = new Date(g.last_seen).toISOString()
+        return `❌ **${g.method} ${g.path}** — ${g.status_code} × ${g.count}, last ${last}`
+      })
+      .join('\n')
+
     return {
       success: true,
-      message: `🚨 **Recent Errors (${errors.length}):**\n\n${errorList}`,
-      data: { errors, count: errors.length }
+      message: `🚨 **5xx in the last ${windowLabel} (${total} across ${groups.length} endpoint(s)):**\n\n${errorList}`,
+      data: { windowMinutes, errors: groups, count: total },
     }
   } catch (error: any) {
     return {
