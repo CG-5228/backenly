@@ -355,7 +355,7 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
     }
 
     return NextResponse.json({ success: true })
-  })
+  }, { floor: 'write' })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

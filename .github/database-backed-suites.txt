@@ -111,6 +111,14 @@ __tests__/auth/project-delete-authorization.test.ts
 # single-tenant operators unaffected. Real sessions, resolver and guard.
 __tests__/auth/connect-credential-authorization.test.ts
 
+# Operate decisions (approve a parked agent request, run or undo a repair,
+# dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
+# create/merge/discard branches, publish) authorized membership only, so a Cloud
+# VIEWER could be the "human approval" the safety model hinges on. Pins the
+# floors: DEVELOPER for build-grade decisions, ADMIN for approvals, consent,
+# merge and rollback; reads stay VIEWER; single-tenant operators unaffected.
+__tests__/auth/operate-role-floors.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
