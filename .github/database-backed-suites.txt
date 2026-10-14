@@ -102,6 +102,14 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# Blocking an end user must flip the row. The workspace users table is FORCE
+# row-level security, and BLOCK_USER/UNBLOCK_USER ran their UPDATE with no
+# claims, so under the production app role every approved block answered "not
+# found" and changed nothing. Pins the FORCE premise under a non-superuser
+# role, that the executor takes the service-role claims path, and the real
+# row flip both ways through the real executor door.
+__tests__/auth/block-user-rls.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that

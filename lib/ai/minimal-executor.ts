@@ -7512,12 +7512,22 @@ async function executeBlockUser(params: any, projectId: string): Promise<Executi
       paramValue = userId
     }
 
-    const result = await prisma.$executeRawUnsafe(
-      `UPDATE "${schemaName}"."users" SET is_blocked = TRUE WHERE "${identifier}" = $1`,
-      paramValue
+    // Service-role UPDATE: the users table is FORCE row-level security with an
+    // own-rows policy, so a claimless query matches ZERO rows — this exact
+    // UPDATE used to report every real account as "not found" while is_blocked
+    // stayed false, including after a human approved the block. Same pattern as
+    // executeResetPassword's read below; `id` is cast because the column may be
+    // uuid. RETURNING is the row count executeWithUserContext can report.
+    const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
+    const where = identifier === 'email' ? `"email" = $1` : `"id"::text = $1`
+    const updated = await executeWithUserContext<{ id: string }>(
+      '',
+      true,
+      `UPDATE "${schemaName}"."users" SET is_blocked = TRUE WHERE ${where} RETURNING id`,
+      [String(paramValue)]
     )
 
-    if (result === 0) {
+    if (updated.length === 0) {
       return { success: false, message: `User "${email || userId}" not found in this project` }
     }
 
@@ -7636,12 +7646,19 @@ async function executeUnblockUser(params: any, projectId: string): Promise<Execu
     const identifier = email ? 'email' : 'id'
     const paramValue = email || userId
 
-    const result = await prisma.$executeRawUnsafe(
-      `UPDATE "${schemaName}"."users" SET is_blocked = FALSE WHERE "${identifier}" = $1`,
-      paramValue,
+    // Service-role UPDATE, for the same reason as executeBlockUser: FORCE RLS
+    // hides every row from a claimless query, so unblock reported "not found"
+    // and changed nothing.
+    const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
+    const where = identifier === 'email' ? `"email" = $1` : `"id"::text = $1`
+    const updated = await executeWithUserContext<{ id: string }>(
+      '',
+      true,
+      `UPDATE "${schemaName}"."users" SET is_blocked = FALSE WHERE ${where} RETURNING id`,
+      [String(paramValue)]
     )
 
-    if (result === 0) {
+    if (updated.length === 0) {
       return { success: false, message: `User "${email || userId}" not found in this project` }
     }
 
