@@ -419,6 +419,9 @@ export async function deployFunctionCode(
       ? args.description.trim().slice(0, 500)
       : existing?.description || 'Deployed from agent-written code.',
     generatedCode: code,
+    // Agent-written code is stored exactly as written, and STAYS as written:
+    // the runtime self-healer refuses to model-rewrite rows marked 'agent'.
+    codeOrigin: 'agent',
     triggerType: DEPLOY_TRIGGERS[trigger],
     triggerTable: method ? `${method} ${endpoint}` : table,
     lastError: null,

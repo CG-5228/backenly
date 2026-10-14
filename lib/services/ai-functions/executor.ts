@@ -23,6 +23,7 @@
  */
 
 import { Worker } from 'worker_threads'
+import { createHash } from 'crypto'
 import * as path from 'path'
 import { prisma } from '@/lib/db'
 import { buildIntegrationContext, IntegrationContext } from './integration-context'
@@ -467,6 +468,54 @@ export function validateSandboxFunction(code: string): Promise<{ valid: boolean;
 
 // ─── Auto-Fix ─────────────────────────────────────────────────────────────────
 
+/**
+ * The one consent check for model rewrites, inside the fixers themselves so
+ * every caller — the executor's fire-and-forget failure paths and the observer
+ * healer — is covered. Agent-deployed code (deploy_code promises "stored
+ * exactly as written") is never model-rewritten: the row keeps its error for
+ * the agent to read and fix. Returns the row when a rewrite is allowed.
+ */
+async function rewritableFunction(functionId: string): Promise<{ codeOrigin: string; name: string } | null> {
+  const row = await prisma.aiFunction.findUnique({
+    where: { id: functionId },
+    select: { codeOrigin: true, name: true },
+  })
+  if (!row) return null
+  if (row.codeOrigin === 'agent') {
+    console.log(`[AutoFix] ${row.name} (${functionId}) is agent-deployed code — left exactly as written, not rewritten.`)
+    return null
+  }
+  return row
+}
+
+/** Every self-heal rewrite leaves an audit row; a silent one is a lie about who wrote the code. */
+async function recordSelfHealRewrite(
+  projectId: string,
+  functionId: string,
+  name: string,
+  errorMessage: string,
+  originalCode: string,
+  fixedCode: string,
+): Promise<void> {
+  const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
+  await prisma.auditLog.create({
+    data: {
+      projectId,
+      action: 'AI_FUNCTION_SELF_HEALED',
+      type: 'autonomy',
+      details: JSON.stringify({
+        functionId,
+        name,
+        reason: 'regenerated from a runtime error',
+        error: errorMessage.slice(0, 300),
+        previousCodeSha256: sha(originalCode),
+        newCodeSha256: sha(fixedCode),
+      }),
+      timestamp: new Date(),
+    },
+  }).catch(() => {})
+}
+
 async function autoFixAiFunction(
   functionId: string,
   projectId: string,
@@ -477,6 +526,8 @@ async function autoFixAiFunction(
   triggerTable: string | null
 ): Promise<void> {
   try {
+    const row = await rewritableFunction(functionId)
+    if (!row) return
     console.log(`[AutoFix] Attempting fix for function ${functionId}: ${errorMessage}`)
 
     const fixedCode = await generateFixedFunctionCode(
@@ -500,6 +551,7 @@ async function autoFixAiFunction(
       where: { id: functionId },
       data: { generatedCode: fixedCode, status: 'active', lastError: null },
     })
+    await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
 
     console.log(`[AutoFix] Successfully fixed function ${functionId}`)
   } catch (err: any) {
@@ -527,6 +579,8 @@ export async function autoFixRouteModuleFunction(
   triggerTableHint: string | null
 ): Promise<boolean> {
   try {
+    const row = await rewritableFunction(functionId)
+    if (!row) return false
     console.log(`[AutoFix:RouteModule] Attempting fix for function ${functionId}: ${errorMessage}`)
     const method = triggerTableHint?.match(/^\s*(GET|POST|PUT|PATCH|DELETE)\b/i)?.[1]?.toUpperCase() || 'POST'
     const { generateFixedRouteModule } = await import('@/lib/ai/function-generator')
@@ -544,6 +598,7 @@ export async function autoFixRouteModuleFunction(
       where: { id: functionId },
       data: { generatedCode: fixedCode, status: 'active', lastError: null },
     })
+    await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
     console.log(`[AutoFix:RouteModule] Successfully fixed function ${functionId}`)
     return true
   } catch (err: any) {
@@ -629,7 +684,10 @@ export async function healErroredAiFunctions(
           result.restored++
           continue
         }
-        if (!lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
+        // Agent-deployed code is never model-rewritten (the restore path above
+        // is fine — it brings back the agent's own bytes). The error stays for
+        // the agent to read and fix.
+        if (fn.codeOrigin !== 'agent' && !lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
           llmBudget--
           const ok = await autoFixRouteModuleFunction(
             fn.id, projectId, lastError || check.error || 'unknown error',
@@ -643,7 +701,7 @@ export async function healErroredAiFunctions(
 
       // Sandbox function — reuse the NL auto-fixer (validated by re-parse in
       // the generator path; runtime re-verification happens on next fire).
-      if (!lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
+      if (fn.codeOrigin !== 'agent' && !lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
         llmBudget--
         await autoFixAiFunction(
           fn.id, projectId, lastError, fn.generatedCode,
