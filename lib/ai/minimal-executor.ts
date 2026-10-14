@@ -9500,6 +9500,17 @@ async function executeCreateTrigger(params: any, projectId: string): Promise<Exe
     return { success: false, message: 'name, sourceTable, event, and actionType are required' }
   }
 
+  // A webhook trigger without a destination used to be CREATED and reported as
+  // "calls your webhook at `undefined`"; every later matching write then threw
+  // 'webhook trigger requires webhookUrl' and logged a DEAD delivery. Refuse
+  // at creation, where the caller can still fix it.
+  if (actionType === 'webhook' && !(typeof webhookUrl === 'string' && /^https?:\/\//i.test(webhookUrl.trim()))) {
+    return {
+      success: false,
+      message: 'A webhook trigger needs webhookUrl — the http(s) endpoint it calls. Pass webhookUrl, or use create_webhook for a signed row webhook.',
+    }
+  }
+
   try {
     const { prisma } = await import('@/lib/db')
     const { createTrigger } = await import('@/lib/services/trigger-service')

@@ -617,11 +617,13 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     },
     ['tableName']),
   fn('create_trigger',
-    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY.',
+    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY. ' +
+    'kind "webhook" REQUIRES webhookUrl (the endpoint to call); without it the trigger is refused, never created dead.',
     {
       tableName: { type: 'string' },
       on: { type: 'string', enum: ['insert', 'update', 'delete'] },
       kind: { type: 'string', enum: ['webhook', 'notify'] },
+      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the HTTP(S) endpoint the trigger calls. Required for webhooks.' },
     },
     ['tableName', 'on', 'kind']),
   fn('sync_column',
