@@ -13,7 +13,7 @@ import { UploadRejectedError, assertFileAllowed, assertFileSize } from '@/lib/st
 export interface StorageService {
   // Bucket operations
   createBucket(name: string, projectId: string, isPublic?: boolean): Promise<{ id: string; name: string; isPublic: boolean }>
-  listBuckets(projectId: string): Promise<Array<{ id: string; name: string; isPublic: boolean; fileCount: number; totalSize: bigint }>>
+  listBuckets(projectId: string): Promise<Array<{ id: string; name: string; isPublic: boolean; accessPolicy: string; fileCount: number; totalSize: bigint }>>
   deleteBucket(bucketId: string, projectId: string): Promise<void>
   getBucket(bucketId: string, projectId: string): Promise<{ id: string; name: string; isPublic: boolean } | null>
 
@@ -103,6 +103,10 @@ class LocalStorageService implements StorageService {
         name,
         projectId, // Required for tenant isolation
         isPublic,
+        // The enforced field. Serving (mayRead), upload clamping and the
+        // console all read accessPolicy; isPublic alone is a label. Deriving
+        // it here keeps the two in agreement from birth.
+        accessPolicy: isPublic ? 'public_read' : 'private',
       },
     })
 
@@ -140,6 +144,9 @@ class LocalStorageService implements StorageService {
       id: bucket.id,
       name: bucket.name,
       isPublic: bucket.isPublic,
+      // The enforced visibility. isPublic is a label; readers deciding what to
+      // DISPLAY or PROMISE must use this.
+      accessPolicy: bucket.accessPolicy,
       fileCount: bucket.files.length,
       totalSize: bucket.files.reduce((sum, file) => sum + file.size, BigInt(0)), // Keep as BigInt
     }))
