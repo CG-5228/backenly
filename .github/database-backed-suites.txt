@@ -102,6 +102,15 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# ApiKey.permissions was written by set_key_permissions and the key editor but
+# never read by the data plane: /api/v1 db and /api/v2 served writes to any
+# valid key, so narrowing a leaked key to ['read'] changed nothing while the
+# tool answered "permissions updated". Pins the method gate on BOTH doors
+# (read-only refused on writes with INSUFFICIENT_KEY_PERMISSIONS, read+write
+# and service-role unaffected) and that SET_KEY_PERMISSIONS over the real
+# executor takes effect on the very next request. Real server, real socket.
+tests/integration/key-permission-gate.spec.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
