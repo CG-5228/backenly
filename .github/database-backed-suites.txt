@@ -38,6 +38,7 @@ tests/build-runs/build-run-service.test.ts
 tests/build-runs/hydration.test.ts
 tests/integration/mcp-oauth-flow.spec.ts
 tests/integration/webhook-delivery.spec.ts
+tests/integration/state-webhooks-section.spec.ts
 tests/integration/end-user-email-verification-opt-in.spec.ts
 tests/integration/signin-enumeration.spec.ts
 tests/integration/project-smtp-and-templates.spec.ts

@@ -901,7 +901,12 @@ export const STATE_SECTIONS: Record<string, string> = {
   integrations: 'list_integration_keys',
   apps: 'list_connected_apps',
   env: 'list_env_vars',
-  webhooks: 'list_webhook_deliveries',
+  // The Webhooks PAGE: configured endpoints, their health. This once pointed
+  // at list_webhook_deliveries — the AppTrigger delivery log, which is empty
+  // unless legacy /database/* routes fired — so an agent grounding itself on a
+  // project with three live webhook endpoints was told there were none.
+  webhooks: 'list_webhooks',
+  deliveries: 'list_webhook_deliveries',
   findings: 'list_findings',
   incidents: 'get_pending_incidents',
   metrics: 'get_metrics',
