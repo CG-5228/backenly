@@ -315,7 +315,7 @@ await backend.auth.signIn({ email, password })
       },
       {
         title: 'You choose what starts it',
-        body: 'A user signing up; an insert, update or delete on a table; a schedule (every 15 minutes, or a 5-field cron expression); an HTTP request to `/api/v1/{projectId}/fn/{name}`; or only when you run it by hand.',
+        body: 'A user signing up; an insert, update or delete on a table (captured inside the database, so it fires no matter which door wrote the row, within about a minute); a schedule (every 15 minutes, or a 5-field cron expression); an HTTP request to `/api/v1/{projectId}/fn/{name}`; or only when you run it by hand.',
       },
       {
         title: 'It runs on the server',

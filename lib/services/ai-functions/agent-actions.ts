@@ -430,6 +430,12 @@ export async function deployFunctionCode(
     ? await prisma.aiFunction.update({ where: { id: existing.id }, data: { ...fields, ...(keptOff ? {} : { status: 'active' }) } })
     : await prisma.aiFunction.create({ data: { projectId: actor.projectId, name, status: 'active', ...fields } })
 
+  // Row-event functions fire from the database-level capture, so deploying one
+  // must make sure the capture trigger is on the tables. Awaited: a deploy that
+  // answers before the trigger exists would silently miss the next write.
+  const { syncCaptureForFunctionChange } = await import('@/lib/webhooks/capture')
+  await syncCaptureForFunctionChange(actor.projectId, fn.triggerType)
+
   const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
   const renamed = rawName !== name
   return {

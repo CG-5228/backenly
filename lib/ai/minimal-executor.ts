@@ -10703,6 +10703,11 @@ async function executeDeleteAiFunction(params: any, projectId: string): Promise<
 
     await prisma.aiFunction.delete({ where: { id: fn.id } })
 
+    // Deleting the last row-event subscriber takes the capture trigger off the
+    // tables, so an unused capture costs nothing.
+    const { syncCaptureForFunctionChange } = await import('@/lib/webhooks/capture')
+    await syncCaptureForFunctionChange(projectId, fn.triggerType)
+
     return {
       success: true,
       message: `✅ AI function \`${fn.name}\` deleted.`,
@@ -10731,6 +10736,11 @@ async function executeToggleAiFunction(params: any, projectId: string): Promise<
 
     const newStatus = active ? 'active' : 'inactive'
     await prisma.aiFunction.update({ where: { id: fn.id }, data: { status: newStatus } })
+
+    // A row-event function going on or off changes what the database-level
+    // capture must record; the sync derives the answer from the rows.
+    const { syncCaptureForFunctionChange } = await import('@/lib/webhooks/capture')
+    await syncCaptureForFunctionChange(projectId, fn.triggerType)
 
     return {
       success: true,

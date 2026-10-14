@@ -670,7 +670,8 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Create a backend function. Backenly functions are EVENT-DRIVEN or HTTP — pick the `trigger` that matches what the user described:\n' +
     '  • on_signup — runs automatically every time an end-user signs up (welcome emails, default rows, tier assignment, analytics identify).\n' +
     '  • on_insert / on_update / on_delete — runs automatically every time a row is inserted / updated / deleted in `table` ' +
-    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`.\n' +
+    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`. ' +
+    'Row events are captured inside PostgreSQL, so every writer fires them — REST, SDK, MCP, SQL in another function — within about a minute of the write. Auth-managed tables (users) are not captured; use on_signup.\n' +
     '  • http — a callable REST endpoint at /api/v1/{projectId}/fn/{name} that a frontend or another service hits directly ' +
     '("an endpoint to export orders as CSV", "a /checkout/session endpoint").\n' +
     '  • manual — only runs when fired from the Functions dashboard (occasional maintenance / recompute tasks).\n' +
