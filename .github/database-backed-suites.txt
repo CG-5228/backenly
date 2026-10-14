@@ -125,6 +125,11 @@ __tests__/auth/workspace-download-authorization.test.ts
 # single-tenant operators unaffected. Real sessions, resolver and guard.
 __tests__/auth/connect-credential-authorization.test.ts
 
+# Provider secrets: the platform AuthProvider collection is admin-only and
+# redacted, and per-project deploy-provider credentials are ADMIN-floored with
+# the decrypted material never leaving the server (INT-11 / INT-12).
+tests/integration/provider-credential-floors.spec.ts
+
 # Operate decisions (approve a parked agent request, run or undo a repair,
 # dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
 # create/merge/discard branches, publish) authorized membership only, so a Cloud
