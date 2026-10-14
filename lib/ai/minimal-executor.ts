@@ -4348,6 +4348,19 @@ async function executeCreateTable(
       console.warn(`[AI Executor] Realtime trigger install failed (non-fatal):`, rtErr?.message)
     }
 
+    // ── Webhook row-capture follows the project, like realtime above ─────────
+    // syncWebhookCapture's contract says it runs "after a table is added", but
+    // nothing on the creation path ever called it, so a webhook saved on
+    // Monday never saw rows written to a table created on Tuesday — while the
+    // Webhooks page promised capture "for every writer". Idempotent, and a
+    // no-op when the project has no active row webhooks.
+    try {
+      const { syncWebhookCapture } = await import('@/lib/webhooks/capture')
+      await syncWebhookCapture(projectId)
+    } catch (whErr: any) {
+      console.warn(`[AI Executor] Webhook capture sync failed (non-fatal):`, whErr?.message)
+    }
+
     // ── Auto-create storage buckets for video/asset domain tables ────────────
     // When a generation_jobs, render_jobs, or similar video/asset table is created,
     // automatically provision the "videos", "thumbnails", and "source-assets" buckets

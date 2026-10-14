@@ -102,6 +102,15 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# Trigger webhooks fired a RAW fetch on the stored URL from the web process and
+# persisted the failure text — an SSRF primitive with a persistence layer,
+# readable back over MCP — while endpoint webhooks had already moved to
+# safeFetch. And syncWebhookCapture's "after a table is added" contract had no
+# caller on any creation path, so webhooks never saw rows in newer tables.
+# Pins guard-validated creation, guarded delivery (raw fetch never touched),
+# the capped stored failure, and the capture sync on CREATE_TABLE.
+__tests__/services/trigger-webhook-egress.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
