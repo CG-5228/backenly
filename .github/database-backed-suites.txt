@@ -102,6 +102,15 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# Schema snapshots stored ZERO tables (the parser expected a format the
+# introspector never emitted), so the History snapshot view was always empty
+# and rollback diffed two empty sets and reported "Dropped 0 table(s)" as
+# success. Pins catalog-true snapshots (columns, types, uniques, defaults,
+# FKs), a real rollback that names what it dropped, the users-table guard,
+# honest failure when dropped structure cannot be recreated, and the no-diff
+# answer.
+__tests__/database/schema-version-snapshots.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
