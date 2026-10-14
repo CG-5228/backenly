@@ -47,3 +47,5 @@ Relative to `https://backenly.com/api/v1/{projectId}`, with `x-api-key: <project
 | POST | `/auth/verify-email` | `{ token }` |
 
 Send the access token as `X-User-Token` on data requests; that is what row-level security reads. `users` is never served through `/db/users`.
+
+OAuth `redirect_to` only redirects to a **connected frontend origin** — connect it first with `connect { "action": "connect_frontend", "url": "…" }`. An unconnected origin never receives a token: the OAuth start refuses with `REDIRECT_NOT_ALLOWED` so the failure is visible on your screen, not after the provider round-trip.
