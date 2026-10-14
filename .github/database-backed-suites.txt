@@ -102,6 +102,20 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# Workspace OAuth client credentials (end-user social sign-in). The routes took
+# the project from the x-project-id header after requireAuth and nothing else,
+# so any signed-in account could list, replace or delete another project's OAuth
+# client. Pins the role ladder: stranger nothing (404, no existence oracle),
+# VIEWER read, DEVELOPER save, ADMIN delete. Real sessions, real resolver, real
+# membership rows.
+__tests__/auth/workspace-oauth-authorization.test.ts
+
+# The workspace ZIP download had the same shape: authenticated, then the header
+# project id trusted. Pins that the guard is getCurrentProjectId like its
+# workspace/files siblings: 401 / 403 / 404 / 400 before any disk access, and an
+# authorized caller reaches the route's own disk lookup.
+__tests__/auth/workspace-download-authorization.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
