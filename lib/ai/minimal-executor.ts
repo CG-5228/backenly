@@ -11223,42 +11223,11 @@ async function executeRemoveIntegrationKey(params: any, projectId: string): Prom
 // BACKGROUND JOBS / CRON SCHEDULING
 // ============================================================================
 
-/**
- * Translate human-readable schedule to a cron expression.
- * e.g. "every day at 9am" → "0 9 * * *"
- */
-function toCronExpression(schedule: string): string {
-  const s = schedule.toLowerCase().trim()
-
-  // Already a cron expression (5 parts)
-  if (/^[\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+$/.test(s)) {
-    return s
-  }
-
-  // Common patterns
-  if (s.includes('every minute') || s === 'minutely') return '* * * * *'
-  if (s.includes('every 5 min')) return '*/5 * * * *'
-  if (s.includes('every 15 min')) return '*/15 * * * *'
-  if (s.includes('every 30 min')) return '*/30 * * * *'
-  if (s.includes('every hour') || s === 'hourly') return '0 * * * *'
-  if (s.includes('every day') || s === 'daily') {
-    const hourMatch = s.match(/at (\d+)(am|pm)?/)
-    if (hourMatch) {
-      let hour = parseInt(hourMatch[1])
-      if (hourMatch[2] === 'pm' && hour < 12) hour += 12
-      if (hourMatch[2] === 'am' && hour === 12) hour = 0
-      return `0 ${hour} * * *`
-    }
-    return '0 9 * * *' // default 9am
-  }
-  if (s.includes('every week') || s === 'weekly') return '0 9 * * 1' // Monday 9am
-  if (s.includes('every month') || s === 'monthly') return '0 9 1 * *' // 1st of month 9am
-  if (s.includes('midnight')) return '0 0 * * *'
-  if (s.includes('noon')) return '0 12 * * *'
-
-  // Default: daily at 9am
-  return '0 9 * * *'
-}
+// Schedule parsing lives in lib/services/cron-expression.ts, shared with the
+// runner that fires the jobs. The parser that used to live here defaulted every
+// phrase it did not recognise to daily 09:00 UTC — including the console's own
+// example "Every night at 02:00" — and the job then silently ran seven hours
+// late. An unrecognised schedule is now a refusal, never a default.
 
 /**
  * CREATE_CRON_JOB: Create a scheduled background job (AI function + schedule)
@@ -11275,7 +11244,17 @@ async function executeCreateCronJob(params: any, projectId: string): Promise<Exe
   if (!schedule) return { success: false, message: 'schedule is required (e.g. "every day at 9am", "0 9 * * *")' }
 
   try {
-    const cronExpr = toCronExpression(schedule)
+    const { scheduleToCron } = await import('@/lib/services/cron-expression')
+    const cronExpr = scheduleToCron(schedule)
+    if (!cronExpr) {
+      return {
+        success: false,
+        message:
+          `Could not understand the schedule "${schedule}", so no job was created. ` +
+          `Pass a five-field cron expression (e.g. "0 2 * * *" for 02:00 UTC daily, "0 9 * * 1-5" for weekdays at 09:00 UTC) ` +
+          `or a phrase like "every 10 minutes", "every day at 21:30", "every weekday at 8am", "every monday at 9am". All times are UTC.`,
+      }
+    }
     const { generateFunctionCode } = await import('@/lib/services/ai-functions/generator')
     const { prisma: db } = await import('@/lib/db')
 
@@ -11305,7 +11284,7 @@ async function executeCreateCronJob(params: any, projectId: string): Promise<Exe
 
     return {
       success: true,
-      message: `Scheduled job created: "${fn.name}"\n\nSchedule: ${schedule} (${cronExpr})\nDescription: ${description}\n\nThe job will run automatically on the configured schedule.`,
+      message: `Scheduled job created: "${fn.name}"\n\nSchedule: ${schedule} (${cronExpr}, UTC)\nDescription: ${description}\n\nThe job will run automatically on the configured schedule.`,
       data: { functionId: fn.id, name: fn.name, cron: cronExpr },
     }
   } catch (error: any) {
