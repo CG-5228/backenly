@@ -102,6 +102,14 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# The dashboard's Insert/Edit/Delete row buttons ran bare prisma writes, which
+# FORCE row-level security refuses under the production app role — the better
+# the agent's RLS, the more broken the data grid. getTableRows was fixed to
+# read as owner; the writes were not. Pins the refusal premise under a
+# non-superuser role, all three writes through the service-role machinery
+# (environment-independent mechanism pin), and the real row effects.
+__tests__/database/dashboard-row-writes-rls.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
