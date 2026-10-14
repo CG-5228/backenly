@@ -576,6 +576,15 @@ tests/integration/mcp-acceptance-cases.spec.ts
 # hardcoded 10 GB on the S3 path, and never a client-supplied storageUsed.
 __tests__/storage/storage-quota-follows-plan.test.ts
 
+# The nightly cleanup sweep destroyed live data two ways: an "incomplete
+# uploads" step that soft-deleted 100 arbitrary active rows per run without ever
+# checking storage, and an orphan sweep whose known-paths set excluded
+# soft-deleted rows, so files inside the 7-day recovery window had their objects
+# physically destroyed. Pins: active files untouched, retention honoured both
+# ways, fresh objects/rows spared by grace windows, dryRun inert. Real database;
+# S3 is the injected in-memory double the function signature exists for.
+__tests__/storage/storage-lifecycle-cleanup.test.ts
+
 # The usage ledger counts every metered quantity exactly once: batches applied
 # with an exactly-once id, a failed or ambiguous flush retried without double
 # counting, a SIGTERM spool replayed once, and an insert-only monthly close.
