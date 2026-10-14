@@ -1945,7 +1945,8 @@ export async function dispatchTool(
     // ── Read: agent workflow primer ───────────────────────────────────────
     if (name === 'get_instructions') {
       const pid = ctx.projectId
-      const base = `https://backenly.com/api/v1/${pid}`
+      const { appOrigin } = await import('@/lib/mcp/oauth')
+      const base = `${appOrigin()}/api/v1/${pid}`
       // ── Every tool named below MUST be one the manifest advertises ───────────
       //
       // This guide used to instruct agents to call `get_backend_metadata`,
