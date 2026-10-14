@@ -20,6 +20,7 @@ import { enforceRateLimitByKeyId } from '../lib/auth'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
 import { hashApiKey, resolveEndUserFromToken, crossEnvironmentUserToken } from '../lib/end-user-identity'
 import { handleViaPostgrest } from './postgrest-handler'
+import { isFunctionSwitchedOff } from '@/lib/services/ai-functions/status'
 import { v1NotFoundBody } from '@/lib/api/v1/route-not-found'
 import {
   SERVICE_ROLE_IN_BROWSER,
@@ -421,11 +422,14 @@ async function handleDynamicRequest(req: Request, res: Response) {
       // may well be the one that works — which is also the only way it can
       // recover on its own.
       //
-      // 'disabled' remains a real refusal: that one is a deliberate act, not a
-      // side effect of a runtime error.
-      if (fn.status === 'disabled' || fn.status === 'deleted') {
+      // A deliberate OFF remains a real refusal: that one is an owner's act,
+      // not a side effect of a runtime error. The console toggle and MCP
+      // set_active write 'inactive' — this gate once listed only the older
+      // 'disabled'/'deleted' spellings, so a switched-off function stayed live
+      // here while every other surface said it was off.
+      if (isFunctionSwitchedOff(fn.status)) {
         res.status(409).json({
-          error: `Function "${fnName}" is disabled`,
+          error: `Function "${fnName}" is switched off`,
           code: 'FUNCTION_DISABLED',
           hint: 'Re-enable it from the project\'s Functions page, or regenerate it with generate_function.',
         })
