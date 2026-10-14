@@ -102,6 +102,15 @@ __tests__/auth/project-routes-authorization.test.ts
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
 
+# A parked branch merge replayed the migration log as it was at EXECUTION time,
+# so an agent could park an innocent merge and append statements before the
+# human clicked approve — breaking the approvals contract "what executes is
+# exactly what the human read". Pins the approved statement list frozen into
+# the request: a grown log refuses MERGE_STALE (unit and end-to-end through
+# createApprovalRequest/decideApproval), a matching log merges, and the
+# console's unpinned live-diff merge is unchanged.
+__tests__/branches/merge-approval-freeze.test.ts
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that

@@ -2306,7 +2306,10 @@ export async function dispatchTool(
       }
 
       if (name === 'merge_branch') {
-        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId)
+        const approvedMigrations = Array.isArray((args as any).approvedMigrations)
+          ? ((args as any).approvedMigrations as unknown[]).map(String)
+          : undefined
+        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId, approvedMigrations)
         if (!res.ok) return finalize({ ok: false, summary: (res as any).error, code: (res as any).code })
         const r: any = res
         const applied = r.applied?.length ? `Applied: ${r.applied.join('; ')}.` : 'Nothing was applied automatically.'
