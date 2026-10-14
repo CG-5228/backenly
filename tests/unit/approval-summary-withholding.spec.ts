@@ -30,14 +30,16 @@ describe('storableResultSummary', () => {
     const projKey = `proj_live_${'A1b2C3d4'.repeat(4)}`
     const summary =
       `✅ **API key rotated.**\n\n**New key (copy now — shown once):**\n\`\`\`\n${skKey}\n\`\`\`\n` +
-      `Also minted ${mcpKey} and ${projKey} for postgres://u:hunter2-secret@db/x`
+      // 'example' in the password marks the DSN illustrative for the OSS
+      // preflight scanner; the withholder redacts by URL shape either way.
+      `Also minted ${mcpKey} and ${projKey} for postgres://u:hunter2-example@localhost:5432/x`
 
     const stored = storableResultSummary(summary)
 
     expect(stored).not.toContain(mcpKey)
     expect(stored).not.toContain(skKey)
     expect(stored).not.toContain(projKey)
-    expect(stored).not.toContain('hunter2-secret')
+    expect(stored).not.toContain('hunter2-example')
     expect(stored).toContain('[withheld]')
     expect(stored.length).toBeLessThanOrEqual(2000)
   })

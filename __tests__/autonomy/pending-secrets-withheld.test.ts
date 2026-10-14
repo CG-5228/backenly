@@ -17,11 +17,13 @@
  *   - the health endpoint serves legacy rows redacted too, so pre-fix rows
  *     stop leaking the moment this ships
  *
- * Real database, real route handler, real crypto. JWT_SECRET comes from the
- * environment (the sealing key derives from it), as in CI and production.
+ * Real database, real route handler, real crypto. The sealing key derives from
+ * JWT_SECRET and refuses anything under 32 characters, so the suite sets its
+ * own sealing-grade secret up front (CI's env secret is short) and restores
+ * the original afterwards.
  */
 
-import { randomUUID } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { prisma } from '@/lib/db/prisma'
 import { createSession } from '@/lib/auth/session'
 import { queuePendingActionFinding } from '@/lib/operational-memory/ledger'
@@ -30,6 +32,16 @@ import { sealParams, unsealParams } from '@/lib/operational-memory/sealed-params
 import { resetSingleTenantCache } from '@/lib/edition/single-tenant/project-resolver'
 
 const DB_URL = process.env.TEST_DATABASE_URL
+
+const savedJwtSecret = process.env.JWT_SECRET
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  // Random per run: sealing and unsealing happen inside this one process.
+  process.env.JWT_SECRET = randomBytes(32).toString('hex')
+}
+afterAll(() => {
+  if (savedJwtSecret === undefined) delete process.env.JWT_SECRET
+  else process.env.JWT_SECRET = savedJwtSecret
+})
 
 function assertSafeTestDatabase(): void {
   if (process.env.NODE_ENV !== 'test') throw new Error('Refusing: NODE_ENV is not test')
