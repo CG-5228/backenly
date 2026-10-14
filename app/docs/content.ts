@@ -600,7 +600,7 @@ await backend.auth.signIn({ email, password })
       },
       {
         title: 'Roll back if you need to',
-        body: 'Pick an earlier version to make it current again. If a publish fails, the version before it stays current.',
+        body: 'Pick an earlier version to mark it current in the history. This is bookkeeping: the live schema and data are unchanged. To restore structure, use the Database page schema History or a Snapshot.',
       },
     ],
     prompts: ['Is my backend ready to publish? List anything that is blocking it.'],

@@ -2159,7 +2159,7 @@ export async function validateAction(
 
     case 'ROLLBACK_DEPLOY':
       preview = action.params.version ? `Rollback to v${action.params.version}` : 'Rollback to previous deployment'
-      warnings.push('Live consumers will see the older schema immediately')
+      warnings.push('Moves the recorded current version only; the live schema, data and functions do not change')
       break
 
     case 'GET_READINESS':

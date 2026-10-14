@@ -1195,7 +1195,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       force: { type: 'boolean', description: 'Set true ONLY when the user has typed DEPLOY verbatim this turn.' },
     }),
   fn('rollback_deploy',
-    'DESTRUCTIVE. Revert the live backend to a previous published version. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status / list_apis first so you know which version you would be reverting to.',
+    'DESTRUCTIVE. Mark a previous published version as current in the version history. This is bookkeeping: it does NOT change the live schema, data, RLS or functions, and the API keeps serving exactly what is deployed now. To restore structure, roll back a schema version from the Database page or restore a Snapshot. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status first.',
     {
       version: { type: 'integer', description: 'Target published version number (e.g. 2). Either version OR deploymentId is required.' },
       deploymentId: { type: 'string', description: 'Specific deployment id to roll back to.' },
