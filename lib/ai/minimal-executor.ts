@@ -10299,7 +10299,7 @@ async function executeCreateAiFunction(params: any, projectId: string): Promise<
     // This prevents the LLM from generating internal-sounding names like
     // "describe_ai_function_with_trigger" when the name-generation call gets confused.
     const suppliedName = typeof params.name === 'string' && params.name.trim()
-      ? params.name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/__+/g, '_').replace(/^_|_$/g, '').slice(0, 50)
+      ? params.name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_').replace(/__+/g, '_').replace(/^[_-]|[_-]$/g, '').slice(0, 50)
       : null
 
     const generated = await generateFunctionCode(description, triggerType, triggerTable || null, projectId)
@@ -10915,47 +10915,51 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
         if (col2.success) autoWiredSteps.push(`✅ Added \`status\` to \`${tableName}\``)
       }
 
-      // Generate POST /checkout/session endpoint
-      const { executeGenerateFunction } = await import('@/lib/ai/function-generator')
-
-      const checkoutResult = await executeGenerateFunction(
+      // SANDBOX functions, not route modules: ctx.integrations only exists in
+      // the sandbox runtime, and route modules deliberately cannot reach stored
+      // provider keys (their curated env withholds them). The old auto-wire
+      // generated route modules whose own description told the model to call a
+      // ctx that does not exist there — every generated endpoint was dead on
+      // arrival (ReferenceError or an empty key).
+      const checkoutResult = await executeCreateAiFunction(
         {
-          functionName: 'stripe-checkout-session',
+          name: 'stripe-checkout-session',
+          triggerType: 'manual',
           description: [
             'Create a Stripe Checkout session.',
-            'Accept { lineItems, successUrl, cancelUrl, customerEmail? } in the request body.',
+            'Read { lineItems, successUrl, cancelUrl, customerEmail? } from event.data.',
             'Call ctx.integrations.stripe.createCheckoutSession({ lineItems, successUrl, cancelUrl, customerEmail }) — it returns { id, url }.',
             'Each lineItem is { price: "price_xxx", quantity } or { priceData: { currency, unitAmount, productName, recurringInterval? }, quantity }.',
-            'Require authentication — reject unauthenticated requests with 401.',
+            'If event.data has no lineItems, return { error: "lineItems required" } without calling Stripe.',
             'Return { checkoutUrl: session.url, sessionId: session.id }.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (checkoutResult.success) autoWiredSteps.push('✅ Generated `POST /checkout/session`')
+      if (checkoutResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/stripe-checkout-session\``)
 
-      // Generate the Stripe webhook handler.
-      // The platform receiver at POST /api/v1/{projectId}/webhooks/stripe already
-      // verifies the Stripe-Signature header and runs deterministic order/subscription
-      // updates BEFORE this function fires — so this function works on an
-      // already-verified event.data payload and must NOT re-verify signatures.
-      const webhookResult = await executeGenerateFunction(
+      // The Stripe webhook handler: triggerType on_webhook / triggerTable
+      // 'stripe' — the ONLY shape the platform receiver fires. It used to be
+      // stored as a 'manual' route module, which the receiver never fires
+      // (functionsTriggered: 0 on every delivery) while readiness reported the
+      // integration Complete.
+      const webhookResult = await executeCreateAiFunction(
         {
-          functionName: 'stripe-webhook',
+          name: 'stripe-webhook',
+          triggerType: 'on_webhook',
+          triggerTable: 'stripe',
           description: [
             'Process a verified Stripe webhook event delivered in event.data.',
             'The platform webhook receiver has already verified the signature — do not re-verify.',
             'Read event.data.type for the Stripe event type and event.data.data.object for the payload.',
-            'On checkout.session.completed: update the matching order row status to "paid".',
-            'On payment_intent.succeeded: log the payment.',
+            'On checkout.session.completed: update the matching order row status to "paid" via ctx.db.',
+            'On payment_intent.succeeded: ctx.log the payment.',
             'Return { handled: true } for recognised events.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (webhookResult.success) autoWiredSteps.push('✅ Generated `stripe-webhook` handler')
+      if (webhookResult.success) autoWiredSteps.push('✅ Generated `stripe-webhook` handler (fires on verified Stripe deliveries)')
     }
 
     // ── PROMPT 2.2: Email triggers ──────────────────────────────────────────
@@ -11000,45 +11004,42 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
 
     // ── PROMPT 2.3: AI route generation ────────────────────────────────────
     if (integrationId === 'openai' || integrationId === 'anthropic') {
-      const { executeGenerateFunction } = await import('@/lib/ai/function-generator')
-
-      // POST /ai/chat — rate-limited, auth-protected
-      const chatResult = await executeGenerateFunction(
+      // Sandbox functions: ctx.integrations.<id>.complete/embed only exist in
+      // the sandbox runtime (see the Stripe note above).
+      const chatResult = await executeCreateAiFunction(
         {
-          functionName: `${integrationId}-chat`,
+          name: `${integrationId}-chat`,
+          triggerType: 'manual',
           description: [
-            `AI chat endpoint backed by ${integrationId}.`,
-            'Accept { prompt, systemPrompt?, maxTokens? } in the request body.',
+            `AI chat backed by ${integrationId}.`,
+            'Read { prompt, systemPrompt?, maxTokens? } from event.data.',
             `Call ctx.integrations.${integrationId}.complete(prompt, maxTokens, systemPrompt) — it returns the assistant reply as a string.`,
-            'Apply rate limiting of 10 requests per minute per authenticated user.',
-            'Require authentication — reject unauthenticated requests with 401.',
+            'If event.data has no prompt, return { error: "prompt required" } without calling the provider.',
             'Return { reply }.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (chatResult.success) autoWiredSteps.push('✅ Generated `POST /ai/chat` (rate-limited, auth-protected)')
+      if (chatResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/${integrationId}-chat\``)
 
-      // POST /ai/embed — OpenAI only. Anthropic has no embeddings API, so an
+      // Embeddings — OpenAI only. Anthropic has no embeddings API, so an
       // anthropic-embed function would be unrunnable — never generate it.
       if (integrationId === 'openai') {
-        const embedResult = await executeGenerateFunction(
+        const embedResult = await executeCreateAiFunction(
           {
-            functionName: 'openai-embed',
+            name: 'openai-embed',
+            triggerType: 'manual',
             description: [
-              'Text embedding endpoint backed by OpenAI.',
-              'Accept { text } in the request body.',
+              'Text embedding backed by OpenAI.',
+              'Read { text } from event.data.',
               'Call ctx.integrations.openai.embed(text) — it returns a number[] embedding vector.',
-              'Apply rate limiting of 20 requests per minute per authenticated user.',
-              'Require authentication — reject unauthenticated requests with 401.',
+              'If event.data has no text, return { error: "text required" } without calling the provider.',
               'Return { embedding }.',
             ].join(' '),
-            method: 'POST',
           },
           projectId,
         )
-        if (embedResult.success) autoWiredSteps.push('✅ Generated `POST /ai/embed` (rate-limited, auth-protected)')
+        if (embedResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/openai-embed\``)
       }
     }
 
