@@ -3055,7 +3055,7 @@ export async function dispatchTool(
         summary: clip([
           `${provisioned ? 'Provisioned' : 'Existing'} ${mode === 'READ_ONLY' ? 'read-only' : 'read-write'} Postgres access: role ${c.roleName} @ ${c.host}:${c.port}/${c.database} (TLS required, search_path pinned to ${status.schema}).`,
           mode === 'READ_ONLY'
-            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump. It cannot mutate anything.'
+            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump (run pg_dump with --enable-row-security; the returned pgDumpCommand includes it). It cannot mutate anything.'
             : 'DML + in-schema DDL. Every DDL statement you run is observed as drift — call adopt_external_schema when you finish migrating.',
           'The connection string is in data.connectionString — treat it as a secret (do not write it into code, files, or logs; reference it from env).',
         ].join('\n')),
@@ -3103,7 +3103,7 @@ export async function dispatchTool(
           'schema change made over that connection is observed as drift and adopted by the autonomy loop, ' +
           'which is why it is opt-in. Then call this tool again with mode=READ_WRITE.\n' +
           'Read-only access needs no approval and is available right now via mode=READ_ONLY — it covers ' +
-          'inspection, EXPLAIN, BI and pg_dump. For SCHEMA CHANGES you do not need direct access at all: ' +
+          'inspection, EXPLAIN, BI and pg_dump (with --enable-row-security — the returned pgDumpCommand includes it). For SCHEMA CHANGES you do not need direct access at all: ' +
           'apply_migration takes ordinary DDL and is governed, verified and reversible.',
         data: access,
       })
