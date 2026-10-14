@@ -163,7 +163,15 @@ function GeneralTab({ projectId, onDeleted }: { projectId: string; onDeleted: ()
     }
   }
 
-  const apiBaseUrl = project?.apiUrlProd || project?.apiUrlStaging || project?.apiUrlDev || null
+  // The live base has been the same since the project's first request:
+  // {origin}/api/v1/{projectId}. The old read keyed off apiUrlProd/Staging/Dev,
+  // columns nothing in the product ever writes (the console creates projects
+  // with a name only), so this row said "Set when the project is first
+  // published" forever — publishing never set it either. An operator-supplied
+  // override still wins when one of those columns is actually filled.
+  const apiBaseUrl =
+    project?.apiUrlProd || project?.apiUrlStaging || project?.apiUrlDev ||
+    (typeof window !== 'undefined' ? `${window.location.origin}/api/v1/${projectId}` : null)
 
   const confirmDelete = async () => {
     if (deleteText !== (project?.name ?? '')) return
@@ -245,7 +253,7 @@ function GeneralTab({ projectId, onDeleted }: { projectId: string; onDeleted: ()
             {apiBaseUrl ? (
               <CopyField value={apiBaseUrl} />
             ) : (
-              <span className="text-zinc-500">Set when the project is first published</span>
+              <span className="text-zinc-500">—</span>
             )}
           </DetailRow>
           <DetailRow label="Runs on">
