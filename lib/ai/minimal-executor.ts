@@ -6373,7 +6373,7 @@ async function executeCreateBucket(params: any, projectId: string): Promise<Exec
     const { prisma: prismaVerify } = await import('@/lib/db')
     const verified = await prismaVerify.storageBucket.findFirst({
       where: { name: bucketName, projectId },
-      select: { id: true, name: true, isPublic: true },
+      select: { id: true, name: true, isPublic: true, accessPolicy: true },
     })
 
     if (!verified) {
@@ -6405,7 +6405,11 @@ async function executeCreateBucket(params: any, projectId: string): Promise<Exec
       console.warn('[executeCreateBucket] Graph update failed:', graphErr)
     }
 
-    const visibilityLabel = isPublic ? 'public' : 'private'
+    // Reported from the ENFORCED field, read back — not from the request.
+    const visibilityLabel =
+      verified.accessPolicy === 'public_read' || verified.accessPolicy === 'cdn_cacheable'
+        ? 'public'
+        : 'private'
     const bucketList = allBucketNames.map(b => `  • ${b}`).join('\n')
     const message = [
       `Done — created \`${bucketName}\` bucket.`,
@@ -6425,7 +6429,13 @@ async function executeCreateBucket(params: any, projectId: string): Promise<Exec
     return {
       success: true,
       message,
-      data: { bucketId: verified.id, bucketName: verified.name, isPublic: verified.isPublic, verified: true },
+      data: {
+        bucketId: verified.id,
+        bucketName: verified.name,
+        isPublic: verified.isPublic,
+        accessPolicy: verified.accessPolicy,
+        verified: true,
+      },
       artifacts: { buckets: [bucketName] },
       diff: { added: [bucketName], modified: [], removed: [] },
       verifiedAt: new Date().toISOString(),
@@ -6461,11 +6471,21 @@ async function executeSetBucketPublic(params: any, projectId: string): Promise<E
     const bucket = await prisma.storageBucket.findFirst({ where: { name: bucketName, projectId } })
     if (!bucket) return { success: false, message: `Bucket "${bucketName}" not found` }
 
-    await prisma.storageBucket.update({ where: { id: bucket.id }, data: { isPublic } })
+    // accessPolicy is the field serving, upload clamping and the console
+    // enforce; isPublic is a label. Writing only the label told the agent
+    // "now public" (or worse, "now private" after a leak) while every object
+    // kept serving exactly as before. Both are written, then READ BACK, and
+    // the answer reports the enforced state.
+    const updated = await prisma.storageBucket.update({
+      where: { id: bucket.id },
+      data: { isPublic, accessPolicy: isPublic ? 'public_read' : 'private' },
+      select: { isPublic: true, accessPolicy: true },
+    })
+    const enforcedPublic = updated.accessPolicy === 'public_read' || updated.accessPolicy === 'cdn_cacheable'
     return {
       success: true,
-      message: `✅ Bucket **"${bucketName}"** is now **${isPublic ? 'public' : 'private'}**`,
-      data: { bucketName, isPublic },
+      message: `✅ Bucket **"${bucketName}"** is now **${enforcedPublic ? 'public' : 'private'}** (access policy: ${updated.accessPolicy})`,
+      data: { bucketName, isPublic: updated.isPublic, accessPolicy: updated.accessPolicy },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to update bucket: ${error.message}`, error: error.message }
@@ -6488,9 +6508,13 @@ async function executeListBuckets(projectId: string): Promise<ExecutionResult> {
       }
     }
 
-    const list = buckets.map(b =>
-      `• **${b.name}** — ${b.fileCount} file${b.fileCount !== 1 ? 's' : ''} · ${b.isPublic ? 'public' : 'private'}`
-    ).join('\n')
+    const list = buckets.map(b => {
+      // Report the ENFORCED visibility (accessPolicy), not the isPublic label:
+      // the two disagreed on buckets whose policy was changed elsewhere, and
+      // this read-back is how an agent confirms a set_public took effect.
+      const enforcedPublic = b.accessPolicy === 'public_read' || b.accessPolicy === 'cdn_cacheable'
+      return `• **${b.name}** — ${b.fileCount} file${b.fileCount !== 1 ? 's' : ''} · ${enforcedPublic ? 'public' : 'private'} (${b.accessPolicy})`
+    }).join('\n')
 
     // StorageBucket carries BigInt columns (storageUsed / maxFileSize). Left raw,
     // they crash JSON.stringify at the MCP boundary ("Do not know how to

@@ -576,6 +576,14 @@ tests/integration/mcp-acceptance-cases.spec.ts
 # hardcoded 10 GB on the S3 path, and never a client-supplied storageUsed.
 __tests__/storage/storage-quota-follows-plan.test.ts
 
+# Bucket visibility must be TRUE: create_bucket/set_public wrote only the
+# isPublic label while serving, upload clamping and the console enforce
+# accessPolicy, so the agent was told "now private" after a leak while every
+# object kept serving to anonymous callers. Pins both fields written together,
+# the lock-down of a diverged legacy bucket, and read-backs (create message,
+# set_public, list_buckets) reporting the ENFORCED policy via the real mayRead.
+__tests__/storage/bucket-visibility-truth.test.ts
+
 # The usage ledger counts every metered quantity exactly once: batches applied
 # with an exactly-once id, a failed or ambiguous flush retried without double
 # counting, a SIGTERM spool replayed once, and an insert-only monthly close.
