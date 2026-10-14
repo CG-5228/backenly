@@ -577,6 +577,7 @@ tests/integration/project-activity-clock.spec.ts
 # approves it. Runs as the cloud edition with only the plan lookup supplied,
 # because the single-tenant resolver rightly refuses a database of many projects.
 tests/integration/mcp-domain-operations.spec.ts
+tests/integration/overview-truthful-counts.spec.ts
 
 # Sandbox function runs lost every ctx.log line, after a success and after a
 # failure: the worker sends them in the message that ends the run, and the
