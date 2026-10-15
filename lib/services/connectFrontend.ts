@@ -111,11 +111,12 @@ async function getDeployedVersion(projectId: string): Promise<{ deployed: boolea
     return { deployed: true, version: 1 }
   }
 
-  return {
-    deployed: false,
-    reason:
-      "I can't connect a frontend yet because your backend hasn't been deployed.\n\nDeploy your backend first, then connect your app.",
-  }
+  // Not published — which is NOT a reason to refuse the connection. The
+  // runtime serves unpublished projects on every surface (/db, /auth, /fn,
+  // realtime), local development runs against them, and the OAuth
+  // redirect_to allowlist reads ConnectedApp — so refusing here locked
+  // developers out of the exact flows that must work before a first publish.
+  return { deployed: false }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,10 +138,10 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
     }
   }
 
+  // The deployed version is informational: it labels the confirmation and
+  // the ConnectedApp row, and an unpublished backend connects as version 0.
   const deploy = await getDeployedVersion(projectId)
-  if (!deploy.deployed) {
-    return { success: false, message: deploy.reason!, connected: false, errors: ['backend not deployed'] }
-  }
+  const backendVersion = deploy.deployed ? deploy.version! : 0
 
   const existing = await prisma.connectedApp.findUnique({
     where: { projectId_origin: { projectId, origin } },
@@ -162,13 +163,15 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
       message:
         `You're about to connect this frontend:\n\n` +
         `• URL: ${origin}\n` +
-        `• Backend version: v${deploy.version} (deployed)\n\n` +
+        (deploy.deployed
+          ? `• Backend version: v${deploy.version} (published)\n\n`
+          : `• Backend: not published yet — the API already answers; publishing adds a stable public URL\n\n`) +
         `Once connected, this app can call your backend APIs.\n\n` +
         `Type CONNECT to confirm.`,
       connected: false,
       requiresConfirmation: true,
       origin,
-      backendVersion: deploy.version,
+      backendVersion,
     }
   }
 
@@ -177,7 +180,7 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
     update: {
       isActive: true,
       connectedBy: confirmedBy,
-      backendVersion: deploy.version!,
+      backendVersion,
       connectedAt: new Date(),
       disconnectedAt: null,
     },
@@ -186,7 +189,7 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
       origin,
       isActive: true,
       connectedBy: confirmedBy,
-      backendVersion: deploy.version!,
+      backendVersion,
     },
   })
 
@@ -199,7 +202,7 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
       type: 'connected_app',
       details: JSON.stringify({
         origin,
-        backendVersion: deploy.version,
+        backendVersion,
         triggerSource: confirmedBy,
         resourceId: row.id,
         timestamp: new Date().toISOString(),
@@ -219,7 +222,7 @@ export async function connectFrontend(options: ConnectFrontendOptions): Promise<
     message: `Connected: ${origin}\n\nYour frontend can now call your backend APIs.`,
     connected: true,
     origin,
-    backendVersion: deploy.version,
+    backendVersion,
   }
 }
 

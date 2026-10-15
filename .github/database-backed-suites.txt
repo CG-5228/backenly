@@ -815,6 +815,13 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# "Already up to date" is decided by a hash of the live catalog, recorded on
+# the Deployment row, never by the graph pointer the MCP schema path does not
+# move: an agent ALTER publishes a new version, an unchanged catalog is a
+# truthful no-op, and a legacy row without a hash never claims up to date.
+# Real workspace DDL and Deployment rows are the property.
+tests/integration/publish-noop-truth.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.

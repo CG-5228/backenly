@@ -6660,7 +6660,7 @@ async function executeListConnectedApps(projectId: string): Promise<ExecutionRes
       return {
         success: true,
         message:
-          '**Connected Frontends:**\n\nNone yet. Try: _"Connect my Replit app at https://app.replit.com/my-app"_\n\nFor anything to connect, your backend must be deployed first.',
+          '**Connected Frontends:**\n\nNone yet. Try: _"Connect my Replit app at https://app.replit.com/my-app"_\n\nConnecting works before a first publish too — the API already answers.',
         data: { apps: [], active: [] },
       }
     }
