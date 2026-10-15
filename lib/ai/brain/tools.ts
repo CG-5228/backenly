@@ -1814,11 +1814,37 @@ const FIX_TARGET_TO_ACTION: Record<string, AIAction['action']> = {
  * their chat. This is the standard funded-platform pattern: the model gets to
  * iterate against the validator in private; users only see real work.
  */
+/** Required-args index, built once from the schemas the model is shown. */
+const REQUIRED_ARGS_BY_TOOL: Record<string, string[]> = Object.fromEntries(
+  BRAIN_TOOLS.map((t) => [t.function.name, (t.function.parameters as any)?.required ?? []]),
+)
+
 function preflightValidate(
   name: string,
   args: Record<string, unknown>,
   ctx: ToolDispatchContext,
 ): ToolResult | null {
+  // ── Generic: a declared-required argument is missing ─────────────────────
+  // The schema already tells the model what is required; dispatch used to
+  // enforce none of it, so `realtime { action: "enable" }` with no tableName
+  // slid through and the executor enabled realtime on EVERY table. Tools
+  // with alternatives (userId OR email) declare `required: []` on purpose
+  // and are untouched by this check.
+  const requiredArgs = REQUIRED_ARGS_BY_TOOL[name]
+  if (requiredArgs?.length) {
+    const missing = requiredArgs.filter((k) => {
+      const v = args[k]
+      return v === undefined || v === null || (typeof v === 'string' && v.trim() === '')
+    })
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        summary: `${name} requires ${missing.map((m) => `\`${m}\``).join(', ')} — the call was not run.`,
+        code: 'MISSING_REQUIRED_ARGUMENT',
+      }
+    }
+  }
+
   switch (name) {
     case 'fix_backend': {
       const target = typeof args.target === 'string' ? args.target : ''

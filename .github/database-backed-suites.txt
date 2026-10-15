@@ -835,6 +835,13 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# Realtime scope is explicit: enable without a tableName refuses instead of
+# silently streaming every table, allTables is the named project-wide switch,
+# the brain dispatch refuses any call missing a declared-required argument,
+# and both park paths name the tables a project-wide disable stops. Real
+# workspace tables and NOTIFY triggers are the property.
+tests/integration/realtime-scope-truth.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
