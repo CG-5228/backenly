@@ -1203,7 +1203,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       force: { type: 'boolean', description: 'Set true ONLY when the user has typed DEPLOY verbatim this turn.' },
     }),
   fn('rollback_deploy',
-    'DESTRUCTIVE. Revert the live backend to a previous published version. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status / list_apis first so you know which version you would be reverting to.',
+    'DESTRUCTIVE. Mark a previous published version as current in the version history. This is bookkeeping: it does NOT change the live schema, data, RLS or functions, and the API keeps serving exactly what is deployed now. To restore structure, roll back a schema version from the Database page or restore a Snapshot. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status first.',
     {
       version: { type: 'integer', description: 'Target published version number (e.g. 2). Either version OR deploymentId is required.' },
       deploymentId: { type: 'string', description: 'Specific deployment id to roll back to.' },
@@ -1953,7 +1953,8 @@ export async function dispatchTool(
     // ── Read: agent workflow primer ───────────────────────────────────────
     if (name === 'get_instructions') {
       const pid = ctx.projectId
-      const base = `https://backenly.com/api/v1/${pid}`
+      const { appOrigin } = await import('@/lib/mcp/oauth')
+      const base = `${appOrigin()}/api/v1/${pid}`
       // ── Every tool named below MUST be one the manifest advertises ───────────
       //
       // This guide used to instruct agents to call `get_backend_metadata`,
@@ -2314,7 +2315,10 @@ export async function dispatchTool(
       }
 
       if (name === 'merge_branch') {
-        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId)
+        const approvedMigrations = Array.isArray((args as any).approvedMigrations)
+          ? ((args as any).approvedMigrations as unknown[]).map(String)
+          : undefined
+        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId, approvedMigrations)
         if (!res.ok) return finalize({ ok: false, summary: (res as any).error, code: (res as any).code })
         const r: any = res
         const applied = r.applied?.length ? `Applied: ${r.applied.join('; ')}.` : 'Nothing was applied automatically.'
