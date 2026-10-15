@@ -139,6 +139,15 @@ __tests__/auth/workspace-download-authorization.test.ts
 # single-tenant operators unaffected. Real sessions, resolver and guard.
 __tests__/auth/connect-credential-authorization.test.ts
 
+# Provider secrets: the platform AuthProvider collection is admin-only and
+# redacted, and per-project deploy-provider credentials are ADMIN-floored with
+# the decrypted material never leaving the server (INT-11 / INT-12).
+tests/integration/provider-credential-floors.spec.ts
+# Settings API keys are a PROJECT surface (admins see and revoke agent keys,
+# ex-members do not), and the withProjectAccess routes carry explicit floors:
+# share-report ADMIN, Supabase import DEVELOPER (SET-03 / SET-04).
+tests/integration/settings-keys-and-floors.spec.ts
+
 # Operate decisions (approve a parked agent request, run or undo a repair,
 # dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
 # create/merge/discard branches, publish) authorized membership only, so a Cloud
@@ -663,6 +672,7 @@ tests/integration/project-activity-clock.spec.ts
 # because the single-tenant resolver rightly refuses a database of many projects.
 tests/integration/mcp-domain-operations.spec.ts
 tests/integration/dbtools-secret-redaction.spec.ts
+tests/integration/overview-truthful-counts.spec.ts
 
 # Sandbox function runs lost every ctx.log line, after a success and after a
 # failure: the worker sends them in the message that ends the run, and the
@@ -838,6 +848,20 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# API keys live an honest lifecycle: create_api_key stamps no silent expiry
+# (opt-in expiresInDays is stored, returned and named), and
+# set_key_permissions parks unapproved calls, validates the real permission
+# vocabulary, refuses admin escalation and service-role edits even when
+# approved, and narrows with a before/after receipt. Real key rows are the
+# property.
+tests/integration/key-lifecycle-honesty.spec.ts
+# The integrations connect door keeps its contract: unknown provider ids are
+# refused with the served list, any alias or casing stores under the one
+# canonical id everything looks up, disconnect clears what the console reads
+# on both doors, and OneSignal connects fully (REST key + App ID) through the
+# typed call with send_push naming what is missing. Real vault rows are the
+# property; PostHog (stored-unverifiable) keeps CI off external APIs.
+tests/integration/integrations-connect-contract.spec.ts
 # The agent can set the access policy the runtime enforces: set_bucket_policy
 # writes all four values to a real bucket row with the derived isPublic
 # label, refuses unknown policies naming the vocabulary, and the catalog and
