@@ -37,9 +37,11 @@ tests/bench/prisma-uuid-binding.spec.ts
 tests/build-runs/build-run-service.test.ts
 tests/build-runs/hydration.test.ts
 tests/integration/mcp-oauth-flow.spec.ts
+tests/integration/mcp-transport-hygiene.spec.ts
 tests/integration/webhook-delivery.spec.ts
 tests/integration/webhook-trigger-url-required.spec.ts
 tests/integration/state-webhooks-section.spec.ts
+tests/integration/integrations-auto-wiring.spec.ts
 tests/integration/end-user-email-verification-opt-in.spec.ts
 tests/integration/signin-enumeration.spec.ts
 tests/integration/project-smtp-and-templates.spec.ts
@@ -83,6 +85,7 @@ tests/integration/rate-limit-shared-store.spec.ts
 
 __tests__/projects/deletion-transaction.test.ts
 __tests__/projects/purge-outbox.test.ts
+tests/integration/project-deletion-complete.spec.ts
 
 # The ProjectResolver regression matrix (commit 2). Pins the behaviour the ~70
 # authorization call sites are being migrated TO, before they are migrated, so
@@ -135,6 +138,15 @@ __tests__/auth/workspace-download-authorization.test.ts
 # effect, ADMIN/OWNER allowed, masked key list stays a VIEWER read, and
 # single-tenant operators unaffected. Real sessions, resolver and guard.
 __tests__/auth/connect-credential-authorization.test.ts
+
+# Provider secrets: the platform AuthProvider collection is admin-only and
+# redacted, and per-project deploy-provider credentials are ADMIN-floored with
+# the decrypted material never leaving the server (INT-11 / INT-12).
+tests/integration/provider-credential-floors.spec.ts
+# Settings API keys are a PROJECT surface (admins see and revoke agent keys,
+# ex-members do not), and the withProjectAccess routes carry explicit floors:
+# share-report ADMIN, Supabase import DEVELOPER (SET-03 / SET-04).
+tests/integration/settings-keys-and-floors.spec.ts
 
 # Operate decisions (approve a parked agent request, run or undo a repair,
 # dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
@@ -659,6 +671,8 @@ tests/integration/project-activity-clock.spec.ts
 # approves it. Runs as the cloud edition with only the plan lookup supplied,
 # because the single-tenant resolver rightly refuses a database of many projects.
 tests/integration/mcp-domain-operations.spec.ts
+tests/integration/dbtools-secret-redaction.spec.ts
+tests/integration/overview-truthful-counts.spec.ts
 
 # Sandbox function runs lost every ctx.log line, after a success and after a
 # failure: the worker sends them in the message that ends the run, and the
