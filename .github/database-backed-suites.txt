@@ -54,6 +54,13 @@ tests/integration/function-egress-guard.spec.ts
 tests/integration/function-row-events-data-plane.spec.ts
 tests/integration/project-route-response-shape.spec.ts
 tests/integration/realtime-sse-slot-release.spec.ts
+
+# Connect auto-wiring does what its receipt lists: Stripe adds the payment
+# columns and registers a webhook handler in the one shape the receiver fires,
+# email providers wire the on_signup welcome trigger only where auth exists,
+# and every connect syncs activeIntegrations. The live provider probe and the
+# LLM generator are the two stubbed seams; vault, executor and DDL are real.
+tests/integration/integrations-autowiring.spec.ts
 tests/integration/export-database-rls.spec.ts
 tests/integration/postgres-admin.spec.ts
 
