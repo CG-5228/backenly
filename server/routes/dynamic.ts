@@ -67,6 +67,12 @@ interface AuthResolution {
   branchSchema?: string
   /** The bound branch's name, for the X-Backenly-Environment response header. */
   branchName?: string
+  /**
+   * The key's granular permission set, for the method gate both data doors
+   * apply. Only set when a KEY authenticated: Bearer identities carry their
+   * authority in the token (end-user RLS, platform service-role), not here.
+   */
+  permissions?: string[]
   error?: string
   code?: string
   /** Replaces the generic "include a credential" hint when the credential was present but wrong. */
@@ -78,6 +84,37 @@ interface AuthResolution {
  * implementations for two surfaces over one data plane is how a fix lands on
  * one and not the other.
  */
+/**
+ * The method gate for a key's granular permissions, shared by both data doors.
+ *
+ * `set_key_permissions` and the key editor have always written
+ * `ApiKey.permissions`, and the legacy Express routers checked it — but the
+ * data plane (/db here and /api/v2) never did, so a key narrowed to ['read']
+ * kept writing and the tool's "✅ permissions updated" changed nothing that
+ * mattered. Service-role keys bypass by definition, as in checkPermission;
+ * 'admin' grants everything via hasPermission. Returns true when it REFUSED
+ * (response already sent), mirroring refuseUnlessServing's contract.
+ */
+export function refuseIfKeyLacksMethodPermission(
+  req: Request,
+  res: Response,
+  auth: AuthResolution,
+): boolean {
+  if (!auth.keyId || auth.isServiceRole) return false
+  const required = req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'write'
+  const permissions = auth.permissions ?? []
+  const allowed = permissions.includes('admin') || permissions.includes(required)
+  if (allowed) return false
+  res.status(403).json({
+    code: 'INSUFFICIENT_KEY_PERMISSIONS',
+    error: `This API key does not have '${required}' permission.`,
+    required,
+    permissions,
+    hint: `The key's permission set is ${JSON.stringify(permissions)}. Use a key with '${required}' access, or update this key's permissions.`,
+  })
+  return true
+}
+
 export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution> {
   const xApiKey = req.headers['x-api-key'] as string | undefined
   if (xApiKey) {
@@ -215,6 +252,7 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       userRole,
       branchSchema: key.branch?.schemaName,
       branchName: key.branch?.name,
+      permissions: key.permissions ?? [],
     }
   }
 
@@ -357,6 +395,7 @@ async function handleDynamicRequest(req: Request, res: Response) {
   // never saw when the path is the legacy `/api/v1/{table}` form. Judge it now
   // that it is known, or a paused or locked project's key walks straight past.
   if (await refuseUnlessServing(res, projectId)) return
+  if (refuseIfKeyLacksMethodPermission(req, res, authResult)) return
   void touchProjectActivity(projectId)
 
   // Strip the URL prefix that the SDK and verifier always include:
