@@ -20,6 +20,14 @@ import { getParkedActionForProject } from '@/lib/mcp/approvals'
 
 const ROOT = process.cwd()
 
+// Parking seals the action's params with a key derived from JWT_SECRET, and the
+// sealer refuses anything under 32 characters. CI's secret is shorter, which
+// made the park fail before a finding existed.
+const savedJwtSecret = process.env.JWT_SECRET
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  process.env.JWT_SECRET = crypto.randomBytes(32).toString('hex')
+}
+
 let ownerId: string
 let projectId: string
 
@@ -47,6 +55,8 @@ afterAll(async () => {
   await prisma.backendEvent?.deleteMany({ where: { projectId } }).catch(() => {})
   await prisma.project.deleteMany({ where: { id: projectId } }).catch(() => {})
   await prisma.user.deleteMany({ where: { id: ownerId } }).catch(() => {})
+  if (savedJwtSecret === undefined) delete process.env.JWT_SECRET
+  else process.env.JWT_SECRET = savedJwtSecret
 }, 60_000)
 
 describe('AUT-05: the parked refusal carries a pollable id', () => {
