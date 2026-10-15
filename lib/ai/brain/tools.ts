@@ -1267,7 +1267,20 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'a property of the key, not of the request, so there is no header or parameter that switches it later.',
     {
       description: { type: 'string', description: 'Human label, e.g. "web frontend" or "cron worker".' },
-      permissions: { type: 'array', items: { type: 'string' }, description: 'e.g. ["read:posts","write:posts"]. Default ["read:*"].' },
+      permissions: {
+        type: 'array',
+        items: { type: 'string', enum: ['read', 'write', 'ai-only'] },
+        description:
+          'The runtime reads exactly these values — there is no per-table scoping. Default ["read","write"].',
+      },
+      expiresInDays: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 3650,
+        description:
+          'Optional. Omitted means the key NEVER expires (same as dashboard keys). When set, the runtime ' +
+          'refuses the key after this many days and the response says the exact date.',
+      },
       serviceRole: {
         type: 'boolean',
         description:
@@ -1291,10 +1304,10 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { keyId: { type: 'string' } },
     ['keyId']),
   fn('set_key_permissions',
-    'Update the permission set on an existing API key (e.g. add write access to a new table).',
+    "Replace a publishable key's permission set. Vocabulary: read, write, ai-only — the whole set the runtime reads; there is no per-table scoping. 'admin' is not grantable here (it passes every gate; that escalation belongs to the project owner in Settings), and service-role keys are refused because their access is not permission-driven.",
     {
       keyId: { type: 'string' },
-      permissions: { type: 'array', items: { type: 'string' } },
+      permissions: { type: 'array', items: { type: 'string', enum: ['read', 'write', 'ai-only'] } },
     },
     ['keyId', 'permissions']),
 
@@ -1773,7 +1786,7 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   // environment can be chosen — the data plane reads its schema from the
   // credential, never from the request. Dropping it here is what made branch
   // routing unreachable from the agent lane.
-  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId } }),
+  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId, expiresInDays: a.expiresInDays } }),
   revoke_api_key: (a) => ({ action: 'REVOKE_KEY', params: { keyId: a.keyId } }),
   rotate_api_key: (a) => ({ action: 'ROTATE_KEY', params: { keyId: a.keyId } }),
   set_key_permissions: (a) => ({ action: 'SET_KEY_PERMISSIONS', params: { keyId: a.keyId, permissions: a.permissions } }),
