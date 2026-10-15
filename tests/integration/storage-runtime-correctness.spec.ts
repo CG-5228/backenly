@@ -25,6 +25,11 @@ process.env.STORAGE_DRIVER = 'local'
 process.env.STORAGE_SECRET = process.env.STORAGE_SECRET || 'storage-correctness-suite-secret'
 process.env.STORAGE_S3_BUCKET = process.env.STORAGE_S3_BUCKET || 'test-bucket'
 process.env.STORAGE_S3_REGION = process.env.STORAGE_S3_REGION || 'ap-south-1'
+// uploadFile presigns the new object's URL. Presigning is a local HMAC, but the
+// SDK still resolves credentials for it and CI has none, so the suite pins
+// static fakes; that also keeps a developer's own AWS profile out of the run.
+process.env.STORAGE_S3_ACCESS_KEY = 'storage-correctness-not-a-real-key'
+process.env.STORAGE_S3_SECRET_KEY = 'storage-correctness-not-a-real-secret'
 
 import fs from 'fs/promises'
 import os from 'os'
