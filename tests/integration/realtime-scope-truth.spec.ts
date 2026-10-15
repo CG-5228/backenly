@@ -5,9 +5,10 @@
  * RT-05: `realtime { action: "enable" }` with no tableName fell through to
  * the install-on-every-table branch, so a forgotten argument silently
  * started streaming the whole project. Enabling is per table now, with the
- * every-table branch reachable only by saying `allTables: true`; the brain
- * dispatch also grew a generic required-args preflight, so any tool call
- * missing a declared-required argument is refused before it runs.
+ * every-table branch reachable only by saying `allTables: true`. The agent's
+ * tool forwards only tableName, so the agent door cannot reach the
+ * every-table branch at all; the executor's TABLE_NAME_REQUIRED refusal is
+ * the guard.
  *
  * RT-07: a project-wide disable parked as the bare words "Realtime:
  * disable" — the human approved a blast radius the card never named. Both
