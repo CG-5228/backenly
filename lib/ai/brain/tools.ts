@@ -370,8 +370,16 @@ export interface ToolResult {
  * deploy_function_code stores source its caller already wrote; the brain writes
  * code through generate_function, which repairs what it writes, and two doors
  * to one behaviour is what the catalog was cut down to avoid.
+ *
+ * rotate_api_key is withheld from the model for the reason the connect domain
+ * already refuses to route it (lib/mcp/domains.ts): its result IS a new
+ * credential, and the chat door parks destructive calls for approval, whose
+ * stored outcome every project member can read. A rotation the model requested
+ * therefore either leaked the new key into the approval row or, with the
+ * stored summary now withheld, rotated into a key nobody was ever shown.
+ * Humans rotate from the dashboard, where the key is handed over once.
  */
-export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code'])
+export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code', 'rotate_api_key'])
 
 // ── Tool schema ───────────────────────────────────────────────────────────────
 
