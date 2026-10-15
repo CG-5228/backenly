@@ -32,7 +32,16 @@ const ENV_TO_INTEGRATION: Record<string, string> = {
   GOOGLE_CLIENT_SECRET:   'google',
   GITHUB_CLIENT_ID:       'github',
   GITHUB_CLIENT_SECRET:   'github',
+  DISCORD_CLIENT_ID:      'discord',
+  DISCORD_CLIENT_SECRET:  'discord',
+  FACEBOOK_CLIENT_ID:     'facebook',
+  FACEBOOK_CLIENT_SECRET: 'facebook',
 }
+
+// Every provider the end-user OAuth runtime serves (server/routes/oauth.ts).
+// A provider missing here saves its keys but never reaches workspaceOAuthConfig,
+// so the runtime keeps answering "not configured" — the AUTH-F7 failure mode.
+const OAUTH_PROVIDERS = ['google', 'github', 'discord', 'facebook']
 
 export async function POST(request: NextRequest, props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
@@ -130,9 +139,10 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
     // We do BOTH: executeAction (which also adds OAuth columns to users table)
     // AND a direct WorkspaceOAuthService.upsertConfig call so the Auth page can
     // reliably read the enabled state even if executeAction fails silently.
-    if (integrationId === 'google' || integrationId === 'github') {
-      const clientId     = values['GOOGLE_CLIENT_ID']     || values['GITHUB_CLIENT_ID']
-      const clientSecret = values['GOOGLE_CLIENT_SECRET'] || values['GITHUB_CLIENT_SECRET']
+    if (OAUTH_PROVIDERS.includes(integrationId)) {
+      const envPrefix    = integrationId.toUpperCase()
+      const clientId     = values[`${envPrefix}_CLIENT_ID`]
+      const clientSecret = values[`${envPrefix}_CLIENT_SECRET`]
       if (clientId && clientSecret) {
         // Direct write first — guaranteed to reach the DB
         try {
