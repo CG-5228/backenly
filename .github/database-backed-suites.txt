@@ -37,11 +37,24 @@ tests/bench/prisma-uuid-binding.spec.ts
 tests/build-runs/build-run-service.test.ts
 tests/build-runs/hydration.test.ts
 tests/integration/mcp-oauth-flow.spec.ts
+tests/integration/mcp-transport-hygiene.spec.ts
 tests/integration/webhook-delivery.spec.ts
+tests/integration/webhook-trigger-url-required.spec.ts
+tests/integration/state-webhooks-section.spec.ts
+tests/integration/integrations-auto-wiring.spec.ts
 tests/integration/end-user-email-verification-opt-in.spec.ts
 tests/integration/signin-enumeration.spec.ts
 tests/integration/project-smtp-and-templates.spec.ts
 tests/integration/storage-bucket-policy.spec.ts
+tests/integration/storage-runtime-policy.spec.ts
+tests/integration/function-off-switch.spec.ts
+tests/integration/function-create-truthful.spec.ts
+tests/integration/function-selfheal-consent.spec.ts
+tests/integration/function-egress-guard.spec.ts
+tests/integration/function-row-events-data-plane.spec.ts
+tests/integration/project-route-response-shape.spec.ts
+tests/integration/realtime-sse-slot-release.spec.ts
+tests/integration/export-database-rls.spec.ts
 tests/integration/postgres-admin.spec.ts
 
 # Needs a real Postgres AND a git worktree of an older release.
@@ -72,6 +85,7 @@ tests/integration/rate-limit-shared-store.spec.ts
 
 __tests__/projects/deletion-transaction.test.ts
 __tests__/projects/purge-outbox.test.ts
+tests/integration/project-deletion-complete.spec.ts
 
 # The ProjectResolver regression matrix (commit 2). Pins the behaviour the ~70
 # authorization call sites are being migrated TO, before they are migrated, so
@@ -124,6 +138,15 @@ __tests__/auth/workspace-download-authorization.test.ts
 # effect, ADMIN/OWNER allowed, masked key list stays a VIEWER read, and
 # single-tenant operators unaffected. Real sessions, resolver and guard.
 __tests__/auth/connect-credential-authorization.test.ts
+
+# Provider secrets: the platform AuthProvider collection is admin-only and
+# redacted, and per-project deploy-provider credentials are ADMIN-floored with
+# the decrypted material never leaving the server (INT-11 / INT-12).
+tests/integration/provider-credential-floors.spec.ts
+# Settings API keys are a PROJECT surface (admins see and revoke agent keys,
+# ex-members do not), and the withProjectAccess routes carry explicit floors:
+# share-report ADMIN, Supabase import DEVELOPER (SET-03 / SET-04).
+tests/integration/settings-keys-and-floors.spec.ts
 
 # Operate decisions (approve a parked agent request, run or undo a repair,
 # dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
@@ -187,6 +210,14 @@ __tests__/services/trigger-webhook-egress.test.ts
 # and service-role unaffected) and that SET_KEY_PERMISSIONS over the real
 # executor takes effect on the very next request. Real server, real socket.
 tests/integration/key-permission-gate.spec.ts
+# A parked branch merge replayed the migration log as it was at EXECUTION time,
+# so an agent could park an innocent merge and append statements before the
+# human clicked approve — breaking the approvals contract "what executes is
+# exactly what the human read". Pins the approved statement list frozen into
+# the request: a grown log refuses MERGE_STALE (unit and end-to-end through
+# createApprovalRequest/decideApproval), a matching log merges, and the
+# console's unpinned live-diff merge is unchanged.
+__tests__/branches/merge-approval-freeze.test.ts
 
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
@@ -640,6 +671,8 @@ tests/integration/project-activity-clock.spec.ts
 # approves it. Runs as the cloud edition with only the plan lookup supplied,
 # because the single-tenant resolver rightly refuses a database of many projects.
 tests/integration/mcp-domain-operations.spec.ts
+tests/integration/dbtools-secret-redaction.spec.ts
+tests/integration/overview-truthful-counts.spec.ts
 
 # Sandbox function runs lost every ctx.log line, after a success and after a
 # failure: the worker sends them in the message that ends the run, and the
@@ -815,6 +848,20 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# API keys live an honest lifecycle: create_api_key stamps no silent expiry
+# (opt-in expiresInDays is stored, returned and named), and
+# set_key_permissions parks unapproved calls, validates the real permission
+# vocabulary, refuses admin escalation and service-role edits even when
+# approved, and narrows with a before/after receipt. Real key rows are the
+# property.
+tests/integration/key-lifecycle-honesty.spec.ts
+# The integrations connect door keeps its contract: unknown provider ids are
+# refused with the served list, any alias or casing stores under the one
+# canonical id everything looks up, disconnect clears what the console reads
+# on both doors, and OneSignal connects fully (REST key + App ID) through the
+# typed call with send_push naming what is missing. Real vault rows are the
+# property; PostHog (stored-unverifiable) keeps CI off external APIs.
+tests/integration/integrations-connect-contract.spec.ts
 # "Already up to date" is decided by a hash of the live catalog, recorded on
 # the Deployment row, never by the graph pointer the MCP schema path does not
 # move: an agent ALTER publishes a new version, an unchanged catalog is a
