@@ -370,8 +370,16 @@ export interface ToolResult {
  * deploy_function_code stores source its caller already wrote; the brain writes
  * code through generate_function, which repairs what it writes, and two doors
  * to one behaviour is what the catalog was cut down to avoid.
+ *
+ * rotate_api_key is withheld from the model for the reason the connect domain
+ * already refuses to route it (lib/mcp/domains.ts): its result IS a new
+ * credential, and the chat door parks destructive calls for approval, whose
+ * stored outcome every project member can read. A rotation the model requested
+ * therefore either leaked the new key into the approval row or, with the
+ * stored summary now withheld, rotated into a key nobody was ever shown.
+ * Humans rotate from the dashboard, where the key is handed over once.
  */
-export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code'])
+export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code', 'rotate_api_key'])
 
 // ── Tool schema ───────────────────────────────────────────────────────────────
 
@@ -670,7 +678,8 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Create a backend function. Backenly functions are EVENT-DRIVEN or HTTP — pick the `trigger` that matches what the user described:\n' +
     '  • on_signup — runs automatically every time an end-user signs up (welcome emails, default rows, tier assignment, analytics identify).\n' +
     '  • on_insert / on_update / on_delete — runs automatically every time a row is inserted / updated / deleted in `table` ' +
-    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`.\n' +
+    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`. ' +
+    'Row events are captured inside PostgreSQL, so every writer fires them — REST, SDK, MCP, SQL in another function — within about a minute of the write. Auth-managed tables (users) are not captured; use on_signup.\n' +
     '  • http — a callable REST endpoint at /api/v1/{projectId}/fn/{name} that a frontend or another service hits directly ' +
     '("an endpoint to export orders as CSV", "a /checkout/session endpoint").\n' +
     '  • manual — only runs when fired from the Functions dashboard (occasional maintenance / recompute tasks).\n' +
@@ -1195,7 +1204,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       force: { type: 'boolean', description: 'Set true ONLY when the user has typed DEPLOY verbatim this turn.' },
     }),
   fn('rollback_deploy',
-    'DESTRUCTIVE. Revert the live backend to a previous published version. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status / list_apis first so you know which version you would be reverting to.',
+    'DESTRUCTIVE. Mark a previous published version as current in the version history. This is bookkeeping: it does NOT change the live schema, data, RLS or functions, and the API keeps serving exactly what is deployed now. To restore structure, roll back a schema version from the Database page or restore a Snapshot. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status first.',
     {
       version: { type: 'integer', description: 'Target published version number (e.g. 2). Either version OR deploymentId is required.' },
       deploymentId: { type: 'string', description: 'Specific deployment id to roll back to.' },
@@ -1945,7 +1954,8 @@ export async function dispatchTool(
     // ── Read: agent workflow primer ───────────────────────────────────────
     if (name === 'get_instructions') {
       const pid = ctx.projectId
-      const base = `https://backenly.com/api/v1/${pid}`
+      const { appOrigin } = await import('@/lib/mcp/oauth')
+      const base = `${appOrigin()}/api/v1/${pid}`
       // ── Every tool named below MUST be one the manifest advertises ───────────
       //
       // This guide used to instruct agents to call `get_backend_metadata`,
@@ -2306,7 +2316,10 @@ export async function dispatchTool(
       }
 
       if (name === 'merge_branch') {
-        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId)
+        const approvedMigrations = Array.isArray((args as any).approvedMigrations)
+          ? ((args as any).approvedMigrations as unknown[]).map(String)
+          : undefined
+        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId, approvedMigrations)
         if (!res.ok) return finalize({ ok: false, summary: (res as any).error, code: (res as any).code })
         const r: any = res
         const applied = r.applied?.length ? `Applied: ${r.applied.join('; ')}.` : 'Nothing was applied automatically.'
