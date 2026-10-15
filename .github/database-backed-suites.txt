@@ -835,6 +835,12 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# No surface claims an alert that can never fire: SET_ALERT refuses honestly
+# and stores nothing, the brain no longer offers set_alert (matching the MCP
+# door's removal), and prompts/capabilities stopped advertising it. A real
+# project row proves nothing is written.
+tests/integration/monitoring-alerts-honesty.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
