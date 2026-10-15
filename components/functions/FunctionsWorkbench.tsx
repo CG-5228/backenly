@@ -60,6 +60,8 @@ interface AiFunction {
   createdAt: string
   /** The deployed source, exactly as stored — what actually runs. */
   generatedCode?: string | null
+  /** 'generated' (Backenly's model) | 'agent' (deploy_code, stored verbatim). */
+  codeOrigin?: string
 }
 
 interface TestRunResult {
@@ -178,9 +180,21 @@ function getEndpointUrl(fn: AiFunction): string | null {
 
 // Auto-generated schema-query helpers: no business logic, always manual, never
 // run. They are real endpoints, just noise in the list.
+//
+// codeOrigin is the gate that keeps "Remove all" honest: the name pattern
+// alone matched any agent-deployed function named like `*-schema` with no run
+// yet, and the bulk cleanup deleted it as an "auto-generated endpoint". Only
+// Backenly-generated rows ('generated' — also the backfill for rows that
+// predate the column) qualify; anything deployed verbatim through
+// deploy_code ('agent') is someone's code, never cleanup fodder.
 const SCHEMA_FN_RE = /(-schema|-full|_schema|_full)$|(^workspaces?-|^workspace_)/i
 function isSchemaQueryFunction(fn: AiFunction): boolean {
-  return SCHEMA_FN_RE.test(fn.name) && fn.triggerType === 'manual' && fn.runCount === 0
+  return (
+    fn.codeOrigin !== 'agent' &&
+    SCHEMA_FN_RE.test(fn.name) &&
+    fn.triggerType === 'manual' &&
+    fn.runCount === 0
+  )
 }
 
 const TRIGGER_FILTERS: Array<{ key: string; label: string }> = [
