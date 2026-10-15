@@ -124,5 +124,11 @@ describe('DEP-13 / DEP-14: the deploy cluster answers honestly', () => {
     expect(svc).toContain('not published yet')
     const executor = fs.readFileSync(path.join(ROOT, 'lib', 'ai', 'minimal-executor.ts'), 'utf8')
     expect(executor).not.toContain('your backend must be deployed first')
+    expect(executor).not.toContain('deployment-gated')
+    // What the agent reads must not send it to publish first either.
+    for (const file of ['tools.ts', 'prompts.ts', 'capabilities.ts']) {
+      const src = fs.readFileSync(path.join(ROOT, 'lib', 'ai', 'brain', file), 'utf8')
+      expect(src).not.toMatch(/verifies the backend (has been|is) deployed|deployment-gated|handles deploy-check/)
+    }
   })
 })

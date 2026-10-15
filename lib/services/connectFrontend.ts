@@ -1,20 +1,22 @@
 /**
  * CONNECT FRONTEND — canonical engine
  *
- * The ONE place that connects/disconnects a frontend to a deployed backend.
+ * The ONE place that connects/disconnects a frontend to a backend.
  * UI, chat, and REST API all funnel through `connectFrontend` /
  * `disconnectFrontend`. Anything that writes a CORS allowance and doesn't
  * call this file is a bug.
  *
  * Guarantees:
- *   1. Backend must be DEPLOYED before any origin can be connected.
+ *   1. No publish is required: the runtime serves an unpublished project on
+ *      every surface, so it connects as version 0.
  *   2. Origin is normalized to exact protocol+host+port — no wildcards,
  *      no trailing slashes, no path component.
  *   3. Confirmation gate on every write unless `force: true` is passed by
  *      the layer that already has user consent (chat replay, REST POST).
  *   4. Every connect/disconnect writes an AuditLog row.
- *   5. Each ConnectedApp row pins the DeploymentAudit graphVersion at
- *      connect time — so we know which version the frontend agreed to.
+ *   5. Each ConnectedApp row records the published Deployment version at
+ *      connect time (0 before a first publish), so we know which version
+ *      the frontend agreed to.
  *
  * State machine per (projectId, origin):
  *   NOT_CONNECTED  →  AWAITING_CONFIRMATION  →  CONNECTED  →  DISCONNECTED
