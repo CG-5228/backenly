@@ -18,6 +18,10 @@ import crypto from 'crypto'
 import { prisma } from '@/lib/db/prisma'
 import { storageService } from '@/lib/services/storage'
 
+// The local driver signs an access token for every file it lists, and CI's
+// integration job sets no STORAGE_SECRET. Read at call time, so this holds.
+process.env.STORAGE_SECRET = process.env.STORAGE_SECRET || crypto.randomBytes(32).toString('hex')
+
 const ROOT = process.cwd()
 const FILES = 120 // past the service's silent first page of 100
 
