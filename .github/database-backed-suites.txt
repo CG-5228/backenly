@@ -824,6 +824,14 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# The storage runtime is correct on both drivers: the S3 driver clamps a
+# requested isPublic to the bucket policy at write time like the local one,
+# multipart complete leaves exactly one real row and counts the bytes once,
+# the signed-upload fallback plants no phantom row, and metadata answers from
+# the row without fetching the object. Real buckets, rows and chunk files are
+# the property; only the S3 network call is stubbed.
+tests/integration/storage-runtime-correctness.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
