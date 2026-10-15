@@ -48,7 +48,7 @@ Exactly **23** are advertised over MCP; `tools/list` (or `backenly tools`) is th
 
 Older tool names that are no longer advertised still run by name through `backenly call` (for example `enable_auth`, `create_bucket`, `set_env_var`). REST is automatic: `/db/<table>` exists the moment the table does, so there is no API-generation step.
 
-**Destructive operations escalate instead of executing.** Deploying, rolling back, deleting buckets or functions, revoking keys: call the domain action (`deploy { action: "deploy" }`, `functions { action: "delete" }` …) and the exact call is parked. Dropping or truncating a table: ask through `backend_chat`. Either way the response carries an `approval` id and nothing is changed until a human approves it on the Autonomy page; an approved domain call runs verbatim. Poll `check_approval` every 15–30s: `executed` (done), `rejected` (do not retry), `failed` (nothing applied), `partial` (some changes landed; verify, do not replay), `expired`.
+**Destructive operations escalate instead of executing.** Deploying, rolling back, deleting buckets or functions, revoking keys: call the domain action (`deploy { action: "deploy" }`, `functions { action: "delete" }` …) and the exact call is parked. Dropping or truncating a table: ask through `backend_chat`. Either way the response carries an `approval` id and nothing is changed until a human approves it on the Autonomy page; an approved domain call runs verbatim. Poll `check_approval` every 15–30s: `executed` (done), `rejected` (do not retry), `failed` (approved but incomplete — work may have partially landed; read state before retrying), `partial` (some changes landed; verify, do not replay), `expired`.
 
 ## Integrations
 
@@ -64,7 +64,7 @@ Two headers: `x-api-key: <project key>` on every request, and `X-User-Token: <en
 
 - `/api/v1/{projectId}/db/{table}`: `GET` (list), `POST`, `GET /{id}`, `PATCH /{id}` (`PUT` is accepted as the same update), `DELETE /{id}`.
 - `/api/v2/{projectId}/{table}`: PostgREST grammar: `?price=gte.100`, `?order=createdAt.desc`, `?select=*,author(*)`.
-- `/auth/signup`, `/auth/signin`, `/auth/refresh-token`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/me`, magic links, OAuth, email verification.
+- `/auth/signup`, `/auth/signin`, `/auth/refresh-token`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password`, magic links, OAuth, email verification. Signup/signin answer `{ data: { user, token } }`; there is no `/auth/me`.
 - `/db/users` is never served; users live behind `/auth/*`.
 
 SDK: `npm install @backenly/sdk`, then `createClient({ projectId, apiKey })` with that project key.
