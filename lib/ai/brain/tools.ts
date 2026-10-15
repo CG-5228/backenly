@@ -1786,7 +1786,7 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   // environment can be chosen — the data plane reads its schema from the
   // credential, never from the request. Dropping it here is what made branch
   // routing unreachable from the agent lane.
-  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId } }),
+  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId, expiresInDays: a.expiresInDays } }),
   revoke_api_key: (a) => ({ action: 'REVOKE_KEY', params: { keyId: a.keyId } }),
   rotate_api_key: (a) => ({ action: 'ROTATE_KEY', params: { keyId: a.keyId } }),
   set_key_permissions: (a) => ({ action: 'SET_KEY_PERMISSIONS', params: { keyId: a.keyId, permissions: a.permissions } }),
