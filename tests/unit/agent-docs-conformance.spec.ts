@@ -367,3 +367,35 @@ describe('what the docs no longer carry', () => {
     for (const [, text] of DOCS) expect(text).not.toMatch(/all[ -]or[ -]nothing/i)
   })
 })
+
+describe('the realtime doc describes the stream the runtime sends', () => {
+  // The trigger emits json_build_object('type', ..., 'table', ..., 'data',
+  // row_data, 'old', old_data, 'timestamp', ...) (lib/services/
+  // realtimeTriggers.ts) and the SSE routes forward the payload unchanged; the
+  // SDK types it as DBChangeEvent { type, table, data?, old?, truncated?,
+  // timestamp? } and hands the EVENT OBJECT to the callback (packages/sdk/src/
+  // database.ts). The doc once said { record, old, at } and
+  // subscribe(({ event, row })), and an agent-written client reading e.record
+  // got undefined for every frame.
+  const realtime = fs.readFileSync(path.join(ROOT, 'public', 'docs', 'agents', 'realtime.md'), 'utf8')
+  const clientSetup = fs.readFileSync(path.join(ROOT, 'public', 'docs', 'agents', 'client-setup.md'), 'utf8')
+
+  it('names the emitted fields, not the invented ones', () => {
+    for (const key of ['"data"', '"old"', '"timestamp"']) expect(realtime).toContain(key)
+    expect(realtime).not.toMatch(/"record"/)
+    expect(realtime).not.toMatch(/"at"\s*\}/)
+  })
+
+  it('shows the real SDK callback: the event object, not ({ event, row })', () => {
+    expect(realtime).not.toContain('({ event, row })')
+    expect(clientSetup).not.toContain('({ event, row })')
+    expect(realtime).toContain('event.type')
+  })
+
+  it('points at the endpoint the server actually mounts', () => {
+    // server/routes/realtime.ts mounts GET /:projectId/realtime; there is no
+    // /realtime/subscribe route anywhere.
+    expect(realtime).not.toContain('/realtime/subscribe')
+    expect(realtime).toMatch(/\/realtime\?table=/)
+  })
+})
