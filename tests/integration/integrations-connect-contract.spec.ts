@@ -24,6 +24,7 @@ import crypto from 'crypto'
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
+import { TOOL_TO_ACTION } from '@/lib/ai/brain/tools'
 import { hasIntegrationKey } from '@/lib/services/integrationKeyStore'
 
 const ROOT = process.cwd()
@@ -117,6 +118,20 @@ describe('INT-06: OneSignal is reachable through the typed door', () => {
       { integrationId: 'onesignal', apiKey: 'os_rest_key', appId: 'os-app-id-123' },
       projectId,
     )
+    expect(out.success).toBe(true)
+    expect((out.data as any).oneSignalAppIdPending).toBe(false)
+    expect(await hasIntegrationKey(projectId, 'onesignal_app_id')).toBe(true)
+  }, 60_000)
+
+  it('the App ID survives the tool layer an agent actually calls', async () => {
+    // The test above hands params straight to the executor, which is how the
+    // tool mapper once dropped appId unseen: the docs showed a call whose
+    // App ID never arrived.
+    const projectId = await freshProject('int06-tool')
+    const mapped = TOOL_TO_ACTION.store_integration_key({
+      integrationId: 'onesignal', apiKey: 'os_rest_key', appId: 'os-app-id-456',
+    })
+    const out = await executeAction(mapped, projectId, undefined, 0, undefined, false)
     expect(out.success).toBe(true)
     expect((out.data as any).oneSignalAppIdPending).toBe(false)
     expect(await hasIntegrationKey(projectId, 'onesignal_app_id')).toBe(true)

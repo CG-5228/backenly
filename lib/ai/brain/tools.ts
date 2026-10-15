@@ -1322,6 +1322,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       apiKey: { type: 'string', description: 'The secret to store (encrypted). Omit to trigger the inline "paste your key" prompt.' },
       label: { type: 'string', description: 'Optional human label, e.g. "Stripe live key".' },
       webhookSecret: { type: 'string', description: 'Stripe only: the endpoint signing secret (whsec_…). Until it is stored, the Stripe receiver rejects every event.' },
+      appId: { type: 'string', description: 'OneSignal only: the App ID, sent with the REST API key. Push stays off until both are stored.' },
     },
     ['integrationId']),
   fn('remove_integration_key',
@@ -1792,7 +1793,7 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   set_key_permissions: (a) => ({ action: 'SET_KEY_PERMISSIONS', params: { keyId: a.keyId, permissions: a.permissions } }),
 
   // Integrations
-  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret } }),
+  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret, appId: a.appId } }),
   remove_integration_key: (a) => ({ action: 'REMOVE_INTEGRATION_KEY', params: { integrationId: a.integrationId } }),
   delete_trigger: (a) => ({ action: 'DELETE_TRIGGER', params: { triggerId: a.triggerId, name: a.name } }),
 
