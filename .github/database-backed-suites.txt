@@ -835,6 +835,13 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# Webhook capture and delivery fail loudly or not at all: the sync names the
+# tables it could not capture and both callers surface them, and a PENDING
+# delivery whose first attempt died is swept to a real retry while a fresh
+# one is left alone. Real capture triggers, webhook rows and a live local
+# receiver (behind the per-test egress opt-in) are the property.
+tests/integration/webhook-capture-truth.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
