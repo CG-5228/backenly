@@ -16,6 +16,7 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
+import { redactRows } from './read-query'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { explainDbError, type QueryContext } from '@/lib/db/query-errors'
 
@@ -292,7 +293,17 @@ export async function dbQuery(projectId: string, input: DbQueryInput) {
   const rows = await runAsServiceRole(sql, where.values, {
     table, columns: Object.keys(input.filter ?? {}), values: where.values, types,
   })
-  return { rows: Array.isArray(rows) ? rows : [], count: Array.isArray(rows) ? rows.length : 0 }
+  // Secret columns never land in an agent transcript. run_query redacts for
+  // exactly this reason; db_query returned the end-user `users` table —
+  // bcrypt hashes included — verbatim. Values are replaced, not dropped, so
+  // the shape still says the column exists.
+  const list = Array.isArray(rows) ? rows : []
+  const { rows: safeRows, redactedColumns } = redactRows(list as Record<string, unknown>[])
+  return {
+    rows: safeRows,
+    count: list.length,
+    ...(redactedColumns.length > 0 ? { redactedColumns } : {}),
+  }
 }
 
 export interface DbInsertInput {
@@ -317,7 +328,9 @@ export async function dbInsert(projectId: string, input: DbInsertInput) {
   const values = cols.map((c) => coerceValue(types.get(c), (row as any)[c]))
   const sql = `INSERT INTO "${schema}"."${table}" (${colList}) VALUES (${placeholders}) RETURNING *`
   const result = await runAsServiceRole(sql, values, { table, columns: cols, values, types })
-  return { row: Array.isArray(result) ? result[0] : null }
+  const returned = Array.isArray(result) && result[0] ? [result[0] as Record<string, unknown>] : []
+  const { rows: safeRows, redactedColumns } = redactRows(returned)
+  return { row: safeRows[0] ?? null, ...(redactedColumns.length > 0 ? { redactedColumns } : {}) }
 }
 
 export interface DbUpdateInput {
@@ -365,7 +378,8 @@ export async function dbUpdate(projectId: string, input: DbUpdateInput) {
     types,
   })
   const rows = Array.isArray(result) ? result : []
-  return { updated: rows.length, rows }
+  const { rows: safeRows, redactedColumns } = redactRows(rows as Record<string, unknown>[])
+  return { updated: rows.length, rows: safeRows, ...(redactedColumns.length > 0 ? { redactedColumns } : {}) }
 }
 
 export interface DbDeleteInput {
