@@ -838,6 +838,12 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# rotate_trigger_secret keeps its advertised contract: the docs print the
+# declared triggerName-or-triggerId alternative instead of "nothing", the
+# new secret rides data.secret and really rotates the row, and a call with
+# neither argument still refuses. A real AppTrigger row is the property.
+tests/integration/rotate-secret-contract.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
