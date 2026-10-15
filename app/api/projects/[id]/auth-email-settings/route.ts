@@ -70,8 +70,8 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
     }
 
     const result = await saveAuthEmailPolicy(params.id, await request.json())
-    if (!result.ok) {
-      if (result.code === 'INVALID_ARGUMENT') {
+    if ('code' in result) {
+      if ('problems' in result) {
         return NextResponse.json({ error: 'Validation failed', details: result.problems }, { status: 400 })
       }
       if (result.code === 'NO_EMAIL_SENDER') {

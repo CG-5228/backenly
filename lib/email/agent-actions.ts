@@ -107,12 +107,12 @@ export async function setEmailPolicy(
     }
   }
   const result = await saveAuthEmailPolicy(actor.projectId, input)
-  if (!result.ok) {
+  if ('code' in result) {
     return {
       ok: false,
       code: result.code,
       summary: result.message,
-      ...(result.code === 'INVALID_ARGUMENT' ? { data: { problems: result.problems } } : {}),
+      ...('problems' in result ? { data: { problems: result.problems } } : {}),
     }
   }
   return { ok: true, summary: `Saved. ${policyLine(result.policy)}`, data: { policy: result.policy } }
