@@ -465,7 +465,7 @@ await backend.auth.signIn({ email, password })
       },
       {
         title: 'You choose the mode',
-        body: 'Review-only holds every change for your one-click approval. Autopilot applies safe fixes on its own and still holds the rest.',
+        body: 'Review-only holds every visible change for your one-click approval; silent additive repairs (indexes, API definitions) still apply. Autopilot applies safe fixes on its own and still holds the rest.',
       },
       {
         title: 'Everything leaves a record',
