@@ -495,6 +495,19 @@ export function validateRouteModule(code: string, expectedMethod?: string | null
 
 // ─── Public executor ──────────────────────────────────────────────────────────
 
+/**
+ * Thrown when the HANDLER itself failed — distinct from compile errors,
+ * timeouts and machinery failures, which stay plain Errors. The smoke test
+ * keys off this class to decide between "the function is broken" and "we
+ * could not test it".
+ */
+export class RouteModuleHandlerError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RouteModuleHandlerError'
+  }
+}
+
 export interface RouteModuleRunResult {
   logs: string[]
   returnValue: { status: number; body: any }
@@ -700,7 +713,15 @@ export async function executeRouteModuleFunction(
       ),
     ])
   } catch (err: any) {
-    throw new Error(err?.message || String(err))
+    const msg = err?.message || String(err)
+    // The 10s race cannot tell a hung handler from slow infrastructure, so a
+    // timeout stays a plain Error. Everything else thrown here came out of the
+    // HANDLER itself, and the type says so: callers that must distinguish "the
+    // function is broken" from "the machinery failed" check the class instead
+    // of sniffing message text, which misread any handler error that happened
+    // to mention "database" or "connect" as an infrastructure failure.
+    if (msg === 'Route function timed out after 10s') throw new Error(msg)
+    throw new RouteModuleHandlerError(msg)
   }
 
   // 5. Normalise the response.

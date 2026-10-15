@@ -30,6 +30,7 @@ import { buildIntegrationContext, IntegrationContext } from './integration-conte
 import { getProviderSpec } from './integration-registry'
 import { generateFixedFunctionCode } from './generator'
 import { isRouteModuleFunction, executeRouteModuleFunction, validateRouteModule } from './route-module-runner'
+import { isFunctionSwitchedOff } from './status'
 import { enforceAiFunctionInvocation, trackAiFunctionInvocation } from '@/lib/entitlements/policy'
 import { recordUsage } from '@/lib/usage/ledger'
 import { accountOf } from '@/lib/usage/account'
@@ -39,6 +40,9 @@ import { isReservedTestEmail } from '@/lib/services/end-user-auth-table'
 // One cast table for the whole codebase. Duplicating it is how the MCP path and
 // this one would drift, and a drifted cast table is invisible until 42804.
 import { castTarget, coerceValue, columnTypes } from '@/lib/mcp/runtime-db'
+
+// Re-exported so the many existing executor importers keep one import site.
+export { FUNCTION_OFF_STATUSES, isFunctionSwitchedOff } from './status'
 
 export interface FunctionEvent {
   type: string
@@ -730,13 +734,8 @@ export async function executeAiFunction(
 
   const fn = await prisma.aiFunction.findFirst({ where: { id: functionId, projectId } })
   if (!fn) return { success: false, logs: [], error: 'Function not found', errorCode: 'NOT_FOUND', durationMs: 0 }
-  // Only a DELIBERATE disable refuses execution. `status: 'error'` records how
-  // the last run went, and this used to treat it as a deployment state — so one
-  // throw made the function permanently uncallable, and the only thing that
-  // clears 'error' is a successful run. See the longer note in
-  // server/routes/dynamic.ts.
-  if (fn.status === 'disabled' || fn.status === 'deleted') {
-    return { success: false, logs: [], error: 'Function is disabled', errorCode: 'NOT_FOUND', durationMs: 0 }
+  if (isFunctionSwitchedOff(fn.status)) {
+    return { success: false, logs: [], error: 'Function is switched off', errorCode: 'NOT_FOUND', durationMs: 0 }
   }
 
   // ── Plan-driven quota ────────────────────────────────────────────────────
