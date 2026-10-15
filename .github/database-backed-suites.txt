@@ -834,6 +834,14 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# API keys live an honest lifecycle: create_api_key stamps no silent expiry
+# (opt-in expiresInDays is stored, returned and named), and
+# set_key_permissions parks unapproved calls, validates the real permission
+# vocabulary, refuses admin escalation and service-role edits even when
+# approved, and narrows with a before/after receipt. Real key rows are the
+# property.
+tests/integration/key-lifecycle-honesty.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.

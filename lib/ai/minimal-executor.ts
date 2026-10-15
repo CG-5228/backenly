@@ -6755,6 +6755,14 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
   // this tool is asked for most often.
   const serviceRole = params.serviceRole === true
 
+  // Expiry is opt-in (1–3650 days) and echoed in the result; see the note on
+  // the create below for why there is no silent default.
+  const expiresInDays =
+    Number.isFinite(Number(params.expiresInDays)) && Number(params.expiresInDays) >= 1
+      ? Math.min(Math.floor(Number(params.expiresInDays)), 3650)
+      : null
+  const expiresAt = expiresInDays ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000) : null
+
   // ── Branch scoping ─────────────────────────────────────────────────────────
   //
   // Which environment a key reads is a property of the CREDENTIAL, never of the
@@ -6838,7 +6846,12 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
         serviceRole,
         branchId,
         role: serviceRole ? 'service' : 'custom',
-        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year
+        // No silent expiry. Dashboard keys default to never expiring; this
+        // tool used to stamp a hidden 365-day expiry that no message, doc or
+        // console column mentioned — the runtime then refused the key a year
+        // later with nothing having warned anyone. Expiry is opt-in and,
+        // when chosen, said out loud below.
+        expiresAt: expiresAt,
       }
     })
     
@@ -6862,6 +6875,8 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
 
 ${safety}
 
+${expiresAt ? `⏳ Expires ${expiresAt.toISOString().slice(0, 10)} (${expiresInDays} days) — the runtime refuses it after that.` : 'No expiry: the key works until it is revoked or rotated.'}
+
 **Copy this key (shown once):**
 \`\`\`
 ${keyValue}
@@ -6873,6 +6888,7 @@ ${keyValue}
         publishable: !serviceRole,
         header: 'x-api-key',
         safeInBrowser: !serviceRole,
+        expiresAt: expiresAt ? expiresAt.toISOString() : null,
       }
     }
   } catch (error: any) {
@@ -10108,19 +10124,64 @@ async function executeRotateKey(params: any, projectId: string): Promise<Executi
 async function executeSetKeyPermissions(params: any, projectId: string): Promise<ExecutionResult> {
   const { keyId, permissions } = params
   if (!keyId) return { success: false, message: 'keyId is required' }
-  if (!Array.isArray(permissions)) return { success: false, message: 'permissions must be an array (e.g. ["read", "write"])' }
+  if (!Array.isArray(permissions) || permissions.length === 0) {
+    return { success: false, message: 'permissions must be a non-empty array (e.g. ["read", "write"])' }
+  }
+
+  // The runtime's whole vocabulary. Anything else would be written verbatim
+  // and silently match no gate — a key that LOOKS narrowed and isn't.
+  const KEY_PERMISSION_VOCABULARY = ['read', 'write', 'ai-only', 'admin']
+  const unknown = permissions.filter((p: unknown) => !KEY_PERMISSION_VOCABULARY.includes(String(p)))
+  if (unknown.length > 0) {
+    return {
+      success: false,
+      message:
+        `Unknown permission${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}. ` +
+        `The runtime reads exactly: read, write, ai-only. ('admin' passes every gate and is not grantable here.)`,
+      error: 'UNKNOWN_PERMISSION',
+    }
+  }
 
   try {
     const { prisma } = await import('@/lib/db')
     const key = await prisma.apiKey.findFirst({ where: { id: keyId, projectId } })
     if (!key) return { success: false, message: `API key "${keyId}" not found` }
 
+    // A service-role key's access is not permission-driven: the runtime
+    // treats serviceRole as operator-grade before any permission is read.
+    // "Narrowing" one here would change nothing while reporting success.
+    if (key.serviceRole) {
+      return {
+        success: false,
+        message:
+          `\`${key.keyPrefix}...\` is a service-role key — its access does not come from the ` +
+          `permissions array, so editing it here would change nothing. Rotate or revoke it instead, ` +
+          `or create a publishable key with the scopes you want.`,
+        error: 'SERVICE_ROLE_KEY_NOT_PERMISSION_DRIVEN',
+      }
+    }
+
+    // 'admin' makes a key pass EVERY permission gate (server/lib/auth.ts) —
+    // granting it is privilege escalation, not scope adjustment, and it is
+    // the project owner's click to make in Settings, not a tool call's.
+    if (permissions.includes('admin') && !key.permissions.includes('admin')) {
+      return {
+        success: false,
+        message:
+          `Refused: adding 'admin' makes \`${key.keyPrefix}...\` pass every permission gate. ` +
+          `That escalation is the project owner's decision — grant it from Settings → API keys, ` +
+          `or create a service-role key deliberately with create_api_key { "serviceRole": true }.`,
+        error: 'ADMIN_ESCALATION_REQUIRES_HUMAN',
+      }
+    }
+
+    const before = key.permissions
     await prisma.apiKey.update({ where: { id: keyId }, data: { permissions } })
 
     return {
       success: true,
-      message: `✅ API key \`${key.keyPrefix}...\` permissions updated to: ${permissions.join(', ')}`,
-      data: { keyId, permissions },
+      message: `✅ API key \`${key.keyPrefix}...\` permissions updated: ${before.join(', ') || '(none)'} → ${permissions.join(', ')}`,
+      data: { keyId, permissions, previousPermissions: before },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to set permissions: ${error.message}`, error: error.message }
