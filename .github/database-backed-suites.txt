@@ -838,6 +838,12 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# The agent can set the access policy the runtime enforces: set_bucket_policy
+# writes all four values to a real bucket row with the derived isPublic
+# label, refuses unknown policies naming the vocabulary, and the catalog and
+# docs advertise the contract. Real bucket rows are the property.
+tests/integration/storage-policy-action.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
