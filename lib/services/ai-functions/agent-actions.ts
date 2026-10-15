@@ -19,6 +19,7 @@ import { canAccessProject, canWriteProject } from '@/lib/edition/guard'
 import { workspaceSchemaName } from '@/lib/security/workspace-schema'
 import { executeAiFunction, validateSandboxFunction } from './executor'
 import { isRouteModuleFunction, validateRouteModule } from './route-module-runner'
+import { isFunctionSwitchedOff } from './status'
 
 export interface FunctionActor {
   userId?: string
@@ -122,7 +123,7 @@ export async function invokeFunction(
   const fn = await findFunction(actor.projectId, args)
   if (fn === undefined) return needsTarget
   if (!fn) return notFound(args)
-  if (fn.status === 'inactive' || fn.status === 'disabled') {
+  if (isFunctionSwitchedOff(fn.status)) {
     return {
       ok: false,
       code: 'FUNCTION_INACTIVE',
@@ -419,6 +420,9 @@ export async function deployFunctionCode(
       ? args.description.trim().slice(0, 500)
       : existing?.description || 'Deployed from agent-written code.',
     generatedCode: code,
+    // Agent-written code is stored exactly as written, and STAYS as written:
+    // the runtime self-healer refuses to model-rewrite rows marked 'agent'.
+    codeOrigin: 'agent',
     triggerType: DEPLOY_TRIGGERS[trigger],
     triggerTable: method ? `${method} ${endpoint}` : table,
     lastError: null,
