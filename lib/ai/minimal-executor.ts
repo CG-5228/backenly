@@ -10985,11 +10985,11 @@ async function executeRollbackToVersion(params: any, projectId: string): Promise
  *   openai/anthropic → generates /ai/chat and /ai/embed endpoints with rate limiting
  */
 async function executeStoreIntegrationKey(params: any, projectId: string): Promise<ExecutionResult> {
-  const { integrationId, apiKey, webhookSecret } = params
-  if (!integrationId || !apiKey) {
+  const { integrationId: rawIntegrationId, apiKey, webhookSecret } = params
+  if (!rawIntegrationId || !apiKey) {
     // Friendly pending state — never a hard error. Show inline key prompt with skip option.
-    const providerName = integrationId
-      ? integrationId.charAt(0).toUpperCase() + integrationId.slice(1)
+    const providerName = rawIntegrationId
+      ? rawIntegrationId.charAt(0).toUpperCase() + rawIntegrationId.slice(1)
       : 'external provider'
     const KEY_EXAMPLES: Record<string, string> = {
       stripe: 'sk_live_... or sk_test_...',
@@ -11002,7 +11002,7 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       runway: 'rw_...',
       luma: 'luma_...',
     }
-    const example = integrationId ? (KEY_EXAMPLES[integrationId.toLowerCase()] ?? `your ${providerName} API key`) : 'your API key'
+    const example = rawIntegrationId ? (KEY_EXAMPLES[rawIntegrationId.toLowerCase()] ?? `your ${providerName} API key`) : 'your API key'
     return {
       success: false,
       message: [
@@ -11015,6 +11015,28 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       error: 'CREDENTIALS_PENDING',
     }
   }
+
+  // ── The id must name a provider the runtime actually serves ───────────────
+  //
+  // This used to store ANY id verbatim: an unknown id ("hubspot") was filed,
+  // marked connected, and promised a `ctx.integrations.hubspot.*` surface that
+  // does not exist; a capitalised id ("Stripe") was stored under a key the
+  // runtime, the receiver and the console all look up lowercased, so the
+  // credential existed and nothing could find it.
+  const { resolveProviderId, allProviderIds } = await import('@/lib/services/ai-functions/integration-registry')
+  const canonicalId = resolveProviderId(String(rawIntegrationId).trim())
+  if (!canonicalId) {
+    return {
+      success: false,
+      message:
+        `"${rawIntegrationId}" is not an integration this runtime serves. ` +
+        `Known providers: ${allProviderIds().sort().join(', ')}.`,
+      error: 'UNKNOWN_INTEGRATION',
+    }
+  }
+  // Every reference below — vault rows, auto-wiring, activeIntegrations, the
+  // ctx.integrations surface named in the receipt — uses the CANONICAL id.
+  const integrationId = canonicalId
 
   // ── Stripe without a webhook secret is a DEGRADED connect, not a refusal ───
   //
@@ -11029,11 +11051,11 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
   // Connect the key, do the work that does not need the secret, and say plainly
   // which capability is off until the real secret arrives. A missing credential
   // is a known gap; a fabricated one is a lie in the vault.
-  const webhookSecretPending = integrationId === 'stripe' && !webhookSecret
+  const webhookSecretPending = canonicalId === 'stripe' && !webhookSecret
 
   try {
     const { storeIntegrationKey } = await import('@/lib/services/integrationKeyStore')
-    const status = await storeIntegrationKey(projectId, integrationId, apiKey)
+    const status = await storeIntegrationKey(projectId, canonicalId, String(apiKey).trim())
     const keyValidationNote =
       status.verification === 'verified' ? ''
       : status.verification === 'unreachable' ? `\n\n⚠ ${status.verificationDetail}`
@@ -11043,6 +11065,20 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
     // there is no branch here that writes a value the caller did not pass.
     if (webhookSecret) {
       await storeIntegrationKey(projectId, `${integrationId}_webhook_secret`, webhookSecret)
+    }
+
+    // OneSignal needs TWO values: the REST key (stored above) and the App ID.
+    // Only the chat-only enable_push_notifications tool could store the App
+    // ID, so the typed door could connect OneSignal and still never send a
+    // push. `appId` rides the same connect call now.
+    let oneSignalAppIdPending = false
+    if (integrationId === 'onesignal') {
+      if (params.appId) {
+        await storeIntegrationKey(projectId, 'onesignal_app_id', String(params.appId).trim())
+      } else {
+        const { hasIntegrationKey } = await import('@/lib/services/integrationKeyStore')
+        oneSignalAppIdPending = !(await hasIntegrationKey(projectId, 'onesignal_app_id'))
+      }
     }
 
     const autoWiredSteps: string[] = []
@@ -11264,15 +11300,21 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       ? `\n\n**Auto-wired:**\n${autoWiredSteps.join('\n')}`
       : ''
 
+    const appIdGap = oneSignalAppIdPending
+      ? `\n\n⚠ **Push sending is NOT active yet.** OneSignal also needs your App ID: ` +
+        `call integrations { "action": "connect", "integrationId": "onesignal", "apiKey": "<same REST key>", "appId": "<your App ID>" }.`
+      : ''
+
     return {
       success: true,
-      message: `${integrationId} connected. Key stored securely (${status.maskedKey}).${keyValidationNote}${webhookUrl}${webhookGap}${autoWiredMsg}\n\nAI functions can now use \`ctx.integrations.${integrationId}.*\` to call ${integrationId} APIs.`,
+      message: `${integrationId} connected. Key stored securely (${status.maskedKey}).${keyValidationNote}${webhookUrl}${webhookGap}${appIdGap}${autoWiredMsg}\n\nAI functions can now use \`ctx.integrations.${integrationId}.*\` to call ${integrationId} APIs.`,
       data: {
         integrationId,
         maskedKey: status.maskedKey,
         verification: status.verification,
         verificationDetail: status.verificationDetail,
         webhookSecretPending,
+        oneSignalAppIdPending,
         autoWired: autoWiredSteps,
       },
     }
@@ -11362,17 +11404,51 @@ async function executeListIntegrationKeys(projectId: string): Promise<ExecutionR
  * params: { integrationId: string }
  */
 async function executeRemoveIntegrationKey(params: any, projectId: string): Promise<ExecutionResult> {
-  const { integrationId } = params
-  if (!integrationId) return { success: false, message: 'integrationId is required' }
+  const { integrationId: rawId } = params
+  if (!rawId) return { success: false, message: 'integrationId is required' }
 
   try {
     const { prisma: db } = await import('@/lib/db')
+    // Same canonical resolution as connect, so "Stripe" removes what
+    // "stripe" stored; an unknown id removes nothing and says so.
+    const { resolveProviderId } = await import('@/lib/services/ai-functions/integration-registry')
+    const integrationId = resolveProviderId(String(rawId).trim()) ?? String(rawId).trim().toLowerCase()
+
     await db.projectIntegrationKey.deleteMany({
       where: { projectId, integrationId: { startsWith: integrationId } },
     })
+
+    // The console reads project.activeIntegrations[id].enabled, which only
+    // the CONNECT paths wrote — so a disconnected provider kept rendering
+    // "Connected" and counting toward "N of 5 connected" forever.
+    try {
+      const proj = await db.project.findUnique({
+        where: { id: projectId },
+        select: { activeIntegrations: true },
+      })
+      const active = (proj?.activeIntegrations as Record<string, any>) ?? {}
+      if (active[integrationId]) {
+        await db.project.update({
+          where: { id: projectId },
+          data: {
+            activeIntegrations: {
+              ...active,
+              [integrationId]: {
+                ...active[integrationId],
+                enabled: false,
+                disconnectedAt: new Date().toISOString(),
+              },
+            },
+          },
+        })
+      }
+    } catch (err: any) {
+      console.warn('[executeRemoveIntegrationKey] activeIntegrations sync failed (non-fatal):', err?.message)
+    }
+
     return {
       success: true,
-      message: `${integrationId} disconnected. Key removed from vault.`,
+      message: `${integrationId} disconnected. Key removed from vault and the dashboard no longer shows it as connected.`,
     }
   } catch (error: any) {
     return { success: false, message: `Failed to remove key: ${error.message}` }
@@ -13293,10 +13369,14 @@ async function executeSendPush(params: any, projectId: string): Promise<Executio
       getIntegrationKey(projectId, 'onesignal_app_id'),
     ])
     if (!restApiKey || !appId) {
+      const missing = !restApiKey && !appId ? 'REST API Key and App ID' : !restApiKey ? 'REST API Key' : 'App ID'
       return {
         success: false,
         message:
-          `OneSignal isn't connected yet. Say "connect OneSignal" and paste your **App ID** and **REST API Key** (both on onesignal.com → Settings → Keys & IDs).`,
+          `OneSignal isn't fully connected: the ${missing} is missing (both are on onesignal.com → Settings → Keys & IDs). ` +
+          `Connect with the exact call: integrations { "action": "connect", "integrationId": "onesignal", ` +
+          `"apiKey": "<REST API Key>", "appId": "<App ID>" }.`,
+        error: 'ONESIGNAL_NOT_CONNECTED',
       }
     }
 

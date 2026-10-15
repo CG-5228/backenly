@@ -127,6 +127,34 @@ export const DELETE = withProjectAccess(async (req: NextRequest, { projectId }) 
     where: { projectId, integrationId },
   })
 
+  // The dashboard derives "Connected" from activeIntegrations[id].enabled,
+  // which only the connect paths wrote — without this, a removed key kept
+  // rendering as connected and counting toward "N of 5 connected".
+  try {
+    const proj = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { activeIntegrations: true },
+    })
+    const active = (proj?.activeIntegrations as Record<string, any>) ?? {}
+    if (active[integrationId]) {
+      await prisma.project.update({
+        where: { id: projectId },
+        data: {
+          activeIntegrations: {
+            ...active,
+            [integrationId]: {
+              ...active[integrationId],
+              enabled: false,
+              disconnectedAt: new Date().toISOString(),
+            },
+          },
+        },
+      })
+    }
+  } catch {
+    // non-fatal — the vault row is already gone
+  }
+
   await prisma.auditLog.create({
     data: {
       projectId,

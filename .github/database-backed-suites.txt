@@ -835,6 +835,14 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# The integrations connect door keeps its contract: unknown provider ids are
+# refused with the served list, any alias or casing stores under the one
+# canonical id everything looks up, disconnect clears what the console reads
+# on both doors, and OneSignal connects fully (REST key + App ID) through the
+# typed call with send_push naming what is missing. Real vault rows are the
+# property; PostHog (stored-unverifiable) keeps CI off external APIs.
+tests/integration/integrations-connect-contract.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
