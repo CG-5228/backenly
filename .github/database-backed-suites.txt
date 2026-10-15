@@ -807,6 +807,12 @@ tests/integration/go-live-empty-guard.spec.ts
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
 
+# The Webhooks console reads the same AppTrigger / TriggerDeliveryLog rows the
+# MCP webhooks tool writes, the trigger list never serves the signing secret,
+# and a dead delivery replays for real against a live receiver. Real rows and
+# a real local HTTP receiver are the property.
+tests/integration/trigger-webhooks-console.spec.ts
+
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
