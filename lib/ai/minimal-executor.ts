@@ -7003,14 +7003,15 @@ async function executeEnableRealtime(params: Record<string, any>, projectId: str
     // Enabling is PER TABLE. Without a name this used to fall through to the
     // install-on-every-table branch, so `realtime { action: "enable" }` from
     // an agent that forgot the argument silently started streaming the whole
-    // project. The all-tables branch stays reachable on purpose — but only
-    // by saying so.
+    // project. The all-tables branch stays reachable for internal callers that
+    // pass allTables: true; the agent's tool forwards only tableName, so the
+    // refusal names only the call an agent can make.
     if (!tableName && params?.allTables !== true) {
       return {
         success: false,
         message:
-          'Realtime is enabled per table: pass tableName, e.g. realtime { "action": "enable", "tableName": "posts" }. ' +
-          'To deliberately stream every table, pass { "allTables": true }.',
+          'Realtime is enabled per table: pass tableName, e.g. realtime { "action": "enable", "tableName": "posts" }, ' +
+          'once for each table that should stream.',
         error: 'TABLE_NAME_REQUIRED',
       }
     }

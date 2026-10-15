@@ -69,7 +69,9 @@ describe('RT-05: enabling is per table, every-table only by name', () => {
     const out = await act('ENABLE_REALTIME', {})
     expect(out.success).toBe(false)
     expect(out.error).toBe('TABLE_NAME_REQUIRED')
-    expect(out.message).toContain('allTables')
+    expect(out.message).toContain('"tableName"')
+    // The agent's tool forwards only tableName, so the refusal must not offer allTables.
+    expect(out.message).not.toContain('allTables')
     await expect(listTablesWithRealtimeTriggers(projectId)).resolves.toEqual([])
   }, 60_000)
 
@@ -79,18 +81,18 @@ describe('RT-05: enabling is per table, every-table only by name', () => {
     await expect(listTablesWithRealtimeTriggers(projectId)).resolves.toEqual(['posts'])
   }, 60_000)
 
-  it('allTables: true is the explicit project-wide switch', async () => {
+  it('the agent door cannot stream the whole project, even when asked to', async () => {
+    const out = await dispatchTool('enable_realtime', { allTables: true }, { projectId, userId: ownerId } as any)
+    expect(out.ok).toBe(false)
+    expect(out.summary).toContain('tableName')
+    await expect(listTablesWithRealtimeTriggers(projectId)).resolves.toEqual(['posts'])
+  }, 60_000)
+
+  it('allTables: true is the explicit project-wide switch for internal callers', async () => {
     const out = await act('ENABLE_REALTIME', { allTables: true })
     expect(out.success).toBe(true)
     const streaming = await listTablesWithRealtimeTriggers(projectId)
     expect(streaming.sort()).toEqual(['comments', 'posts'])
-  }, 60_000)
-
-  it('the brain dispatch refuses any call missing a declared-required argument', async () => {
-    const out = await dispatchTool('enable_realtime', {}, { projectId, userId: ownerId } as any)
-    expect(out.ok).toBe(false)
-    expect((out as any).code).toBe('MISSING_REQUIRED_ARGUMENT')
-    expect(out.summary).toContain('tableName')
   }, 60_000)
 })
 
