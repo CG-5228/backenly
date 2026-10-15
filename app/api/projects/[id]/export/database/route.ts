@@ -57,6 +57,10 @@ function portableFilter(): Transform {
   })
 }
 
+// ADMIN: `mode=full` streams every row of every table in the workspace — the
+// whole tenant, end-user data included. An export is classified by what it
+// hands over, not by its verb; membership alone let an organization VIEWER
+// exfiltrate the project.
 export async function GET(request: NextRequest) {
   return withProjectValidation<any>(request, async (validated) => {
     const url = new URL(request.url)
@@ -173,5 +177,5 @@ export async function GET(request: NextRequest) {
         'Cache-Control': 'no-store',
       },
     })
-  })
+  }, { floor: 'administer' })
 }
