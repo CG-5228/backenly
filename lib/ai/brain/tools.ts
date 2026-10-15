@@ -625,11 +625,13 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     },
     ['tableName']),
   fn('create_trigger',
-    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY.',
+    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY. ' +
+    'kind "webhook" REQUIRES webhookUrl (the endpoint to call); without it the trigger is refused, never created dead.',
     {
       tableName: { type: 'string' },
       on: { type: 'string', enum: ['insert', 'update', 'delete'] },
       kind: { type: 'string', enum: ['webhook', 'notify'] },
+      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the HTTP(S) endpoint the trigger calls. Required for webhooks.' },
     },
     ['tableName', 'on', 'kind']),
   fn('sync_column',
@@ -678,7 +680,8 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Create a backend function. Backenly functions are EVENT-DRIVEN or HTTP — pick the `trigger` that matches what the user described:\n' +
     '  • on_signup — runs automatically every time an end-user signs up (welcome emails, default rows, tier assignment, analytics identify).\n' +
     '  • on_insert / on_update / on_delete — runs automatically every time a row is inserted / updated / deleted in `table` ' +
-    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`.\n' +
+    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`. ' +
+    'Row events are captured inside PostgreSQL, so every writer fires them — REST, SDK, MCP, SQL in another function — within about a minute of the write. Auth-managed tables (users) are not captured; use on_signup.\n' +
     '  • http — a callable REST endpoint at /api/v1/{projectId}/fn/{name} that a frontend or another service hits directly ' +
     '("an endpoint to export orders as CSV", "a /checkout/session endpoint").\n' +
     '  • manual — only runs when fired from the Functions dashboard (occasional maintenance / recompute tasks).\n' +
@@ -1203,7 +1206,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       force: { type: 'boolean', description: 'Set true ONLY when the user has typed DEPLOY verbatim this turn.' },
     }),
   fn('rollback_deploy',
-    'DESTRUCTIVE. Revert the live backend to a previous published version. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status / list_apis first so you know which version you would be reverting to.',
+    'DESTRUCTIVE. Mark a previous published version as current in the version history. This is bookkeeping: it does NOT change the live schema, data, RLS or functions, and the API keeps serving exactly what is deployed now. To restore structure, roll back a schema version from the Database page or restore a Snapshot. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status first.',
     {
       version: { type: 'integer', description: 'Target published version number (e.g. 2). Either version OR deploymentId is required.' },
       deploymentId: { type: 'string', description: 'Specific deployment id to roll back to.' },
@@ -1264,7 +1267,20 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'a property of the key, not of the request, so there is no header or parameter that switches it later.',
     {
       description: { type: 'string', description: 'Human label, e.g. "web frontend" or "cron worker".' },
-      permissions: { type: 'array', items: { type: 'string' }, description: 'e.g. ["read:posts","write:posts"]. Default ["read:*"].' },
+      permissions: {
+        type: 'array',
+        items: { type: 'string', enum: ['read', 'write', 'ai-only'] },
+        description:
+          'The runtime reads exactly these values — there is no per-table scoping. Default ["read","write"].',
+      },
+      expiresInDays: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 3650,
+        description:
+          'Optional. Omitted means the key NEVER expires (same as dashboard keys). When set, the runtime ' +
+          'refuses the key after this many days and the response says the exact date.',
+      },
       serviceRole: {
         type: 'boolean',
         description:
@@ -1288,10 +1304,10 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { keyId: { type: 'string' } },
     ['keyId']),
   fn('set_key_permissions',
-    'Update the permission set on an existing API key (e.g. add write access to a new table).',
+    "Replace a publishable key's permission set. Vocabulary: read, write, ai-only — the whole set the runtime reads; there is no per-table scoping. 'admin' is not grantable here (it passes every gate; that escalation belongs to the project owner in Settings), and service-role keys are refused because their access is not permission-driven.",
     {
       keyId: { type: 'string' },
-      permissions: { type: 'array', items: { type: 'string' } },
+      permissions: { type: 'array', items: { type: 'string', enum: ['read', 'write', 'ai-only'] } },
     },
     ['keyId', 'permissions']),
 
@@ -1306,6 +1322,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       apiKey: { type: 'string', description: 'The secret to store (encrypted). Omit to trigger the inline "paste your key" prompt.' },
       label: { type: 'string', description: 'Optional human label, e.g. "Stripe live key".' },
       webhookSecret: { type: 'string', description: 'Stripe only: the endpoint signing secret (whsec_…). Until it is stored, the Stripe receiver rejects every event.' },
+      appId: { type: 'string', description: 'OneSignal only: the App ID, sent with the REST API key. Push stays off until both are stored.' },
     },
     ['integrationId']),
   fn('remove_integration_key',
@@ -1770,13 +1787,13 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   // environment can be chosen — the data plane reads its schema from the
   // credential, never from the request. Dropping it here is what made branch
   // routing unreachable from the agent lane.
-  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId } }),
+  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId, expiresInDays: a.expiresInDays } }),
   revoke_api_key: (a) => ({ action: 'REVOKE_KEY', params: { keyId: a.keyId } }),
   rotate_api_key: (a) => ({ action: 'ROTATE_KEY', params: { keyId: a.keyId } }),
   set_key_permissions: (a) => ({ action: 'SET_KEY_PERMISSIONS', params: { keyId: a.keyId, permissions: a.permissions } }),
 
   // Integrations
-  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret } }),
+  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret, appId: a.appId } }),
   remove_integration_key: (a) => ({ action: 'REMOVE_INTEGRATION_KEY', params: { integrationId: a.integrationId } }),
   delete_trigger: (a) => ({ action: 'DELETE_TRIGGER', params: { triggerId: a.triggerId, name: a.name } }),
 
@@ -1953,7 +1970,8 @@ export async function dispatchTool(
     // ── Read: agent workflow primer ───────────────────────────────────────
     if (name === 'get_instructions') {
       const pid = ctx.projectId
-      const base = `https://backenly.com/api/v1/${pid}`
+      const { appOrigin } = await import('@/lib/mcp/oauth')
+      const base = `${appOrigin()}/api/v1/${pid}`
       // ── Every tool named below MUST be one the manifest advertises ───────────
       //
       // This guide used to instruct agents to call `get_backend_metadata`,
@@ -1982,7 +2000,7 @@ export async function dispatchTool(
         '- `read_backend_state` with NO arguments — the grounding overview: tables, APIs, auth, storage, RLS.',
         '- `read_backend_state { section: "schema" }` — every table with record counts + all foreign-key relationships. Record counts reveal one-to-many joins (use COUNT(DISTINCT …), never a naive COUNT(*) over a join).',
         '- `get_table_schema { tableName }` — BEFORE any query/insert/migration on a table. Columns (type/nullable/default/PK), foreign keys, indexes, CHECK constraints WITH THEIR EXACT ALLOWED VALUES, triggers, and the live RLS policies. Reading this is what stops a write failing on a constraint you could have seen.',
-        '- Other sections: `tables`, `apis`, `functions`, `rls`, `triggers`, `keys`, `users`, `buckets`, `files`, `cron`, `env`, `integrations`, `apps`, `webhooks`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `findings`, `incidents`, `autonomy`, `maintenance`, `realtime`.',
+        '- Other sections: `tables`, `apis`, `functions`, `rls`, `triggers`, `keys`, `users`, `buckets`, `files`, `cron`, `env`, `integrations`, `apps`, `webhooks`, `deliveries`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `findings`, `incidents`, `autonomy`, `maintenance`, `realtime`.',
         '',
         '## 2. Build',
         '- `apply_migration { sql }` for schema. Ordinary PostgreSQL DDL: CREATE TABLE, ALTER TABLE ADD COLUMN / RENAME COLUMN / ADD CONSTRAINT, CREATE INDEX. Multiple statements, semicolon-separated. Your DDL is applied AS WRITTEN — declared NOT NULL, DEFAULT and nullability are honoured exactly. Every table also gets `id`, `"createdAt"`, `"updatedAt"` (camelCase) and `"deleted_at"`; a declared `id`, `created_at` or `updated_at` is skipped in their favour and reported, so order by `"createdAt"`.',
@@ -2314,7 +2332,10 @@ export async function dispatchTool(
       }
 
       if (name === 'merge_branch') {
-        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId)
+        const approvedMigrations = Array.isArray((args as any).approvedMigrations)
+          ? ((args as any).approvedMigrations as unknown[]).map(String)
+          : undefined
+        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId, approvedMigrations)
         if (!res.ok) return finalize({ ok: false, summary: (res as any).error, code: (res as any).code })
         const r: any = res
         const applied = r.applied?.length ? `Applied: ${r.applied.join('; ')}.` : 'Nothing was applied automatically.'
@@ -3063,7 +3084,7 @@ export async function dispatchTool(
         summary: clip([
           `${provisioned ? 'Provisioned' : 'Existing'} ${mode === 'READ_ONLY' ? 'read-only' : 'read-write'} Postgres access: role ${c.roleName} @ ${c.host}:${c.port}/${c.database} (TLS required, search_path pinned to ${status.schema}).`,
           mode === 'READ_ONLY'
-            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump. It cannot mutate anything.'
+            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump (run pg_dump with --enable-row-security; the returned pgDumpCommand includes it). It cannot mutate anything.'
             : 'DML + in-schema DDL. Every DDL statement you run is observed as drift — call adopt_external_schema when you finish migrating.',
           'The connection string is in data.connectionString — treat it as a secret (do not write it into code, files, or logs; reference it from env).',
         ].join('\n')),
@@ -3111,7 +3132,7 @@ export async function dispatchTool(
           'schema change made over that connection is observed as drift and adopted by the autonomy loop, ' +
           'which is why it is opt-in. Then call this tool again with mode=READ_WRITE.\n' +
           'Read-only access needs no approval and is available right now via mode=READ_ONLY — it covers ' +
-          'inspection, EXPLAIN, BI and pg_dump. For SCHEMA CHANGES you do not need direct access at all: ' +
+          'inspection, EXPLAIN, BI and pg_dump (with --enable-row-security — the returned pgDumpCommand includes it). For SCHEMA CHANGES you do not need direct access at all: ' +
           'apply_migration takes ordinary DDL and is governed, verified and reversible.',
         data: access,
       })

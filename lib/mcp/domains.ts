@@ -127,7 +127,7 @@ export const DOMAIN_TOOLS: DomainTool[] = [
       list: { tool: 'list_integration_keys', gloss: 'connected providers, masked keys and verification state' },
       capabilities: { tool: 'list_integration_capabilities', gloss: 'the exact ctx.integrations methods each provider gives a function, and for Stripe its receiver URL and signing-secret state' },
       verify: { tool: 'verify_integration_key', gloss: 'ask the provider again whether the stored key works' },
-      connect: { tool: 'store_integration_key', gloss: 'store a provider key (Stripe also takes webhookSecret) and wire the first functions' },
+      connect: { tool: 'store_integration_key', gloss: 'store a provider key (Stripe also takes webhookSecret, OneSignal also takes appId) and wire the first functions' },
       disconnect: { tool: 'remove_integration_key', gloss: 'remove a provider key' },
       send_push: { tool: 'send_push', gloss: 'a push notification through the connected OneSignal app' },
     },
@@ -193,7 +193,7 @@ export const DOMAIN_TOOLS: DomainTool[] = [
       history: { tool: 'list_deploy_versions', gloss: 'every published version, which one is serving, and which can be rolled back to' },
       readiness: { tool: 'get_readiness', gloss: 'the 0-100 readiness score with blockers; fixes nothing unless autoFix is true', readGloss: 'the 0-100 readiness score with its blockers' },
       deploy: { tool: 'trigger_deploy', gloss: 'publish the current backend' },
-      rollback: { tool: 'rollback_deploy', gloss: 'return to an earlier version' },
+      rollback: { tool: 'rollback_deploy', gloss: 'mark an earlier published version as current (version bookkeeping; the live backend is unchanged)' },
     },
   },
   {
