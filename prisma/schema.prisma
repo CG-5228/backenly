@@ -2391,7 +2391,7 @@ model WebhookLog {
   id           String                @id @default(uuid())
   webhookId    String
   eventType    String
-  payload      Json? // The event payload sent. NULL for a project outside the home region: it is kept in that region (lib/webhooks/delivery-bodies.ts)
+  payload      Json? // The event payload sent. NULL for a project outside the home region: it is kept in that region (lib/data-plane/regional-bodies.ts)
   signature    String // HMAC signature used
   status       WebhookDeliveryStatus @default(PENDING)
   statusCode   Int? // HTTP response status
@@ -3080,7 +3080,7 @@ model TriggerDeliveryLog {
   projectId    String
   eventType    String // 'insert' | 'update' | 'delete'
   table        String // Source table that fired the event
-  payload      Json? // Full event payload that was sent. NULL for a project outside the home region: it is kept in that region (lib/webhooks/delivery-bodies.ts)
+  payload      Json? // Full event payload that was sent. NULL for a project outside the home region: it is kept in that region (lib/data-plane/regional-bodies.ts)
   status       TriggerDeliveryStatus
   attemptCount Int                   @default(1)
   statusCode   Int? // HTTP response status (null if network error)

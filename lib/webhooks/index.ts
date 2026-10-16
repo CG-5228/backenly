@@ -23,7 +23,7 @@ import { prisma } from '@/lib/db/prisma'
 import crypto from 'crypto'
 import { emit } from '@/lib/events/bus'
 import { safeFetch, assertAllowedUrl, BlockedOutboundError } from '@/lib/security/outbound-guard'
-import { BODIES_ON_THE_ROW, DELIVERY_BODY_RETENTION_DAYS, deliveryBodiesFor, type DeliveryBodies } from './delivery-bodies'
+import { BODIES_ON_THE_ROW, REGIONAL_BODY_RETENTION_DAYS, regionalBodiesFor, type RegionalBodies } from '@/lib/data-plane/regional-bodies'
 import { WEBHOOK_EVENT_TYPES, isWebhookEventType, type WebhookEventType } from './events'
 
 // ─── Retry schedule ───────────────────────────────────────────────────────────
@@ -92,7 +92,7 @@ export function verifyWebhookSignature(
  * Timeout: 10 s per attempt (enough for a slow endpoint, but won't block long).
  *
  * `bodies` says where the receiver's answer is kept: on the row for a home
- * project, in the project's region otherwise (./delivery-bodies.ts).
+ * project, in the project's region otherwise (lib/data-plane/regional-bodies.ts).
  */
 export async function deliverSingleAttempt(
   webhookId: string,
@@ -101,7 +101,7 @@ export async function deliverSingleAttempt(
   payload: WebhookPayload,
   logId: string,
   attemptNumber: number = 1,
-  bodies: DeliveryBodies = BODIES_ON_THE_ROW
+  bodies: RegionalBodies = BODIES_ON_THE_ROW
 ): Promise<WebhookDeliveryResult> {
   const payloadString = JSON.stringify(payload)
   const signature = generateWebhookSignature(payloadString, secret)
@@ -153,7 +153,7 @@ export async function deliverSingleAttempt(
           deliveredAt: new Date(),
         },
       })
-      if (bodies.region) await bodies.answer(logId, { responseBody: answer })
+      if (bodies.region) await bodies.set('webhook', logId, { responseBody: answer })
       return {
         success: true,
         statusCode: response.status,
@@ -193,7 +193,7 @@ export async function deliverWebhook(
   secret: string,
   payload: WebhookPayload,
   logId: string,
-  bodies: DeliveryBodies = BODIES_ON_THE_ROW
+  bodies: RegionalBodies = BODIES_ON_THE_ROW
 ): Promise<WebhookDeliveryResult> {
   const result = await deliverSingleAttempt(webhookId, targetUrl, secret, payload, logId, 1, bodies)
 
@@ -216,7 +216,7 @@ async function _scheduleRetry(
   logId: string,
   lastResult: WebhookDeliveryResult,
   attemptNumber: number,
-  bodies: DeliveryBodies = BODIES_ON_THE_ROW
+  bodies: RegionalBodies = BODIES_ON_THE_ROW
 ): Promise<void> {
   const nextAttempt = attemptNumber + 1
   // What the receiver answered stays with the body: on the row at home, in the
@@ -255,7 +255,7 @@ async function _scheduleRetry(
         nextRetryAt: null,
       },
     })
-    if (bodies.region) await bodies.answer(logId, { responseBody: answer })
+    if (bodies.region) await bodies.set('webhook', logId, { responseBody: answer })
 
     // Notify via event bus → creates a PlatformNotification for the project owner
     const log = await prisma.webhookLog.findUnique({
@@ -287,7 +287,7 @@ async function _scheduleRetry(
         nextRetryAt,
       },
     })
-    if (bodies.region) await bodies.answer(logId, { responseBody: answer })
+    if (bodies.region) await bodies.set('webhook', logId, { responseBody: answer })
   }
 }
 
@@ -329,11 +329,11 @@ export async function retryFailedWebhooks(): Promise<number> {
   if (pending.length === 0) return 0
 
   // One lookup of where each project's bodies are kept, for the whole pass.
-  const bodiesByProject = new Map<string, Promise<DeliveryBodies>>()
-  const bodiesOf = (projectId: string): Promise<DeliveryBodies> => {
+  const bodiesByProject = new Map<string, Promise<RegionalBodies>>()
+  const bodiesOf = (projectId: string): Promise<RegionalBodies> => {
     let bodies = bodiesByProject.get(projectId)
     if (!bodies) {
-      bodies = deliveryBodiesFor(projectId)
+      bodies = regionalBodiesFor(projectId)
       bodiesByProject.set(projectId, bodies)
     }
     return bodies
@@ -356,9 +356,9 @@ export async function retryFailedWebhooks(): Promise<number> {
         // A regional project's event is kept in its region. When the region
         // cannot be read this tick, the delivery stays due and is tried again
         // on the next one: there is no other copy to send instead.
-        let held: Awaited<ReturnType<DeliveryBodies['get']>>
+        let held: Awaited<ReturnType<RegionalBodies['get']>>
         try {
-          held = await bodies.get(log.id)
+          held = await bodies.get('webhook', log.id)
         } catch (err: any) {
           console.warn(`[Webhooks] retry of ${log.id} waits: its region could not be read (${err?.message})`)
           return
@@ -368,7 +368,7 @@ export async function retryFailedWebhooks(): Promise<number> {
             where: { id: log.id },
             data: {
               status: 'FAILED',
-              error: `The event is no longer kept in the project's region (${DELIVERY_BODY_RETENTION_DAYS} days), so it cannot be retried`,
+              error: `The event is no longer kept in the project's region (${REGIONAL_BODY_RETENTION_DAYS} days), so it cannot be retried`,
               nextRetryAt: null,
             },
           })
@@ -422,7 +422,7 @@ export async function triggerWebhooks(
     projectId,
     data,
   }
-  const bodies = await deliveryBodiesFor(projectId)
+  const bodies = await regionalBodiesFor(projectId)
 
   await Promise.all(
     webhooks.map(async (webhook) => {
@@ -439,16 +439,16 @@ export async function triggerWebhooks(
 /**
  * A delivery's log row, with its payload where the project's data is kept: on
  * the row at home; in the project's region otherwise, written first and under
- * the row's id, so the row never exists without it (./delivery-bodies.ts).
+ * the row's id, so the row never exists without it (lib/data-plane/regional-bodies.ts).
  */
 async function createLog(
   webhook: { id: string; secret: string },
   eventType: string,
   payload: WebhookPayload,
-  bodies: DeliveryBodies,
+  bodies: RegionalBodies,
 ) {
   const id = crypto.randomUUID()
-  await bodies.put('webhook', id, payload)
+  await bodies.set('webhook', id, { payload })
   return prisma.webhookLog.create({
     data: {
       id,
@@ -533,9 +533,9 @@ export async function getWebhookLogs(projectId: string, webhookId: string, limit
 
   // A regional project's payloads and answers are read from its region, for
   // whoever asked; they are not copied back to the platform row.
-  const bodies = await deliveryBodiesFor(projectId)
+  const bodies = await regionalBodiesFor(projectId)
   if (!bodies.region) return rows
-  const held = await bodies.getMany(rows.filter((row) => row.payload === null).map((row) => row.id))
+  const held = await bodies.getMany('webhook', rows.filter((row) => row.payload === null).map((row) => row.id))
   return rows.map((row) => {
     const body = held.get(row.id)
     return body ? { ...row, payload: body.payload as Prisma.JsonValue, responseBody: body.responseBody } : row
@@ -612,7 +612,7 @@ export async function sendTestDelivery(projectId: string, webhookId: string) {
     },
   }
 
-  return deliverOnceAndRecord(webhook, payload, await deliveryBodiesFor(projectId))
+  return deliverOnceAndRecord(webhook, payload, await regionalBodiesFor(projectId))
 }
 
 /** Why a delivery cannot be sent again, or null when it can. */
@@ -644,13 +644,13 @@ export async function redeliverWebhookLog(projectId: string, logId: string) {
   const refusal = replayRefusal(original.status, original.webhook.active)
   if (refusal) return { refused: refusal, status: original.status }
 
-  const bodies = await deliveryBodiesFor(projectId)
+  const bodies = await regionalBodiesFor(projectId)
   let payload = original.payload as unknown as WebhookPayload | null
   if (payload === null) {
-    const held = await bodies.get(original.id)
+    const held = await bodies.get('webhook', original.id)
     if (!held) {
       return {
-        refused: `the event is no longer kept in the project's region (${DELIVERY_BODY_RETENTION_DAYS} days)`,
+        refused: `the event is no longer kept in the project's region (${REGIONAL_BODY_RETENTION_DAYS} days)`,
         status: original.status,
       }
     }
@@ -668,7 +668,7 @@ export async function redeliverWebhookLog(projectId: string, logId: string) {
 async function deliverOnceAndRecord(
   webhook: { id: string; eventType: string; targetUrl: string; secret: string },
   payload: WebhookPayload,
-  bodies: DeliveryBodies,
+  bodies: RegionalBodies,
 ) {
   const log = await createLog(webhook, webhook.eventType, payload, bodies)
 
@@ -697,7 +697,7 @@ async function deliverOnceAndRecord(
         nextRetryAt: null,
       },
     })
-    if (bodies.region) await bodies.answer(log.id, { responseBody: answer })
+    if (bodies.region) await bodies.set('webhook', log.id, { responseBody: answer })
   }
 
   return { logId: log.id, ...result }

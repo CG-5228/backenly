@@ -306,6 +306,12 @@ async function dropRegionalProjectData(projectId: string, region: CloudRegionId)
       for (const schema of schemas) {
         await rtx.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`)
       }
+      // The project's customer data kept off its platform rows
+      // (lib/data-plane/regional-bodies.ts) goes with it, not 30 days later.
+      // A database the procedure has not given the table yet holds none.
+      const [{ present }] = await rtx.$queryRaw<{ present: boolean }[]>`
+        SELECT to_regclass('public.regional_bodies') IS NOT NULL AS present`
+      if (present) await rtx.$executeRaw`DELETE FROM public.regional_bodies WHERE "projectId" = ${projectId}`
       // After the schemas, so the roles hold no grants that would block the drop.
       await dropRoles(rtx, projectRoleNames(credentialRoles, schemas))
       return schemas

@@ -16,7 +16,7 @@
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
-import { DELIVERY_BODY_RETENTION_DAYS, deliveryBodiesFor, failureWithoutReply, type DeliveryBodies } from '@/lib/webhooks/delivery-bodies'
+import { REGIONAL_BODY_RETENTION_DAYS, failureWithoutReply, regionalBodiesFor, type RegionalBodies } from '@/lib/data-plane/regional-bodies'
 import * as Sentry from '@sentry/nextjs'
 import crypto from 'crypto'
 
@@ -224,7 +224,7 @@ async function fireWebhookWithDLQ(
  * A delivery's log row, and its body where the project's data is kept: the
  * payload and the receiver's reply on the row at home; in the project's region
  * otherwise, written first and under the row's id, with only the HTTP status
- * of a failure on the row (lib/webhooks/delivery-bodies.ts).
+ * of a failure on the row (lib/data-plane/regional-bodies.ts).
  */
 async function recordDelivery(
   projectId: string,
@@ -233,10 +233,9 @@ async function recordDelivery(
   payload: Record<string, any>,
   outcome: { status: 'SUCCESS' | 'DEAD'; attemptCount: number; statusCode?: number; error?: string; deliveredAt?: Date },
 ): Promise<void> {
-  const bodies = await deliveryBodiesFor(projectId)
+  const bodies = await regionalBodiesFor(projectId)
   const id = crypto.randomUUID()
-  await bodies.put('trigger', id, payload)
-  if (bodies.region && outcome.error !== undefined) await bodies.answer(id, { error: outcome.error })
+  await bodies.set('trigger', id, { payload, ...(outcome.error !== undefined ? { error: outcome.error } : {}) })
 
   await prisma.triggerDeliveryLog.create({
     data: {
@@ -276,12 +275,12 @@ export async function replayDelivery(
     return { success: false, error: 'Trigger no longer has a webhook URL' }
   }
 
-  const bodies: DeliveryBodies = await deliveryBodiesFor(projectId)
+  const bodies: RegionalBodies = await regionalBodiesFor(projectId)
   let payload = log.payload as Record<string, any> | null
   if (payload === null) {
-    const held = await bodies.get(deliveryLogId)
+    const held = await bodies.get('trigger', deliveryLogId)
     if (!held) {
-      return { success: false, error: `The event is no longer kept in the project's region (${DELIVERY_BODY_RETENTION_DAYS} days)` }
+      return { success: false, error: `The event is no longer kept in the project's region (${REGIONAL_BODY_RETENTION_DAYS} days)` }
     }
     payload = held.payload as Record<string, any>
   }
@@ -300,7 +299,7 @@ export async function replayDelivery(
         attemptCount: { increment: 1 },
       },
     })
-    if (bodies.region) await bodies.answer(deliveryLogId, { error: null })
+    if (bodies.region) await bodies.set('trigger', deliveryLogId, { error: null })
 
     console.log(`[Triggers] ✅ Replayed delivery ${deliveryLogId} successfully`)
     return { success: true }
@@ -313,7 +312,7 @@ export async function replayDelivery(
         attemptCount: { increment: 1 },
       },
     })
-    if (bodies.region) await bodies.answer(deliveryLogId, { error: err.message })
+    if (bodies.region) await bodies.set('trigger', deliveryLogId, { error: err.message })
 
     Sentry.captureException(withoutReply(err), {
       tags: { replay: true, delivery_log_id: deliveryLogId, project_id: projectId },
@@ -701,9 +700,9 @@ export async function listDeliveryLogs(
 
   // A regional project's failure text is read from its region, for whoever
   // asked; the platform row holds only the HTTP status.
-  const bodies = await deliveryBodiesFor(projectId)
+  const bodies = await regionalBodiesFor(projectId)
   if (!bodies.region) return rows
-  const held = await bodies.getMany(rows.map((row) => row.id))
+  const held = await bodies.getMany('trigger', rows.map((row) => row.id))
   return rows.map((row) => {
     const error = held.get(row.id)?.error
     return error != null ? { ...row, error } : row

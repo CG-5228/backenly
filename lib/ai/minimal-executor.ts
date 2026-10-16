@@ -10982,12 +10982,16 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
       ? await prisma.aiFunction.findFirst({ where: { name: functionName, projectId } })
       : null
 
+    // A regional project's last errors are read from its region
+    // (lib/services/ai-functions/run-records.ts).
+    const { withLastErrors } = await import('@/lib/services/ai-functions/run-records')
+
     if (!fn) {
       // No specific function identified — list broken ones so the AI can pick
-      const broken = await prisma.aiFunction.findMany({
+      const broken = await withLastErrors(projectId, await prisma.aiFunction.findMany({
         where: { projectId, status: 'error' },
         select: { id: true, name: true, lastError: true },
-      })
+      }))
       if (broken.length === 0) {
         return { success: true, message: 'No functions are currently in an error state.' }
       }
@@ -10998,7 +11002,8 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
       }
     }
 
-    const originalError = errorMessage || fn.lastError || 'unknown error'
+    const [withError] = await withLastErrors(projectId, [fn])
+    const originalError = errorMessage || withError.lastError || 'unknown error'
 
     const { generateFixedFunctionCode } = await import('@/lib/services/ai-functions/generator')
     const fixedCode = await generateFixedFunctionCode(
@@ -11027,6 +11032,12 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
         lastError: syntaxCheck.valid ? null : `Syntax error: ${syntaxCheck.error}`,
       },
     })
+    // The runtime error the fix answered is no longer the last one, in the
+    // project's region either (a syntax error names the code, not the data).
+    if (fn.lastError !== null) {
+      const { rowLastError } = await import('@/lib/services/ai-functions/run-records')
+      await rowLastError(projectId, fn.id, null)
+    }
 
     if (!syntaxCheck.valid) {
       return {
@@ -11071,14 +11082,17 @@ async function executeListAiFunctions(projectId: string): Promise<ExecutionResul
     // `lastError` matters as much as the code: it is the difference between
     // "this function is wrong" and "this function is fine and the table it reads
     // has an RLS policy that matches nothing".
-    const functions = await prisma.aiFunction.findMany({
+    // A regional project's last errors and run logs are read from its region
+    // (lib/services/ai-functions/run-records.ts).
+    const { withLastErrors, withRunBodies } = await import('@/lib/services/ai-functions/run-records')
+    const functions = await withLastErrors(projectId, await prisma.aiFunction.findMany({
       where: { projectId },
       orderBy: { createdAt: 'desc' },
       select: {
         id: true, name: true, description: true, triggerType: true, triggerTable: true,
         status: true, runCount: true, lastRun: true, lastError: true, generatedCode: true,
       },
-    })
+    }))
 
     if (functions.length === 0) {
       return {
@@ -11096,8 +11110,8 @@ async function executeListAiFunctions(projectId: string): Promise<ExecutionResul
       where: { functionId: { in: functions.map(f => f.id) } },
       orderBy: { createdAt: 'desc' },
       take: 60,
-      select: { functionId: true, success: true, error: true, logs: true, createdAt: true, durationMs: true },
-    }).catch(() => [] as any[])
+      select: { id: true, functionId: true, success: true, error: true, logs: true, createdAt: true, durationMs: true },
+    }).then((runs) => withRunBodies(projectId, runs)).catch(() => [] as any[])
 
     const logsByFn = new Map<string, any[]>()
     for (const log of recentLogs) {

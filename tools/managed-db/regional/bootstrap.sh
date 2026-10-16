@@ -166,9 +166,9 @@ step postgrest "$ROOT/scripts/postgrest-install.sh|$ROOT/scripts/lib/db-admin.sh
 # 3. The one platform-shaped table a regional database holds, before the capture
 #    triggers that write it.
 step drift-events "$ROOT/scripts/sql/schema-drift-events.sql"
-# 4. The region's projects' webhook and trigger delivery bodies, which never
-#    leave the region (lib/webhooks/delivery-bodies.ts).
-step delivery-bodies "$ROOT/scripts/sql/delivery-bodies.sql"
+# 4. The region's projects' customer data on platform rows, which never
+#    leaves the region (lib/data-plane/regional-bodies.ts).
+step regional-bodies "$ROOT/scripts/sql/regional-bodies.sql"
 # 5. Direct database access and its two DDL-capture event triggers.
 step direct-access "$ROOT/scripts/setup-direct-access.sql"
 # 6. Extensions the data plane and its probes use.

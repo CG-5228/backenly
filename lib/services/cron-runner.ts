@@ -14,7 +14,7 @@
  *                       user cron jobs, in two shares:
  *                         runRegionalSystemTasks(), every region: turn its
  *                           projects' captured row changes into deliveries,
- *                           and prune the delivery bodies it keeps (hourly)
+ *                           and prune the regional bodies it keeps (hourly)
  *                         runPlatformSystemTasks(), home region only:
  *                           1. Retry failed outbound webhooks
  *                           2. Detect & fail stuck background jobs (timeout)
@@ -34,7 +34,7 @@ import { matchesCronExpression } from '@/lib/services/cron-expression'
 import { executeAiFunction, FunctionEvent } from '@/lib/services/ai-functions/executor'
 import { retryFailedWebhooks } from '@/lib/webhooks/index'
 import { drainWebhookOutbox } from '@/lib/webhooks/capture'
-import { pruneDeliveryBodies } from '@/lib/webhooks/delivery-bodies'
+import { pruneRegionalBodies } from '@/lib/data-plane/regional-bodies'
 import { detectAndTimeoutStuckJobs, enqueue } from '@/lib/queue/index'
 import { processBackgroundJobs, processPurgeJobs } from '@/lib/queue/worker'
 
@@ -169,14 +169,14 @@ export async function runRegionalSystemTasks(now: Date = new Date()): Promise<vo
     console.error('[SystemTasks] webhook outbox drain failed:', err?.message)
   )
 
-  // The bodies of this region's deliveries are kept 30 days in its own
-  // database (lib/webhooks/delivery-bodies.ts). Hourly is ample for a 30-day
+  // This region's projects' customer data on platform rows is kept 30 days
+  // in its own database (lib/data-plane/regional-bodies.ts). Hourly is ample for a 30-day
   // retention; the home region keeps none there, so this is a no-op at home.
   if (now.getTime() - lastBodyPruneAt >= BODY_PRUNE_INTERVAL_MS) {
     lastBodyPruneAt = now.getTime()
-    await pruneDeliveryBodies(serviceRegion(), now)
-      .then((pruned) => { if (pruned > 0) console.log(`[SystemTasks] pruned ${pruned} delivery bodies past retention`) })
-      .catch(err => console.error('[SystemTasks] delivery body prune failed:', err?.message))
+    await pruneRegionalBodies(serviceRegion(), now)
+      .then((pruned) => { if (pruned > 0) console.log(`[SystemTasks] pruned ${pruned} regional bodies past retention`) })
+      .catch(err => console.error('[SystemTasks] regional body prune failed:', err?.message))
   }
 }
 

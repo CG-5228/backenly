@@ -1079,6 +1079,15 @@ tests/integration/reset-password-sends-link.spec.ts
 # property, so it needs a real Postgres.
 tests/integration/project-region.spec.ts
 
+# A regional project's customer data on platform rows stays in its region: a
+# second database stands in for another region's, holding the real
+# regional_bodies table. Webhook and trigger payloads and replies, and function
+# run logs and errors, are kept there and nowhere in the home database; retries,
+# replays and listings read them back; a home project is unchanged; the region
+# prunes after 30 days. Two real databases and a real receiver are the
+# property, so it needs a real Postgres.
+tests/integration/regional-bodies.spec.ts
+
 # Model spend on the MCP tool route is gated and charged wherever it happens:
 # functions.schedule is refused up front with no credits and charged exactly
 # what its model calls used; integrations.connect stores the key with no

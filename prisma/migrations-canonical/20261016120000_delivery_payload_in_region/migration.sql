@@ -1,8 +1,8 @@
 -- A webhook or trigger delivery's payload is the row that fired it. For a
 -- project outside the home region it is kept in that region's own database
--- (public.delivery_bodies, scripts/sql/delivery-bodies.sql), and the platform
+-- (public.regional_bodies, scripts/sql/regional-bodies.sql), and the platform
 -- row records only what the platform needs to schedule, list and alert; its
--- payload is then NULL (lib/webhooks/delivery-bodies.ts).
+-- payload is then NULL (lib/data-plane/regional-bodies.ts).
 --
 -- Additive: two NOT NULL constraints dropped, no row or other column touched.
 -- Every existing row keeps its payload, and a home project's rows are written
