@@ -30,6 +30,7 @@
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
+import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 
@@ -91,6 +92,10 @@ export async function createApprovalRequest(input: {
     },
   })
 
+  // The request itself keeps its target, which is what the approver reads. The
+  // audit copy of it is left out for a project kept in another region, where
+  // it can name a row or a file (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
@@ -100,7 +105,7 @@ export async function createApprovalRequest(input: {
       details: JSON.stringify({
         approvalId: row.id,
         tool: input.danger.tool,
-        target: input.danger.target,
+        ...(quote ? { target: input.danger.target } : {}),
         rowCount: input.danger.rowCount,
         at: new Date().toISOString(),
       }),
@@ -352,9 +357,13 @@ export async function decideApproval(input: {
     destructiveConfirmed: true,
     createdThisTurn: new Set<string>(),
   })
+  // The approver gets the full result now. What is stored for later readers is
+  // the status alone for a project kept in another region, whose result can
+  // quote its rows (lib/data-plane/residency.ts).
+  const stored = (await quotesKeptHere(input.projectId)) ? storableResultSummary(outcome.summary) : NOT_QUOTED
   await prisma.agentApprovalRequest.update({
     where: { id: row.id },
-    data: { status: outcome.status, executedAt: new Date(), resultSummary: storableResultSummary(outcome.summary) },
+    data: { status: outcome.status, executedAt: new Date(), resultSummary: stored },
   })
   return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
@@ -371,13 +380,16 @@ async function auditDecision(
   target: string,
   action: ApprovalAuditAction,
 ) {
+  // No copy of the target for a project kept in another region: the request
+  // row has it (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
       userId: input.approverUserId,
       action,
       type: 'mcp',
-      details: JSON.stringify({ approvalId: input.approvalId, tool, target, at: new Date().toISOString() }),
+      details: JSON.stringify({ approvalId: input.approvalId, tool, ...(quote ? { target } : {}), at: new Date().toISOString() }),
       timestamp: new Date(),
     },
   }).catch(() => {})

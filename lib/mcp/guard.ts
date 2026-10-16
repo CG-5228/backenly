@@ -26,6 +26,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db/prisma'
+import { quotesKeptHere } from '@/lib/data-plane/residency'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 import {
   authenticateMcp,
@@ -228,6 +229,10 @@ export interface McpCallContext {
  * the tool just handed the agent (a new API key, a rotated signing secret), so
  * it is stored with those withheld. Pass the tool's `data` so values it names
  * are withheld too; it is read here and never stored.
+ *
+ * A project kept in another region gets neither the summary nor the error:
+ * both can quote its rows (lib/data-plane/residency.ts). The tool, status and
+ * timing are still recorded.
  */
 export function recordMcpCall(
   ctx: McpCallContext,
@@ -241,8 +246,19 @@ export function recordMcpCall(
   },
 ): void {
   const responseTime = Date.now() - ctx.startedAt
-  const summary = result.summary === undefined ? undefined : withholdSecrets(result.summary, result.data)
-  const error = result.error === undefined ? undefined : withholdSecrets(result.error, result.data)
+  quotesKeptHere(ctx.projectId)
+    .then((quote) => writeMcpCallRows(ctx, result, responseTime, quote))
+    .catch(() => {})
+}
+
+function writeMcpCallRows(
+  ctx: McpCallContext,
+  result: Parameters<typeof recordMcpCall>[1],
+  responseTime: number,
+  quote: boolean,
+): void {
+  const summary = !quote || result.summary === undefined ? undefined : withholdSecrets(result.summary, result.data)
+  const error = !quote || result.error === undefined ? undefined : withholdSecrets(result.error, result.data)
 
   prisma.apiKeyUsage
     .create({

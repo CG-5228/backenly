@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/db'
+import { quotesKeptHere } from '@/lib/data-plane/residency'
 import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
 import { sealParams } from '@/lib/operational-memory/sealed-params'
 import type { ExecutionChange } from '@/lib/orchestration/atomic-executor'
@@ -190,15 +191,17 @@ export function summarizeResources(changes: ExecutionChange[]) {
   }
 }
 
-export function receiptTitleForChanges(changes: ExecutionChange[], userMessage: string): string {
+// `userMessage` is null for a project kept in another region: the receipt then
+// names what changed without quoting the request (lib/data-plane/residency.ts).
+export function receiptTitleForChanges(changes: ExecutionChange[], userMessage: string | null): string {
   const resources = summarizeResources(changes)
   if (resources.tables.length > 1) return `Created ${resources.tables.length}-table backend foundation`
   if (resources.tables.length === 1 && resources.total <= 3) return `Created ${resources.tables[0]} backend resource`
   if (resources.total > 0) return `Updated ${resources.total} backend resources`
-  return `Recorded backend requirement: ${truncate(userMessage, 80)}`
+  return userMessage === null ? 'Recorded backend requirement' : `Recorded backend requirement: ${truncate(userMessage, 80)}`
 }
 
-export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage: string): string {
+export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage: string | null): string {
   const resources = summarizeResources(changes)
   const parts: string[] = []
 
@@ -211,10 +214,14 @@ export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage
   if (resources.deployments.length) parts.push(`${resources.deployments.length} deployment change${resources.deployments.length === 1 ? '' : 's'}`)
 
   if (parts.length === 0) {
-    return `Backenly recorded the requirement: "${truncate(userMessage, 180)}".`
+    return userMessage === null
+      ? 'Backenly recorded the requirement.'
+      : `Backenly recorded the requirement: "${truncate(userMessage, 180)}".`
   }
 
-  return `Backenly changed ${joinHuman(parts)} based on the product request: "${truncate(userMessage, 180)}".`
+  return userMessage === null
+    ? `Backenly changed ${joinHuman(parts)} based on the product request.`
+    : `Backenly changed ${joinHuman(parts)} based on the product request: "${truncate(userMessage, 180)}".`
 }
 
 function eventTypeForTool(tool: string): BackendEventType | null {
@@ -315,12 +322,15 @@ function receiptTitleForTools(tools: string[]): string {
   return `Applied ${eventful.length} backend actions`
 }
 
-function receiptSummaryForTools(tools: string[], userMessage: string, summary?: string): string {
+// `userMessage` is null for a project kept in another region, and its result
+// is then not passed either (lib/data-plane/residency.ts).
+function receiptSummaryForTools(tools: string[], userMessage: string | null, summary?: string): string {
   const eventful = tools.filter(tool => eventTypeForTool(tool))
   const phrases = toolNounPhrases(eventful)
+  const request = userMessage === null ? '' : `: "${truncate(userMessage, 180)}"`
   const base = phrases.length
-    ? `Backenly applied ${joinHuman(phrases)} based on the product request: "${truncate(userMessage, 180)}".`
-    : `Backenly recorded the product request: "${truncate(userMessage, 180)}".`
+    ? `Backenly applied ${joinHuman(phrases)} based on the product request${request}.`
+    : `Backenly recorded the product request${request}.`
 
   return summary ? `${base} Result: ${truncate(stripMarkdown(summary), 240)}` : base
 }
@@ -385,6 +395,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
     (risk, change) => maxRisk(risk, riskForChange(change)),
     'low',
   )
+  // A project kept in another region: what changed, never the request or the
+  // intent parsed from it, which can quote its data (lib/data-plane/residency.ts).
+  const request = (await quotesKeptHere(input.projectId)) ? input.userMessage : null
 
   const events = []
 
@@ -393,9 +406,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
     eventType: 'product_requirement_created',
     actorType: 'user',
     actorId: input.actorId,
-    summary: `User asked: "${truncate(input.userMessage)}"`,
+    summary: request === null ? 'User asked for a backend change.' : `User asked: "${truncate(request)}"`,
     beforeState: input.beforeState,
-    afterState: input.canonicalIntent,
+    afterState: request === null ? undefined : input.canonicalIntent,
     reason: 'Captured as the source requirement for this backend change.',
     riskLevel: 'low',
     status: 'applied',
@@ -413,7 +426,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
         resource: change.target,
       },
       afterState: change.details,
-      reason: `Backenly applied this because of the request: "${truncate(input.userMessage, 180)}".`,
+      reason: request === null
+        ? 'Backenly applied this because of the request.'
+        : `Backenly applied this because of the request: "${truncate(request, 180)}".`,
       riskLevel: riskForChange(change),
       status: 'applied',
     }))
@@ -422,8 +437,8 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
   const receipt = await createChangeReceipt({
     projectId: input.projectId,
     eventIds: events.map(event => event.id),
-    title: receiptTitleForChanges(input.changes, input.userMessage),
-    summary: receiptSummaryForChanges(input.changes, input.userMessage),
+    title: receiptTitleForChanges(input.changes, request),
+    summary: receiptSummaryForChanges(input.changes, request),
     resourcesChanged: {
       ...summarizeResources(input.changes),
       executionId: input.executionId,
@@ -472,6 +487,10 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     (risk, tool) => maxRisk(risk, riskForTool(tool)),
     'low',
   )
+  // A project kept in another region: which tools ran, never the request or
+  // the agent's result, which can quote its data (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
+  const request = quote ? input.userMessage : null
 
   const events = []
   events.push(await createBackendEvent({
@@ -479,7 +498,7 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     eventType: 'product_requirement_created',
     actorType: 'user',
     actorId: input.actorId,
-    summary: `User asked: "${truncate(input.userMessage)}"`,
+    summary: request === null ? 'User asked for a backend change.' : `User asked: "${truncate(request)}"`,
     afterState: { tools: eventfulTools },
     reason: 'Captured as the source requirement for this backend action.',
     riskLevel: 'low',
@@ -494,7 +513,9 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
       actorId: input.actorId,
       summary: summarizeTool(tool),
       afterState: { tool },
-      reason: `Backenly ran this action because of the request: "${truncate(input.userMessage, 180)}".`,
+      reason: request === null
+        ? 'Backenly ran this action because of the request.'
+        : `Backenly ran this action because of the request: "${truncate(request, 180)}".`,
       riskLevel: riskForTool(tool),
       status,
     }))
@@ -504,7 +525,7 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     projectId: input.projectId,
     eventIds: events.map(event => event.id),
     title: receiptTitleForTools(eventfulTools),
-    summary: receiptSummaryForTools(eventfulTools, input.userMessage, input.summary),
+    summary: receiptSummaryForTools(eventfulTools, request, quote ? input.summary : undefined),
     resourcesChanged: {
       tools: eventfulTools,
       total: eventfulTools.length,
