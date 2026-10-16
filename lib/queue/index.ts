@@ -21,6 +21,8 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { emit } from '@/lib/events/bus'
+import { serviceRegion } from '@/lib/data-plane/serving'
+import { HOME_REGION, type CloudRegionId } from '@/lib/regions'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -343,7 +345,7 @@ export async function detectAndTimeoutStuckJobs(): Promise<number> {
  * without this they would sit there forever, which is the same lost-instruction
  * failure in a different costume.
  */
-export async function claimPurgeJobs(limit = 5) {
+export async function claimPurgeJobs(limit = 5, region: CloudRegionId = serviceRegion()) {
   const now = new Date()
 
   await prisma.backgroundJob.updateMany({
@@ -355,12 +357,19 @@ export async function claimPurgeJobs(limit = 5) {
     data: { status: PURGE_STATUS.pending, startedAt: null, timeoutAt: null },
   })
 
-  const candidates = await prisma.backgroundJob.findMany({
-    where: { type: PURGE_JOB_TYPE, status: PURGE_STATUS.pending, runAt: { lte: now } },
-    orderBy: { runAt: 'asc' },
-    take: limit,
-    select: { id: true },
-  })
+  // Only this region's jobs: each region's scheduler purges what was kept in
+  // it, whose bucket and disks are its own. Chosen in the query, so another
+  // region's backlog ahead in the queue can never hide them. A job written
+  // before the region was recorded is the home region's; one naming a region
+  // this build does not know matches none, so no region purges the wrong place.
+  const candidates = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT "id" FROM "background_jobs"
+    WHERE "type" = ${PURGE_JOB_TYPE}
+      AND "status" = ${PURGE_STATUS.pending}
+      AND "runAt" <= (${now}::timestamptz AT TIME ZONE 'UTC')
+      AND COALESCE("payload"->>'region', ${HOME_REGION}) = ${region}
+    ORDER BY "runAt" ASC
+    LIMIT ${limit}`
 
   if (candidates.length === 0) return []
 

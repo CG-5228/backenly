@@ -56,6 +56,7 @@
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
 import { projectRegion, regionOfRecord, regionRawClient } from '@/lib/data-plane/regional'
+import { serviceRegion } from '@/lib/data-plane/serving'
 import { HOME_REGION, type CloudRegionId } from '@/lib/regions'
 import {
   assertValidProjectId,
@@ -391,14 +392,22 @@ async function purgeProjectInTransaction(
  * on disk.
  */
 async function attemptImmediatePurge(
-  targets: { projectId: string; jobId: string }[],
+  targets: { projectId: string; jobId: string; region: CloudRegionId }[],
 ): Promise<boolean> {
   let allSucceeded = true
 
-  for (const { projectId, jobId } of targets) {
+  for (const { projectId, jobId, region } of targets) {
+    // A project kept in another region is purged there, by that region's
+    // scheduler (lib/queue/worker.ts processPurgeJobs): its bucket and disks
+    // are not this process's. The job stays pending until it does.
+    if (region !== serviceRegion()) {
+      allSucceeded = false
+      continue
+    }
     try {
       const report = await purgeProjectExternals(projectId, {
         storageDriver: process.env.STORAGE_DRIVER || 'local',
+        region,
       })
 
       await prisma.backgroundJob
@@ -476,7 +485,7 @@ export async function deleteProjectCompletely(projectId: string): Promise<Deleti
     `[ProjectDelete] project=${projectId} schemas=${schemas.length} purgeJob=${jobId}`,
   )
 
-  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId }])
+  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId, region }])
 
   return {
     projectIds: [projectId],
@@ -577,7 +586,7 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
   )
 
   const externalPurgeCompleted = await attemptImmediatePurge(
-    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i] })),
+    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i], region: regions.get(projectId) ?? HOME_REGION })),
   )
 
   return {

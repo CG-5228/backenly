@@ -1935,6 +1935,32 @@ describe('deleting a project in another region', () => {
     expect(await purgeJobPayload(projectId)).toMatchObject({ projectId, region: 'us-east-1' })
   })
 
+  it('leaves its files and backups to its own region, whose scheduler purges them', async () => {
+    const { deleteProjectCompletely } = await load()
+    const { processPurgeJobs } = await import('@/lib/queue/worker')
+    process.env[REGION_VARIABLE] = regionalUrl
+    const { projectId } = await regionalProjectWithLogin()
+    const status = async () =>
+      (await prisma.backgroundJob.findFirst({ where: { type: 'purge_project', payload: { path: ['projectId'], equals: projectId } } }))
+        ?.status
+
+    const result = await deleteProjectCompletely(projectId)
+
+    // Its bucket and disks are Virginia's, not this process's: the home
+    // process leaves them, and says the purge is still to come.
+    expect(result.externalPurgeCompleted).toBe(false)
+    expect(await status()).toBe('purge_pending')
+
+    // Virginia's scheduler finishes it.
+    process.env.BACKENLY_SERVICE_REGION = 'us-east-1'
+    try {
+      await processPurgeJobs()
+    } finally {
+      delete process.env.BACKENLY_SERVICE_REGION
+    }
+    expect(await status()).toBe('completed')
+  })
+
   it('stops before anything is dropped when this process cannot reach the region', async () => {
     const { deleteProjectCompletely } = await load()
     process.env[REGION_VARIABLE] = regionalUrl

@@ -14,12 +14,13 @@
  *                       user cron jobs, in two shares:
  *                         runRegionalSystemTasks(), every region: turn its
  *                           projects' captured row changes into deliveries,
- *                           and prune the regional bodies it keeps (hourly)
+ *                           finish the external purges of deleted projects
+ *                           kept in it, and prune the regional bodies it
+ *                           keeps (hourly)
  *                         runPlatformSystemTasks(), home region only:
  *                           1. Retry failed outbound webhooks
  *                           2. Detect & fail stuck background jobs (timeout)
  *                           3. Process the background job queue
- *                           3b. Finish external purges for deleted projects
  *                           4. Auto-provision system cleanup jobs (daily)
  *                       instrumentation.ts schedules the two shares
  *                       separately; the cron route runs both.
@@ -162,11 +163,23 @@ export async function runSystemTasks(): Promise<void> {
 /**
  * This region's share, run by every region's scheduler: turn the row changes
  * captured in its projects' databases into webhook deliveries
- * (drainWebhookOutbox reads only the projects this process serves).
+ * (drainWebhookOutbox reads only the projects this process serves), finish
+ * the deletions of projects that were kept here, and prune the customer data
+ * it keeps off the platform rows.
  */
 export async function runRegionalSystemTasks(now: Date = new Date()): Promise<void> {
   await drainWebhookOutbox().catch(err =>
     console.error('[SystemTasks] webhook outbox drain failed:', err?.message)
+  )
+
+  // Finish deleting files and backups for projects whose rows are already
+  // gone, those kept in this region only: their bucket and disks are this
+  // process's own (lib/queue/worker.ts processPurgeJobs). Separate from the
+  // background queue because purge jobs deliberately never enter the
+  // 'queued' status a released worker would claim and complete without a
+  // handler. See PURGE_STATUS in lib/queue/index.ts.
+  await processPurgeJobs().catch(err =>
+    console.error('[SystemTasks] purge processing failed:', err?.message)
   )
 
   // This region's projects' customer data on platform rows is kept 30 days
@@ -185,10 +198,10 @@ let lastBodyPruneAt = 0
 
 /**
  * The platform's share, run once, by the home region's scheduler: rows in the
- * platform database that any project may own. The background queue, purges
- * and delivery retries still serve every region from here; running each
- * project's job in its own region needs the job to carry that region (a purge
- * outlives its project's row) and is the next change.
+ * platform database that any project may own. The background queue and
+ * delivery retries still serve every region from here; purges run in each
+ * project's own region (runRegionalSystemTasks), from the region their job
+ * records.
  */
 export async function runPlatformSystemTasks(): Promise<void> {
   // 1. Retry outbound webhooks whose nextRetryAt has passed
@@ -204,14 +217,6 @@ export async function runPlatformSystemTasks(): Promise<void> {
   // 3. Process the background job queue (up to 10 jobs per tick)
   await processBackgroundJobs().catch(err =>
     console.error('[SystemTasks] job processing failed:', err?.message)
-  )
-
-  // 3b. Finish deleting files for projects whose rows are already gone.
-  //     Separate from the queue above because purge jobs deliberately never
-  //     enter the 'queued' status a released worker would claim and complete
-  //     without a handler. See PURGE_STATUS in lib/queue/index.ts.
-  await processPurgeJobs().catch(err =>
-    console.error('[SystemTasks] purge processing failed:', err?.message)
   )
 
   // 4. Auto-provision daily cleanup jobs at 02:00 UTC

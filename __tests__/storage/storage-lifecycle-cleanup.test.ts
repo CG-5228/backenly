@@ -28,6 +28,9 @@
  *     enough (this is the honest version of "incomplete upload"); a FRESH row
  *     (object still uploading) → kept
  *   - dryRun touches nothing
+ *   - each region's sweep judges only its own projects' rows against its own
+ *     bucket: another region's files are not in it, so their rows would all
+ *     read as phantoms, and their expired rows are that region's to delete
  */
 
 import { randomUUID } from 'crypto'
@@ -98,14 +101,14 @@ const DAY = 24 * HOUR
 const createdUserIds: string[] = []
 const createdProjectIds: string[] = []
 
-async function fixtureProject() {
+async function fixtureProject(region: string | null = null) {
   const u = await prisma.user.create({
     data: { email: `lc-${randomUUID()}@test.invalid`, name: 'Lifecycle Test' },
     select: { id: true },
   })
   createdUserIds.push(u.id)
   const p = await prisma.project.create({
-    data: { name: `lc-${randomUUID().slice(0, 8)}`, userId: u.id },
+    data: { name: `lc-${randomUUID().slice(0, 8)}`, userId: u.id, region },
     select: { id: true },
   })
   createdProjectIds.push(p.id)
@@ -247,5 +250,67 @@ describe('runLifecycleCleanup', () => {
     expect(s3.objects.has(key)).toBe(true)
     expect(s3.objects.has(orphan)).toBe(true)
     expect(s3.deleted).toHaveLength(0)
+  })
+})
+
+describe("each region's sweep covers its own bucket and its own projects", () => {
+  it("leaves another region's live files alone, though none of their objects is in this bucket", async () => {
+    const f = await fixtureProject('us-east-1')
+    const homeBucket = new FakeS3()
+    const live = await fileRow({ ...f, path: `${f.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+    await runLifecycleCleanup(homeBucket.asClient(), 'home-bucket', {})
+
+    // Its object is in Virginia's bucket. Missing from this one is not a phantom.
+    expect((await rowById(live.id))?.deletedAt).toBeNull()
+  })
+
+  it("leaves another region's expired files to that region's own sweep", async () => {
+    const f = await fixtureProject('us-east-1')
+    const homeBucket = new FakeS3()
+    const expired = await fileRow({ ...f, path: `${f.projectId}/expired-${randomUUID()}.png`, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+
+    await runLifecycleCleanup(homeBucket.asClient(), 'home-bucket', {})
+
+    // Deleting the row here would strand its object in Virginia's bucket with
+    // nothing left pointing at it.
+    expect(await rowById(expired.id)).not.toBeNull()
+    expect(homeBucket.deleted).not.toContain(expired.path)
+  })
+
+  it("cleans a region's own files in its own bucket, and judges no other region's", async () => {
+    const virginia = await fixtureProject('us-east-1')
+    const home = await fixtureProject()
+    const bucket = new FakeS3()
+    const expiredKey = `${virginia.projectId}/expired-${randomUUID()}.png`
+    const expired = await fileRow({ ...virginia, path: expiredKey, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+    bucket.put(expiredKey, 10 * DAY)
+    const phantom = await fileRow({ ...virginia, path: `${virginia.projectId}/never-${randomUUID()}.bin`, ageMs: 2 * HOUR })
+    const homeLive = await fileRow({ ...home, path: `${home.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+    await runLifecycleCleanup(bucket.asClient(), 'virginia-bucket', { region: 'us-east-1' })
+
+    expect(await rowById(expired.id)).toBeNull()
+    expect(bucket.objects.has(expiredKey)).toBe(false)
+    expect((await rowById(phantom.id))?.deletedAt).not.toBeNull()
+    // A home project's object is in the home bucket; its absence here proves nothing.
+    expect((await rowById(homeLive.id))?.deletedAt).toBeNull()
+  })
+
+  it('judges a project recording a region this build does not know against no bucket', async () => {
+    const f = await fixtureProject('xx-nowhere-1')
+    try {
+      const row = await fileRow({ ...f, path: `${f.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+      await runLifecycleCleanup(new FakeS3().asClient(), 'home-bucket', {})
+      await runLifecycleCleanup(new FakeS3().asClient(), 'virginia-bucket', { region: 'us-east-1' })
+
+      expect((await rowById(row.id))?.deletedAt).toBeNull()
+    } finally {
+      // Not left for the other suites' fleet passes to find.
+      await prisma.storageFile.deleteMany({ where: { projectId: f.projectId } })
+      await prisma.storageBucket.deleteMany({ where: { projectId: f.projectId } })
+      await prisma.project.delete({ where: { id: f.projectId } })
+    }
   })
 })

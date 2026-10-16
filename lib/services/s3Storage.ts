@@ -32,7 +32,8 @@ import crypto from 'crypto'
 import type { StorageService } from './storage'
 import { generateUniqueStoragePath, enforceStorageQuota as enforceStorageLifecycleQuota, generatePresignedUrlExpiry } from '@/lib/storage/storage-lifecycle'
 import { enforceStorageQuota as enforceStorageBillingQuota } from './quota-enforcement'
-import { getS3Client, getS3Config, s3ConfigurationProblem, checkS3Configuration } from './s3-config'
+import { getS3Client, getS3Config, s3ConfigurationProblem, checkS3Configuration, s3LocationFor, type S3Location } from './s3-config'
+import { projectRegion } from '@/lib/data-plane/regional'
 import { StorageUnavailableError } from '@/lib/storage/errors'
 import { projectRestriction } from '@/lib/usage/restrictions'
 import { signCdnUrl, signedCdnConfig } from '@/lib/storage/cdn'
@@ -118,6 +119,16 @@ export class S3StorageService implements StorageService {
     } catch {
       return null
     }
+  }
+
+  /**
+   * The bucket holding a project's files, and a client for it: this process's
+   * own for a project it serves, the project's region's otherwise. A project's
+   * files are never read from or written to another region's bucket
+   * (./s3-config.ts s3LocationFor).
+   */
+  private async at(projectId: string): Promise<S3Location> {
+    return s3LocationFor(await projectRegion(projectId))
   }
 
   /**
@@ -390,11 +401,12 @@ export class S3StorageService implements StorageService {
       finalFileName
     )
 
-    // Upload to S3
+    // Upload to S3, in the bucket of the project's own region.
     try {
-      await this.s3Client.send(
+      const at = await this.at(options.projectId)
+      await at.client.send(
         new PutObjectCommand({
-          Bucket: this.bucket,
+          Bucket: at.bucket,
           Key: s3Key,
           Body: file.buffer,
           ContentType: detectedMimeType,
@@ -555,9 +567,10 @@ export class S3StorageService implements StorageService {
     }
 
     try {
-      const response = await this.s3Client.send(
+      const at = await this.at(projectId)
+      const response = await at.client.send(
         new GetObjectCommand({
-          Bucket: this.bucket,
+          Bucket: at.bucket,
           Key: file.path,
         })
       )
@@ -600,6 +613,10 @@ export class S3StorageService implements StorageService {
       throw new Error('File does not belong to this project')
     }
 
+    // The CDN fronts this process's own bucket only. A file kept in another
+    // region's bucket is handed out as a presigned URL from that bucket.
+    const at = await this.at(projectId)
+
     // ── Public files ─────────────────────────────────────────────────────────
     // A public file needs a permanent, auth-free URL. We must NOT hand out a raw
     // S3-endpoint URL: the shared bucket is PRIVATE (per-object presigned
@@ -615,7 +632,7 @@ export class S3StorageService implements StorageService {
     if (policyAllowsPublic(file.bucket.accessPolicy) && file.isPublic) {
       // A SIGNED CDN serves nothing unsigned, so a public file's permanent URL
       // is the app route, which mints a fresh signed URL on every request.
-      const cdnBase = signedCdnConfig() ? null : this.publicCdnBase()
+      const cdnBase = !at.local || signedCdnConfig() ? null : this.publicCdnBase()
       if (cdnBase) {
         return `${cdnBase}/${file.path}`
       }
@@ -640,7 +657,7 @@ export class S3StorageService implements StorageService {
 
     // Served from the edge when a signed CDN fronts the bucket (lib/storage/cdn.ts):
     // the same short-lived grant, without the bucket's egress price.
-    const cdn = signedCdnConfig()
+    const cdn = at.local ? signedCdnConfig() : null
     if (cdn) {
       return signCdnUrl(file.path, generatePresignedUrlExpiry(expiresIn), cdn)
     }
@@ -649,13 +666,13 @@ export class S3StorageService implements StorageService {
     // ENFORCED: Time-limited URLs, no direct access
     // Maximum 24-hour expiry enforced
     const safeExpiry = generatePresignedUrlExpiry(expiresIn)
-    
+
     const command = new GetObjectCommand({
-      Bucket: this.bucket,
+      Bucket: at.bucket,
       Key: file.path,
     })
 
-    const url = await getSignedUrl(this.s3Client, command, {
+    const url = await getSignedUrl(at.client, command, {
       expiresIn: safeExpiry,
     })
 
@@ -675,7 +692,8 @@ export class S3StorageService implements StorageService {
     if (!file || file.deletedAt) throw new Error('File not found')
     if (file.projectId !== projectId) throw new Error('File does not belong to this project')
 
-    return getSignedUrl(this.s3Client, new GetObjectCommand({ Bucket: this.bucket, Key: file.path }), {
+    const at = await this.at(projectId)
+    return getSignedUrl(at.client, new GetObjectCommand({ Bucket: at.bucket, Key: file.path }), {
       expiresIn: generatePresignedUrlExpiry(ttlSeconds),
     })
   }
@@ -825,11 +843,13 @@ export class S3StorageService implements StorageService {
       throw new Error('File does not belong to this project')
     }
 
-    // Delete from S3
+    // Delete from S3. Outside the try: a region whose storage this process
+    // cannot reach keeps the row, rather than leaving its object behind.
+    const at = await this.at(projectId)
     try {
-      await this.s3Client.send(
+      await at.client.send(
         new DeleteObjectCommand({
-          Bucket: this.bucket,
+          Bucket: at.bucket,
           Key: file.path,
         })
       )
@@ -876,9 +896,11 @@ export class S3StorageService implements StorageService {
 
     for (const file of filesToDelete) {
       try {
-        await this.s3Client.send(
+        // Each file in its own project's region's bucket.
+        const at = await this.at(file.projectId)
+        await at.client.send(
           new DeleteObjectCommand({
-            Bucket: this.bucket,
+            Bucket: at.bucket,
             Key: file.path,
           })
         )

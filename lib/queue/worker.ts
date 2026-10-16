@@ -23,6 +23,8 @@ import {
 } from './index'
 import { emit } from '@/lib/events/bus'
 import { prisma } from '@/lib/db/prisma'
+import { serviceRegion } from '@/lib/data-plane/serving'
+import type { CloudRegionId } from '@/lib/regions'
 
 // ── Job Handlers ──────────────────────────────────────────────────────────────
 
@@ -111,14 +113,16 @@ async function handleCleanupJob(payload: any): Promise<Record<string, any>> {
  * only durable record that a customer's backups still need deleting. See
  * PURGE_STATUS in lib/queue/index.ts for the full argument.
  *
- * Called every minute from `runSystemTasks`.
+ * Called every minute by every region's scheduler (`runRegionalSystemTasks`):
+ * each purges what was kept in its own region, whose bucket and disks are its
+ * own, so no region reaches into another's.
  */
-export async function processPurgeJobs(): Promise<{
+export async function processPurgeJobs(region: CloudRegionId = serviceRegion()): Promise<{
   processed: number
   succeeded: number
   failed: number
 }> {
-  const jobs = await claimPurgeJobs(5)
+  const jobs = await claimPurgeJobs(5, region)
   if (jobs.length === 0) return { processed: 0, succeeded: 0, failed: 0 }
 
   let succeeded = 0
@@ -145,6 +149,7 @@ export async function processPurgeJobs(): Promise<{
         const { purgeProjectExternals } = await import('@/lib/projects/purge')
         const report = await purgeProjectExternals(projectId, {
           storageDriver: typeof payload.storageDriver === 'string' ? payload.storageDriver : undefined,
+          region,
         })
         await completePurgeJob(job.id, {
           projectId: report.projectId,
