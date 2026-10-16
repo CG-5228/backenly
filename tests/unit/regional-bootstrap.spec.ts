@@ -153,6 +153,9 @@ describe('the RDS roots a regional image trusts', () => {
   // in tests/unit/rds-ca-bundle-is-pinned.spec.ts.
   const PINNED: Record<string, string> = {
     'us-east-1': 'sXEdErrlGDhYEoHiO2y5exB0AWhztNr8gO0UACRi3Xc=',
+    'us-west-2': 'cztS5LWJWGN34+APfEYlth4Uy/C14Iys4otPiuzCfGY=',
+    'eu-central-1': 'VqDK4ES2zEM5cdlkNHQBaSqS6gKU45J1Oj69ruVNi4Q=',
+    'ap-southeast-1': 'PGlgIKO3xnIQhdGCIRwoAkqwGHOt413Mfu67icIO6Xk=',
   }
 
   it.each(Object.entries(PINNED))('%s is the pinned bundle, byte for byte', (region, sha256) => {
