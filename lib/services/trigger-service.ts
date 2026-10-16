@@ -119,9 +119,11 @@ export async function fireTriggers(
         results.push(result)
       } catch (err: any) {
         console.error(`[Triggers] DB action failed for trigger "${trigger.name}":`, err.message)
+        // Identifiers only: the row that fired the trigger is the customer's
+        // data and never goes to the error reporter.
         Sentry.captureException(err, {
           tags: { trigger_id: trigger.id, trigger_name: trigger.name, action_type: trigger.actionType },
-          extra: { projectId, event },
+          extra: triggerReportContext(projectId, event),
         })
         results.push({
           triggerId: trigger.id,
@@ -204,15 +206,17 @@ async function fireWebhookWithDLQ(
       },
     })
 
-    // Report to Sentry — this is a silent failure non-devs can't see
+    // Report to Sentry — this is a silent failure non-devs can't see. Without
+    // the row, and without the receiver's path and query, which can carry a
+    // token: its host is enough to tell which endpoint is failing.
     Sentry.captureException(err, {
       tags: {
         trigger_id: trigger.id,
         trigger_name: trigger.name,
-        webhook_url: trigger.webhookUrl,
+        webhook_host: hostOf(trigger.webhookUrl),
         project_id: projectId,
       },
-      extra: { event, attempts, lastStatusCode },
+      extra: { ...triggerReportContext(projectId, event), attempts, lastStatusCode },
     })
 
     console.error(`[Triggers] ☠️ Webhook permanently failed for trigger "${trigger.name}" after ${attempts} attempts — logged to DLQ`)
@@ -282,6 +286,23 @@ export async function replayDelivery(
     })
 
     return { success: false, error: err.message }
+  }
+}
+
+// ── Error-report context ──────────────────────────────────────────────────────
+
+/** What a trigger failure tells the error reporter: which event, never its row. */
+export function triggerReportContext(projectId: string, event: TriggerEvent): Record<string, string> {
+  return { projectId, table: event.table, eventType: event.type }
+}
+
+/** A webhook URL's host, or a placeholder for one that does not parse. */
+export function hostOf(url: string | null | undefined): string {
+  if (!url) return 'none'
+  try {
+    return new URL(url).host
+  } catch {
+    return 'unparseable'
   }
 }
 
