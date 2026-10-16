@@ -160,7 +160,7 @@ describe('the scrubber', () => {
       exception: {
         values: [
           {
-            value: 'connect ECONNREFUSED postgres://admin:hunter2@db.internal:5432/app',
+            value: 'connect ECONNREFUSED postgres://admin:password@db.internal:5432/app',
             stacktrace: { frames: [{ vars: { row: { email: 'customer@example.com' } } }] },
           },
         ],
@@ -218,7 +218,7 @@ describe('a URL', () => {
   it("of a third party keeps its origin, of the platform its route words and ids", () => {
     expect(scrubUrl('https://hooks.example.com/in/s3cret?token=abc')).toBe('https://hooks.example.com')
     expect(scrubUrl('https://us-east-1.api.backenly.com/api/v1/p1/db/orders')).toBe('https://us-east-1.api.backenly.com/api/v1/p1/db/orders')
-    expect(scrubUrl('https://user:pw@backenly.com/app')).toBe('https://backenly.com/app')
+    expect(scrubUrl('https://user:password@backenly.com/app')).toBe('https://backenly.com/app')
     expect(scrubUrl('/api/v1/p1/storage/report%20Q3.pdf')).toBe(`/api/v1/p1/storage/${REMOVED}`)
     expect(scrubUrl('/api/v1/p1/db/orders/3f2c1a9e-8d7b-4c6a-9e5f-1a2b3c4d5e6f')).toBe('/api/v1/p1/db/orders/3f2c1a9e-8d7b-4c6a-9e5f-1a2b3c4d5e6f')
     expect(scrubUrl('/api/v1/[projectId]/fn/[...name]')).toBe('/api/v1/[projectId]/fn/[...name]')
