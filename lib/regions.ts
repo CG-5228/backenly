@@ -83,23 +83,53 @@ type Env = Readonly<Record<string, string | undefined>>
  */
 export function stagingOpenRegions(env: Env = process.env): ReadonlySet<CloudRegionId> {
   if ((env.BACKENLY_ENV ?? '').trim().toLowerCase() !== 'staging') return new Set()
-  const ids = (env.BACKENLY_STAGING_OPEN_REGIONS ?? '').split(',').map((id) => id.trim()).filter(Boolean)
-  return new Set(ids.map((id) => findRegion(id)?.id).filter((id): id is CloudRegionId => id !== undefined))
+  return knownRegions(env.BACKENLY_STAGING_OPEN_REGIONS)
+}
+
+/**
+ * The regions a deployment opens for project creation to named platform users
+ * only, so a production region can be qualified with a probe project before
+ * any customer can choose it (a region opens to customers only in the release
+ * that sets `open` above, after that qualification).
+ *
+ * BACKENLY_PREVIEW_REGIONS (region ids) and BACKENLY_PREVIEW_USER_IDS (platform
+ * user ids) are honoured together or not at all. A region list without a user
+ * list opens nothing, and a caller not named opens nothing, so the setting can
+ * never open a region to customers. Server-side only, like the staging list.
+ */
+export function previewRegionsFor(userId: string | null | undefined, env: Env = process.env): ReadonlySet<CloudRegionId> {
+  if (!userId) return new Set()
+  if (!commaList(env.BACKENLY_PREVIEW_USER_IDS).includes(userId)) return new Set()
+  return knownRegions(env.BACKENLY_PREVIEW_REGIONS)
+}
+
+function commaList(value: string | undefined): string[] {
+  return (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
+}
+
+/** The ids in a list that name a region this build knows; others are ignored. */
+function knownRegions(value: string | undefined): ReadonlySet<CloudRegionId> {
+  return new Set(commaList(value).map((id) => findRegion(id)?.id).filter((id): id is CloudRegionId => id !== undefined))
 }
 
 /**
  * The region a create request asked for. Omitted means the home region. A
  * region that is not on the list, or not open yet, is refused rather than
  * quietly replaced, so a caller never gets a project in a place it did not ask
- * for.
+ * for. `callerUserId` is the platform user making the request, for the
+ * preview list.
  */
-export function checkRequestedRegion(requested: string | null | undefined, env: Env = process.env): RegionCheck {
+export function checkRequestedRegion(
+  requested: string | null | undefined,
+  env: Env = process.env,
+  callerUserId?: string | null,
+): RegionCheck {
   if (requested === undefined || requested === null || requested === '') return { ok: true, region: HOME_REGION }
   const region = findRegion(requested)
   if (!region) {
     return { ok: false, code: 'UNKNOWN_REGION', message: `There is no Backenly Cloud region called "${requested}".` }
   }
-  if (!region.open && !stagingOpenRegions(env).has(region.id)) {
+  if (!region.open && !stagingOpenRegions(env).has(region.id) && !previewRegionsFor(callerUserId, env).has(region.id)) {
     return {
       ok: false,
       code: 'REGION_NOT_OPEN',

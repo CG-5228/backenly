@@ -13,7 +13,15 @@
  * to change, together with the infra, the Project.region column and routing
  * that lib/regions.ts lists.
  */
-import { checkRequestedRegion, CLOUD_REGIONS, findRegion, HOME_REGION, regionLabel, stagingOpenRegions } from '@/lib/regions'
+import {
+  checkRequestedRegion,
+  CLOUD_REGIONS,
+  findRegion,
+  HOME_REGION,
+  previewRegionsFor,
+  regionLabel,
+  stagingOpenRegions,
+} from '@/lib/regions'
 
 describe('Backenly Cloud regions', () => {
   it('lists the five decided regions, each once', () => {
@@ -85,6 +93,44 @@ describe('Backenly Cloud regions', () => {
     it('opens only the regions it names, and never one this build does not know', () => {
       expect(checkRequestedRegion('eu-central-1', staging)).toEqual(expect.objectContaining({ ok: false, code: 'REGION_NOT_OPEN' }))
       expect(checkRequestedRegion('mars-north-1', staging)).toEqual(expect.objectContaining({ ok: false, code: 'UNKNOWN_REGION' }))
+    })
+  })
+
+  describe('a region previewed to named users, to qualify it in production before customers can choose it', () => {
+    const production = {
+      BACKENLY_ENV: 'production',
+      BACKENLY_PREVIEW_REGIONS: 'us-east-1, mars-north-1',
+      BACKENLY_PREVIEW_USER_IDS: 'founder-a, founder-b',
+    }
+
+    it('is accepted for a named user', () => {
+      expect(checkRequestedRegion('us-east-1', production, 'founder-a')).toEqual({ ok: true, region: 'us-east-1' })
+      expect(checkRequestedRegion('us-east-1', production, 'founder-b')).toEqual({ ok: true, region: 'us-east-1' })
+      expect(previewRegionsFor('founder-a', production)).toEqual(new Set(['us-east-1']))
+    })
+
+    it('is refused to everyone else, and to a request with no caller', () => {
+      for (const caller of ['customer-1', '', null, undefined, 'founder-a ']) {
+        expect(checkRequestedRegion('us-east-1', production, caller)).toEqual(expect.objectContaining({ ok: false, code: 'REGION_NOT_OPEN' }))
+      }
+    })
+
+    it('opens nothing without the user list, or without the region list', () => {
+      const noUsers = { ...production, BACKENLY_PREVIEW_USER_IDS: undefined }
+      const noRegions = { ...production, BACKENLY_PREVIEW_REGIONS: '' }
+      for (const env of [noUsers, noRegions]) {
+        expect(checkRequestedRegion('us-east-1', env, 'founder-a')).toEqual(expect.objectContaining({ ok: false, code: 'REGION_NOT_OPEN' }))
+        expect(previewRegionsFor('founder-a', env).size).toBe(0)
+      }
+    })
+
+    it('opens only the regions it names, and never one this build does not know', () => {
+      expect(checkRequestedRegion('eu-central-1', production, 'founder-a')).toEqual(expect.objectContaining({ ok: false, code: 'REGION_NOT_OPEN' }))
+      expect(checkRequestedRegion('mars-north-1', production, 'founder-a')).toEqual(expect.objectContaining({ ok: false, code: 'UNKNOWN_REGION' }))
+    })
+
+    it('leaves the region shown as not open, so the console picker still refuses it', () => {
+      expect(findRegion('us-east-1')!.open).toBe(false)
     })
   })
 })
