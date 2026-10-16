@@ -117,6 +117,16 @@ describe('what recordMcpCall stores', () => {
     expect(JSON.parse(mockAuditRows[0].details)).toMatchObject({ tool: 'db.insert' })
     expect(JSON.stringify([mockUsageRows, mockAuditRows])).not.toContain('alice@example.com')
   })
+
+  it('still keeps an error code for a project kept in another region, which quotes nothing', async () => {
+    // The admin agent-ops view tells a partly applied migration from a refusal by this code.
+    const virginia = { ...CTX, projectId: 'p-virginia' }
+    recordMcpCall(virginia, { statusCode: 500, tool: 'apply_migration', mutation: true, error: 'MIGRATION_FAILED', summary: 'migration: 3 statement(s), failed at alice@example.com' })
+    recordMcpCall(virginia, { statusCode: 403, tool: 'db.delete', error: 'READ_ONLY_KEY' })
+    await flush()
+    expect(mockUsageRows.map((row) => row.metadata.error)).toEqual(['MIGRATION_FAILED', 'READ_ONLY_KEY'])
+    expect(JSON.stringify(mockUsageRows)).not.toContain('alice@example.com')
+  })
 })
 
 describe('through the tool route', () => {

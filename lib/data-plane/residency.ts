@@ -16,6 +16,8 @@
  * already. This module only decides; each writer applies it to its own row.
  */
 
+import { createHmac } from 'crypto'
+import { isIP } from 'net'
 import { HOME_REGION } from '@/lib/regions'
 import { projectRegion } from '@/lib/data-plane/regional'
 
@@ -76,4 +78,44 @@ export function argumentShape(args: Record<string, unknown> | null | undefined):
     else shape[key] = `[${typeof value}]`
   }
   return shape
+}
+
+/**
+ * The network an end user's address belongs to, not the address: the first
+ * three octets of an IPv4 address (a /24) and the first three groups of an
+ * IPv6 one (a /48). Enough to see that requests come from one network, which
+ * is what an abuse signal needs; not enough to name the device. Anything that
+ * is not an address is dropped.
+ */
+export function addressNetwork(ip: string | null | undefined): string | null {
+  const address = (ip ?? '').trim().replace(/^::ffff:(?=\d+\.)/i, '')
+  if (isIP(address) === 4) return address.split('.').slice(0, 3).join('.') + '.0/24'
+  if (isIP(address) === 6) {
+    const [head, tail = ''] = address.toLowerCase().split('::')
+    const left = head ? head.split(':') : []
+    const right = tail ? tail.split(':') : []
+    const groups = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right]
+    return groups.slice(0, 3).map((group) => group.replace(/^0+(?=.)/, '')).join(':') + '::/48'
+  }
+  return null
+}
+
+/** A request path without its query string, which can carry a filter's values (`?email=eq.alice@…`). */
+export function pathWithoutQuery(path: string): string {
+  return path.split(/[?#]/, 1)[0]
+}
+
+/**
+ * A stable stand-in for an end user's id in the platform's records of a
+ * project kept in another region: the same for that user in that project every
+ * time, so counting distinct users still works, and of no use outside it.
+ * Keyed like the function database logins (lib/services/ai-functions/
+ * function-db-role.ts), with a secret every region's tasks receive, so every
+ * region computes the same value. Throws when no key is set: an unkeyed hash
+ * of a guessable id would protect nothing.
+ */
+export function endUserPseudonym(projectId: string, endUserId: string): string {
+  const key = process.env.ENV_VAR_ENCRYPTION_KEY || process.env.JWT_SECRET
+  if (!key) throw new Error('No key for end-user pseudonyms: neither ENV_VAR_ENCRYPTION_KEY nor JWT_SECRET is set')
+  return createHmac('sha256', key).update(`backenly:end-user-pseudonym:v1:${projectId}:${endUserId}`).digest('base64url')
 }
