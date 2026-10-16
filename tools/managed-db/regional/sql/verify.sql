@@ -238,6 +238,18 @@ BEGIN
     END IF;
   END IF;
 
+  -- ── Delivery bodies: the app writes, reads and prunes; nobody else reads ──
+  IF to_regclass('public.delivery_bodies') IS NULL THEN
+    problems := problems || 'public.delivery_bodies is missing'::text;
+  ELSE
+    IF app_exists AND NOT has_table_privilege('backenly_app', 'public.delivery_bodies', 'SELECT, INSERT, UPDATE, DELETE') THEN
+      problems := problems || 'backenly_app cannot write, read and prune delivery bodies'::text;
+    END IF;
+    IF has_table_privilege('public', 'public.delivery_bodies', 'SELECT') THEN
+      problems := problems || 'PUBLIC can read delivery bodies'::text;
+    END IF;
+  END IF;
+
   -- ── Extensions: installed in public, and working ──────────────────────────
   -- The probes are tools/managed-db/extension-spec.ts operationalProbe, verbatim.
   FOR r IN
@@ -267,7 +279,7 @@ BEGIN
   END LOOP;
 
   -- ── Every step recorded ───────────────────────────────────────────────────
-  FOREACH rname IN ARRAY ARRAY['roles', 'postgrest', 'drift-events', 'direct-access', 'extensions'] LOOP
+  FOREACH rname IN ARRAY ARRAY['roles', 'postgrest', 'drift-events', 'delivery-bodies', 'direct-access', 'extensions'] LOOP
     IF NOT EXISTS (SELECT 1 FROM backenly_meta.bootstrap_steps s WHERE s.step = rname) THEN
       problems := problems || format('step %s is not recorded in backenly_meta.bootstrap_steps', rname);
     END IF;

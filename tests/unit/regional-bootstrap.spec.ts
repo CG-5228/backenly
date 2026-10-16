@@ -96,7 +96,7 @@ describe('bootstrap.sh and verify.sql agree', () => {
     const steps = [...read(`${DIR}/bootstrap.sh`).matchAll(/^step ([a-z-]+) /gm)].map((m) => m[1])
     const block = section(read(`${DIR}/sql/verify.sql`), '── Every step recorded', 'IF array_length')
     const required = [...block.matchAll(/'([a-z-]+)'/g)].map((m) => m[1])
-    expect(steps).toEqual(['roles', 'postgrest', 'drift-events', 'direct-access', 'extensions'])
+    expect(steps).toEqual(['roles', 'postgrest', 'drift-events', 'delivery-bodies', 'direct-access', 'extensions'])
     expect(required).toEqual(steps)
   })
 

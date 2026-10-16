@@ -60,7 +60,7 @@ jest.setTimeout(300_000)
 const ROOT = process.cwd()
 const DB = 'backenly_regional'
 const ADMIN = 'regional_admin'
-const STEPS = ['roles', 'postgrest', 'drift-events', 'direct-access', 'extensions']
+const STEPS = ['roles', 'postgrest', 'drift-events', 'delivery-bodies', 'direct-access', 'extensions']
 const LOGINS = ['backenly_app', 'backenly_backup', 'backenly_authenticator'] as const
 type Login = (typeof LOGINS)[number]
 const VERIFIER_VARIABLE: Record<Login, string> = {

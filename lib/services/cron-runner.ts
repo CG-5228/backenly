@@ -13,7 +13,8 @@
  *   runSystemTasks()  — runs the housekeeping that must happen regardless of
  *                       user cron jobs, in two shares:
  *                         runRegionalSystemTasks(), every region: turn its
- *                           projects' captured row changes into deliveries
+ *                           projects' captured row changes into deliveries,
+ *                           and prune the delivery bodies it keeps (hourly)
  *                         runPlatformSystemTasks(), home region only:
  *                           1. Retry failed outbound webhooks
  *                           2. Detect & fail stuck background jobs (timeout)
@@ -28,11 +29,12 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
-import { partitionServed } from '@/lib/data-plane/serving'
+import { partitionServed, serviceRegion } from '@/lib/data-plane/serving'
 import { matchesCronExpression } from '@/lib/services/cron-expression'
 import { executeAiFunction, FunctionEvent } from '@/lib/services/ai-functions/executor'
 import { retryFailedWebhooks } from '@/lib/webhooks/index'
 import { drainWebhookOutbox } from '@/lib/webhooks/capture'
+import { pruneDeliveryBodies } from '@/lib/webhooks/delivery-bodies'
 import { detectAndTimeoutStuckJobs, enqueue } from '@/lib/queue/index'
 import { processBackgroundJobs, processPurgeJobs } from '@/lib/queue/worker'
 
@@ -162,11 +164,24 @@ export async function runSystemTasks(): Promise<void> {
  * captured in its projects' databases into webhook deliveries
  * (drainWebhookOutbox reads only the projects this process serves).
  */
-export async function runRegionalSystemTasks(): Promise<void> {
+export async function runRegionalSystemTasks(now: Date = new Date()): Promise<void> {
   await drainWebhookOutbox().catch(err =>
     console.error('[SystemTasks] webhook outbox drain failed:', err?.message)
   )
+
+  // The bodies of this region's deliveries are kept 30 days in its own
+  // database (lib/webhooks/delivery-bodies.ts). Hourly is ample for a 30-day
+  // retention; the home region keeps none there, so this is a no-op at home.
+  if (now.getTime() - lastBodyPruneAt >= BODY_PRUNE_INTERVAL_MS) {
+    lastBodyPruneAt = now.getTime()
+    await pruneDeliveryBodies(serviceRegion(), now)
+      .then((pruned) => { if (pruned > 0) console.log(`[SystemTasks] pruned ${pruned} delivery bodies past retention`) })
+      .catch(err => console.error('[SystemTasks] delivery body prune failed:', err?.message))
+  }
 }
+
+const BODY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
+let lastBodyPruneAt = 0
 
 /**
  * The platform's share, run once, by the home region's scheduler: rows in the
