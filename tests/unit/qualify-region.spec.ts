@@ -16,7 +16,7 @@ import '../helpers/real-web-standard'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { SseReader, connectingFetch, parseArgs, pendingApproval, qualify } from '@/scripts/qualify-region'
+import { SseReader, connectingFetch, parseArgs, pendingApproval, qualify, toolData } from '@/scripts/qualify-region'
 
 const PROJECT = '0b9e3a52-7a5d-4c1e-9a2b-1f2e3d4c5b6a'
 const ENV = {
@@ -146,6 +146,21 @@ describe('parked calls', () => {
     expect(pendingApproval({ text: JSON.stringify({ approval: { id: 'apr_2', status: 'pending' } }), structured: null })).toBe('apr_2')
     expect(pendingApproval({ text: JSON.stringify({ approval: { id: 'apr_3', status: 'executed' } }), structured: null })).toBeNull()
     expect(pendingApproval({ text: 'Created the table.', structured: null })).toBeNull()
+  })
+})
+
+describe('tool answers', () => {
+  // Every tool answers { ok, summary, data }: the approval for check_approval,
+  // the table for get_table_schema, the new key for create_api_key.
+  it('reads data from the structured result, or from the JSON text', () => {
+    const key = `proj_live_${'a'.repeat(64)}`
+    expect(toolData({ text: '', structured: { ok: true, summary: 'Created', data: { apiKey: key, keyId: 'k1' } } })).toEqual({ apiKey: key, keyId: 'k1' })
+    expect(toolData({ text: JSON.stringify({ ok: true, data: { status: 'executed' } }), structured: null })).toEqual({ status: 'executed' })
+  })
+
+  it('answers null when there is no data object', () => {
+    expect(toolData({ text: 'Approval 1234… is pending.', structured: null })).toBeNull()
+    expect(toolData({ text: '', structured: { ok: true, summary: 'Done.' } })).toBeNull()
   })
 })
 

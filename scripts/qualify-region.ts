@@ -321,6 +321,21 @@ export function pendingApproval(outcome: ToolOutcome): string | null {
   return null
 }
 
+/** The `data` a tool answered with ({ ok, summary, data }), from the structured result or its JSON text. */
+export function toolData<T>(outcome: ToolOutcome): T | null {
+  const candidates: unknown[] = [outcome.structured]
+  try {
+    candidates.push(JSON.parse(outcome.text))
+  } catch {
+    // not JSON
+  }
+  for (const c of candidates) {
+    const data = (c as { data?: unknown } | null)?.data
+    if (data && typeof data === 'object') return data as T
+  }
+  return null
+}
+
 class Mcp {
   private constructor(private readonly client: Client) {}
 
@@ -504,8 +519,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     const deadline = Date.now() + args.approvalWaitMinutes * 60_000
     while (Date.now() < deadline) {
       const status = await mcp!.call('check_approval', { id })
-      const parsed = (status.structured ?? (() => { try { return JSON.parse(status.text) } catch { return {} } })()) as { status?: string }
-      const state = parsed.status ?? (/\b(executed|rejected|failed|expired|partial)\b/.exec(status.text)?.[1] ?? 'pending')
+      // check_approval answers { ok, summary, data: <the approval> }.
+      const state = toolData<{ status?: string }>(status)?.status ?? (/\b(executed|rejected|failed|expired|partial)\b/.exec(status.text)?.[1] ?? 'pending')
       if (state === 'executed') return 'approved and executed'
       if (['rejected', 'failed', 'expired', 'partial'].includes(state)) throw new Error(`${what}: approval ${id} is ${state}`)
       await new Promise((r) => setTimeout(r, 15_000))
@@ -611,13 +626,13 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return 'end-user email and password auth on'
     })
     await check('fixtures', 'realtime', ['table'], async () => {
-      await fixture('realtime', { action: 'enable', table: TABLE })
+      await fixture('realtime', { action: 'enable', tableName: TABLE })
       return `${TABLE} streams its changes`
     })
     await check('fixtures', 'bucket', ['connect'], async () => {
       const buckets = await mcp!.call('storage', { action: 'list_buckets' })
       if (buckets.text.includes(`"${BUCKET}"`) || new RegExp(`\\b${BUCKET}\\b`).test(buckets.text)) return `bucket ${BUCKET} already exists`
-      await fixture('storage', { action: 'create_bucket', name: BUCKET, isPublic: false })
+      await fixture('storage', { action: 'create_bucket', bucketName: BUCKET, isPublic: false })
       return `private bucket ${BUCKET} created`
     })
     await check('fixtures', 'functions', ['table'], async () => {
@@ -966,8 +981,11 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const done: string[] = []
       for (const c of drill) done.push(`#${c.seq} ${await restoreFromConsole({ id: c.id, seq: c.seq })}`)
       must(!(await indexLeadingWith(probeColumn)), `${probeColumn}'s index is still there after the restore`)
-      const state = await mcp!.call('read_backend_state', { section: 'schema' })
-      must(!state.text.includes(probeColumn), `${probeColumn} is still in the schema after the restore`)
+      // The table's own columns: read_backend_state's schema section counts columns and never names them.
+      const described = toolData<{ columns?: Array<{ name?: string }> }>(await mcp!.call('get_table_schema', { tableName: TABLE }))
+      const columns = (described?.columns ?? []).map((c) => c.name)
+      must(columns.length > 0, `get_table_schema listed no columns for ${TABLE}`)
+      must(!columns.includes(probeColumn), `${probeColumn} is still in the schema after the restore`)
       return `restored the state before ${done.join(', then ')}: ${probeColumn} and its index are gone`
     })
 
@@ -1067,9 +1085,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     } else {
       await check('revocation', 'revoked-key-refused', ['connect', 'project-health'], async () => {
         const minted = await mcp!.call('connect', { action: 'create_api_key', description: `qualify ${run} (revoked by this run)` })
-        const text = minted.text + JSON.stringify(minted.structured ?? '')
-        const key = /proj_live_[0-9a-f]{48}/.exec(text)?.[0]
-        const keyId = /"(?:keyId|id)"\s*:\s*"([0-9a-z-]{8,})"/i.exec(text)?.[1]
+        // The whole key is data.apiKey (its prefix and 64 hex characters, lib/auth/key-prefix.ts).
+        const created = toolData<{ apiKey?: unknown; keyId?: unknown }>(minted)
+        const key = typeof created?.apiKey === 'string' ? created.apiKey : undefined
+        const keyId = typeof created?.keyId === 'string' ? created.keyId : undefined
         must(key && keyId, 'create_api_key returned no key or id')
         const probe = () => theFetch(apiUrl(`/api/v1/${args.project}/healthz`), { headers: { 'x-api-key': key! } })
         must((await probe()).status === 200, 'the new key was not accepted')

@@ -23,6 +23,8 @@
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
 import { randomUUID } from 'crypto'
+import { argumentShape, findingDetailsKeptHere, quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
+import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
 import { captureSchemaSnapshot } from '@/lib/services/workspace-schema-snapshot'
 import {
   withSqlCapture,
@@ -423,6 +425,8 @@ export async function executeApprovedFix(
   verification?: FixVerification
   /** Whether other guarantees were compared before and after the fix. */
   regressionCheck?: FixOutcome['regressionCheck']
+  /** Nothing ran because the project's region, which keeps what it replays, could not be reached. */
+  regionUnavailable?: boolean
 }> {
   const finding = await prisma.healthFinding.findUnique({ where: { id: findingId } })
   if (!finding) return { success: false, message: 'Finding not found.' }
@@ -433,7 +437,19 @@ export async function executeApprovedFix(
   // correct snapshot/rollback treatment via their canonical base.
   const baseType = (normalizeFindingType(finding.type, details)?.base ?? type) as FindingType
 
-  const fixAction = buildFixAction(finding.type, details)
+  // A held action replays exactly the target and arguments it was held with,
+  // which a project kept in another region keeps there
+  // (lib/operational-memory/held-action-targets.ts). They are read for the
+  // replay only, and nothing runs when they cannot be read.
+  let replayDetails: Record<string, unknown>
+  try {
+    replayDetails = await heldActionForReplay(projectId, findingId, details)
+  } catch (err) {
+    if (!(err instanceof HeldActionUnreadable)) throw err
+    return { success: false, message: err.message, regionUnavailable: err.regionUnreachable }
+  }
+
+  const fixAction = buildFixAction(finding.type, replayDetails)
   if (!fixAction) {
     // Friendly fallback for findings that require user input (e.g. orphan tables,
     // credential rotation). Surfaced verbatim to the dashboard instead of a
@@ -693,9 +709,21 @@ export async function executeApprovedFix(
     ? await captureSchemaSnapshot(projectId, 'post_migration').catch(() => null)
     : null
 
+  // What the record keeps of the call. A held action's arguments are its
+  // caller's own values, a secret among them (SET_ENV_VAR), which its finding
+  // keeps sealed or in the project's region: the record keeps their shape, in
+  // every region. Undo reads none of them (revertAutoFix). For a project kept
+  // in another region no repair's arguments, result or error text is kept here
+  // either (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
+  const recordedAction =
+    finding.type === 'ai_action_pending' || !quote
+      ? { action: fixAction.action, params: argumentShape(fixAction.params as Record<string, unknown>) }
+      : fixAction
+
   const rollbackData: Record<string, unknown> = {
-    fixAction,
-    fixResult: { message: result.message, data: result.data },
+    fixAction: recordedAction,
+    fixResult: quote ? { message: result.message, data: result.data } : { success: result.success },
     // The statements the executor actually sent, captured at the driver. This
     // is the half of the audit trail that used to be missing: the change was
     // derivable by diffing two schema snapshots, but the statement itself was
@@ -715,7 +743,7 @@ export async function executeApprovedFix(
     // Whether other guarantees were compared before and after. 'unavailable'
     // means nobody looked, so no claim of "nothing else broke" may be made.
     regressionCheck,
-    ...(baselineError ? { baselineError } : {}),
+    ...(baselineError ? { baselineError: quotedError(baselineError, quote) } : {}),
   }
 
   return {
@@ -1667,7 +1695,9 @@ async function _executeAutoFix(
       status: 'auto_fixed',
       autoFixed: true,
       fixAppliedAt: new Date(),
-      details: { ...details, rollbackData } as any,
+      // A baseline's error only as an error code for a project kept in another
+      // region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, { ...details, rollbackData })) as any,
     },
   })
 
@@ -1742,7 +1772,9 @@ async function _appliedUnverified(
       // finding whose gap is actually gone, so a fix that worked resolves
       // itself next tick and one that did not stays visible.
       status: 'pending_approval',
-      details: {
+      // The check's error, and the reason that quotes it, only as an error
+      // code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         // The mutation is on the record even though the verdict is not, so a
         // later reader can tell "we changed this and do not know the result"
@@ -1760,7 +1792,7 @@ async function _appliedUnverified(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
 
@@ -1850,7 +1882,9 @@ async function _escalate(
       // loop tried, verified, and the fix did not hold" apart from "policy
       // gates this on a human", and renders the guardrail line for both. That
       // mislabel made Autopilot look like it asks permission for safe fixes.
-      details: {
+      // The reason is the executor's or PostgreSQL's own words, kept only as an
+      // error code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         escalation: {
           // Carry the retry bookkeeping the reconciler wrote before handing this
@@ -1863,7 +1897,7 @@ async function _escalate(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
   await _writeAuditLog(projectId, 'HEALTH_FIX_ESCALATED', {
@@ -1930,17 +1964,31 @@ async function _deferred(
   }
 }
 
+/** Audit payload fields that carry an executor's or PostgreSQL's own words, which can quote rows. */
+const AUDIT_ERROR_TEXTS = new Set(['message', 'error', 'escalationReason', 'verifierError', 'deferReason', 'rejectedBecause'])
+
 async function _writeAuditLog(
   projectId: string,
   action: string,
   payload: Record<string, unknown>,
 ) {
+  // Those words only as an error code for a project kept in another region
+  // (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
+  const kept = quote
+    ? payload
+    : Object.fromEntries(
+        Object.entries(payload).map(([key, value]) => [
+          key,
+          AUDIT_ERROR_TEXTS.has(key) && typeof value === 'string' ? quotedError(value, false) : value,
+        ]),
+      )
   await prisma.auditLog.create({
     data: {
       projectId,
       action,
       type: 'health',
-      details: JSON.stringify(payload),
+      details: JSON.stringify(kept),
       timestamp: new Date(),
     },
   })

@@ -374,6 +374,12 @@ export function buildFixAction(
     case 'ai_action_pending': {
       const executorAction = rawDetails.executorAction as string | undefined
       if (!executorAction) return null
+      // A project kept in another region keeps the target and arguments there,
+      // and its row only their shape and `keptInRegion`
+      // (lib/operational-memory/held-action-targets.ts). Approval reads them
+      // back before it gets here; a row still marked was not read back, and
+      // replaying the shape, or nothing, would run something nobody approved.
+      if (rawDetails.keptInRegion === true) return null
       // The sealed copy carries the exact arguments; the stored executorParams
       // are the DISPLAY copy with secret fields redacted. Legacy rows predate
       // the split and stored the raw params with no sealed copy, so the
@@ -668,6 +674,10 @@ If the column is deliberately different now, tell your coding agent to rebuild i
     // Without that payload there is nothing to re-run, and inventing one from
     // the type would execute something the user never approved.
     case 'ai_action_pending':
+      // Recorded, but in the project's region, which this view could not read.
+      if (details?.keptInRegion === true) {
+        return 'This change’s target and arguments are kept in your project’s region, which could not be read just now. It stays queued: reload to review and approve it once the region answers.'
+      }
       return 'The details of this queued change were not recorded, so it cannot be replayed automatically. Dismiss it and ask the AI chat to make the change again — it will re-queue with a full record.'
 
     // Surface probes that are NOT a data-plane outage. Named per surface,
