@@ -851,8 +851,9 @@ export async function executeApprovedProposal(input: {
 
   installSqlRecorder(prisma as any)
   let captured
+  let changeIds: string[] = []
   try {
-    captured = await withSqlCapture(() => withBuildLock(
+    const grouped = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
       projectId,
       'modify',
       async () => {
@@ -867,7 +868,9 @@ export async function executeApprovedProposal(input: {
       },
       // Human-approved: skip the autonomy cooldown/budget gate.
       { skipCooldown: true },
-    ))
+    )))
+    captured = grouped.result
+    changeIds = grouped.changeIds
   } catch (err) {
     return { mutated: false, fixed: false, outcome: 'failed', message: `The change could not run: ${err instanceof Error ? err.message : String(err)}` }
   }
@@ -887,7 +890,10 @@ export async function executeApprovedProposal(input: {
     fixAction,
     fixResult: { message: result.message, data: result.data },
     statements,
-    rollbackFormat: 2,
+    // UNDO CONTRACT (rollbackFormat 3), as for every other fix: the governed
+    // changes it made, newest first, which Undo restores (lib/changes/recovery.ts).
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     preMetadata: pre.preMetadata,
     schemaTouching: pre.schemaTouching,
