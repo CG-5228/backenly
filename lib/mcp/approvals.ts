@@ -43,7 +43,6 @@ import {
   requestAsKept,
   shownDigest,
   withApprovalRequests,
-  type CallUnreadable,
 } from '@/lib/mcp/approval-request-bodies'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 import { withHeldActions } from '@/lib/operational-memory/held-action-targets'
@@ -350,7 +349,14 @@ export async function decideApproval(input: {
    * card is read from its region; checked for any request whenever it is given.
    */
   shownDigest?: string
-}): Promise<{ ok: boolean; status: string; error?: string; resultSummary?: string }> {
+}): Promise<{
+  ok: boolean
+  status: string
+  error?: string
+  resultSummary?: string
+  /** The project's region, which keeps the request's call, could not be reached: nothing ran, and it is still waiting. */
+  regionUnavailable?: boolean
+}> {
   const row = await prisma.agentApprovalRequest.findFirst({
     where: { id: input.approvalId, projectId: input.projectId },
   })
@@ -373,12 +379,17 @@ export async function decideApproval(input: {
   // The request as it would run: its row, or the record its project's region
   // keeps, where a regional project's request keeps its words and exact call
   // and its row only their shape (lib/mcp/approval-request-bodies.ts). Read
-  // before the request is claimed. When the call cannot be read the request is
-  // closed unrun: the shape is never run in its place, and the agent asking
-  // again makes a new request whose call can be read.
+  // before the request is claimed, and never replaced by that shape. A region
+  // that cannot be reached decides nothing: the request keeps waiting, to be
+  // approved again once the region answers. A region that answers without the
+  // call closes the request unrun, and the agent asking again makes a new
+  // request whose call can be read.
   const read = await requestAsKept(input.projectId, row)
   if ('unreadable' in read) {
-    return closeUnrun(input, row, CALL_UNREADABLE_SUMMARY[read.unreadable], 'AGENT_APPROVAL_UNREADABLE_REFUSED')
+    if (read.unreadable === 'unreachable') {
+      return { ok: false, status: 'pending', error: REGION_UNREACHABLE, regionUnavailable: true }
+    }
+    return closeUnrun(input, row, CALL_MISSING_SUMMARY, 'AGENT_APPROVAL_UNREADABLE_REFUSED')
   }
 
   // What runs is what the approver was shown. A regional project's card is
@@ -443,15 +454,15 @@ const NOT_AS_SHOWN =
   'Not run. This approval does not match the request as it is kept now, so nothing was changed and the ' +
   'request is still waiting. Refresh the Review Queue, review it and approve it again.'
 
-/** Why an approved request whose call is kept in its project's region ran nothing. */
-const CALL_UNREADABLE_SUMMARY: Record<CallUnreadable, string> = {
-  unreachable:
-    'Not executed. This request’s exact call is kept in the project’s region, which could not be reached, ' +
-    `so nothing was changed. ${ASK_AGAIN}`,
-  missing:
-    'Not executed. This request’s exact call was not found in the project’s region, so nothing was changed. ' +
-    ASK_AGAIN,
-}
+/** Why an approval ran nothing while the region keeping the request's call could not be reached. */
+const REGION_UNREACHABLE =
+  'Not run. This request’s exact call is kept in the project’s region, which could not be reached, so nothing ' +
+  'was changed and the request is still waiting. Approve it again once the region answers.'
+
+/** Why an approved request closed unrun when its region answered without its call. */
+const CALL_MISSING_SUMMARY =
+  'Not executed. This request’s exact call was not found in the project’s region, so nothing was changed. ' +
+  ASK_AGAIN
 
 /**
  * Close an approved request without running anything, and say why. It is never
@@ -486,7 +497,7 @@ type ApprovalAuditAction =
   | 'AGENT_APPROVAL_REJECTED'
   /** Approved, but the request named no exact call, so nothing was run. */
   | 'AGENT_APPROVAL_UNBOUND_REFUSED'
-  /** Approved, but its exact call, kept in the project's region, could not be read, so nothing was run. */
+  /** Approved, but the project's region, which keeps its exact call, had no record of it, so nothing was run. */
   | 'AGENT_APPROVAL_UNREADABLE_REFUSED'
 
 async function auditDecision(

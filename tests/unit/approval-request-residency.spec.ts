@@ -12,9 +12,10 @@
  *     read back from the region, and the row as stored, marked unreadable,
  *     when it cannot be read;
  *   - approval runs exactly the call read back from the region, and only for
- *     an approval that carries the digest of what its card showed; when that
- *     call cannot be read it runs nothing, never marks the request approved,
- *     and closes it with a note to ask the agent again;
+ *     an approval that carries the digest of what its card showed; while the
+ *     region cannot be reached it runs nothing and the request keeps waiting,
+ *     and when the region has no such call it runs nothing, never marks the
+ *     request approved, and closes it with a note to ask the agent again;
  *   - a home project's request is read from its row, even when its agent's
  *     arguments carry the mark a regional row has;
  *   - the region keeps the request with its other log bodies, for longer than
@@ -389,27 +390,57 @@ describe('approving a regional request', () => {
     expect(JSON.stringify(forProject(mockAudits, 'p-use1-run'))).not.toContain(EMAIL)
   })
 
+  it('runs nothing while its region cannot be reached, keeps the request waiting, and runs it once the region answers', async () => {
+    mockRegions.set('p-use1-down', 'us-east-1')
+    const row = await createApprovalRequest(blockAlice('p-use1-down'))
+    const shownDigest = await shownOf('p-use1-down', row.id)
+    dispatched.mockImplementation(async () => ({ ok: true, summary: 'Blocked' }))
+
+    mockUnreachable.add('p-use1-down')
+    let decided: Awaited<ReturnType<typeof approve>>
+    let viaConsole: Awaited<ReturnType<typeof viaRoute>>
+    try {
+      decided = await quietly(() => approve('p-use1-down', row.id, shownDigest))
+      viaConsole = await quietly(() => viaRoute('p-use1-down', { approvalId: row.id, decision: 'approve', shownDigest }))
+    } finally {
+      mockUnreachable.delete('p-use1-down')
+    }
+    expect(decided).toEqual({
+      ok: false,
+      status: 'pending',
+      error: expect.stringMatching(/could not be reached, so nothing was changed and the request is still waiting\. Approve it again once the region answers\./),
+      regionUnavailable: true,
+    })
+    expect(viaConsole).toMatchObject({ status: 503, body: { success: false, status: 'pending', retryable: true } })
+    expect(dispatched).not.toHaveBeenCalled()
+    // Nothing was decided: still pending, nothing audited as refused.
+    expect(statusesOf(row.id)).toEqual([])
+    expect(auditOf('p-use1-down', 'AGENT_APPROVAL_UNREADABLE_REFUSED')).toBeUndefined()
+    expect(await getApprovalForProject('p-use1-down', row.id)).toMatchObject({ status: 'pending', resultSummary: null })
+
+    // Once the region answers, the same card's approval runs the call.
+    expect(await approve('p-use1-down', row.id, shownDigest)).toMatchObject({ ok: true, status: 'executed' })
+    expect(dispatched.mock.calls.map(([tool, args]) => [tool, args])).toEqual([['block_end_user', CALL]])
+  })
+
   it.each([
-    ['cannot be reached', 'p-use1-down', /exact call is kept in the project’s region, which could not be reached, so nothing was changed\./],
-    ['no longer has it', 'p-use1-gone', /exact call was not found in the project’s region, so nothing was changed\./],
-    ['has no call in it', 'p-use1-bad', /exact call was not found in the project’s region, so nothing was changed\./],
-  ])('runs nothing when the region %s, and closes the request asking for a new one', async (_how, projectId, why) => {
+    ['no longer has it', 'p-use1-gone'],
+    ['has no call in it', 'p-use1-bad'],
+  ])('runs nothing when the region %s, and closes the request asking for a new one', async (_how, projectId) => {
     mockRegions.set(projectId, 'us-east-1')
     const row = await createApprovalRequest(blockAlice(projectId))
     if (projectId === 'p-use1-gone') mockBodies.delete(`approval_request:${row.id}`)
     if (projectId === 'p-use1-bad') {
       mockBodies.set(`approval_request:${row.id}`, { projectId, payload: { message: MESSAGE, target: TARGET, toolArgs: ['not', 'a', 'call'] } })
     }
-    if (projectId === 'p-use1-down') mockUnreachable.add(projectId)
 
-    let decided: Awaited<ReturnType<typeof approve>>
-    try {
-      decided = await quietly(() => approve(projectId, row.id))
-    } finally {
-      mockUnreachable.delete(projectId)
-    }
+    const decided = await quietly(() => approve(projectId, row.id))
 
-    expect(decided).toEqual({ ok: false, status: 'failed', resultSummary: expect.stringMatching(why) })
+    expect(decided).toEqual({
+      ok: false,
+      status: 'failed',
+      resultSummary: expect.stringMatching(/exact call was not found in the project’s region, so nothing was changed\./),
+    })
     expect(decided.resultSummary).toMatch(/Ask your agent to make the change again: it will be held again, as a new request, for your approval\.$/)
     // Nothing ran, and the shape on the row was never offered in the call's place.
     expect(dispatched).not.toHaveBeenCalled()

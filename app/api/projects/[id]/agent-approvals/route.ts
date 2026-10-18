@@ -13,7 +13,9 @@ export const dynamic = 'force-dynamic'
  *   returns the outcome. A request without an exact call is closed unrun.
  *   `shownDigest` is the listed request's own, sent back with an approval: a
  *   regional project's request runs only with it, and only while it still
- *   matches (409 otherwise, nothing run, the request still waiting).
+ *   matches (409 otherwise, nothing run, the request still waiting). 503 when
+ *   the project's region, which keeps the request's call, cannot be reached:
+ *   nothing ran, and the request is still waiting.
  *
  * Auth: platform JWT + project ownership (withProjectAccess). Scoped agent
  * keys can create and poll requests over MCP but can never decide them —
@@ -67,6 +69,14 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, projectId
 
   if (!result.ok && result.status === 'missing') {
     return NextResponse.json({ success: false, error: result.error }, { status: 404 })
+  }
+  if (result.regionUnavailable) {
+    // The project's region, which keeps the request's exact call, could not be
+    // reached: nothing ran, and the request is still waiting to be approved again.
+    return NextResponse.json(
+      { success: false, error: result.error, status: result.status, retryable: true },
+      { status: 503 },
+    )
   }
   if (!result.ok && result.error && result.status !== 'failed') {
     // Already decided / expired — tell the truth, not a 500.
