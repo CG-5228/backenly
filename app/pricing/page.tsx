@@ -139,7 +139,7 @@ const included: { icon: LucideIcon; label: string; body: string }[] = [
   { icon: UploadCloud, label: 'Storage', body: 'Buckets, uploads, metadata and signed URLs.' },
   { icon: Radio, label: 'Realtime', body: 'SSE subscriptions, presence and broadcast channels.' },
   { icon: Zap, label: 'Triggers', body: 'Event workflows for inserts, updates, schedules and integrations. On Pro and Enterprise.' },
-  { icon: RefreshCcw, label: 'Rollback', body: 'Every schema change is checkpointed and verified, and a change that fails its checks is recovered automatically when that is safe. Agents can ask for a restore; only a person approves one.' },
+  { icon: RefreshCcw, label: 'Rollback', body: 'Every schema change made through Backenly is checkpointed and verified, and a change that fails its checks is recovered automatically when that is safe. Agents can ask for a restore; only a person approves one.' },
   { icon: Bot, label: 'Autonomy', body: 'Watches your live backend every minute and repairs what is safe to repair. On every plan.' },
   { icon: Terminal, label: 'Bring your own agent', body: 'Drive the backend from Claude Code or Cursor over MCP. Typed tools carry no AI charge.' },
 ]
