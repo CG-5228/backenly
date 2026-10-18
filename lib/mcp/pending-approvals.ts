@@ -37,5 +37,5 @@ export async function listPendingAgentApprovals(projectId: string, take = 10) {
   // is read by the health route and the top bar's poll.
   const { withApprovalRequests } = await import('@/lib/mcp/approval-request-bodies')
   const shown = await withApprovalRequests(projectId, rows)
-  return shown.map(({ toolArgs: _call, ...row }) => row)
+  return shown.map(({ toolArgs: _call, readable: _readable, ...row }) => row)
 }

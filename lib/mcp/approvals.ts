@@ -28,7 +28,8 @@
  *     identity, with the standard audit trail.
  *   • A project kept in another region keeps a request's words and exact call
  *     in that region (lib/mcp/approval-request-bodies.ts). Approval reads the
- *     call back from there, and runs nothing when it cannot.
+ *     call back from there and runs it only when the approval carries the
+ *     digest of what its card showed; it runs nothing when it cannot read it.
  */
 
 import { randomUUID } from 'crypto'
@@ -37,9 +38,10 @@ import { prisma } from '@/lib/db/prisma'
 import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import {
-  callKeptInRegion,
   keepApprovalRequest,
-  keptCallForReplay,
+  matchesShown,
+  requestAsKept,
+  shownDigest,
   withApprovalRequests,
   type CallUnreadable,
 } from '@/lib/mcp/approval-request-bodies'
@@ -240,7 +242,7 @@ export async function getApprovalForProject(projectId: string, id: string) {
   if (!found) return null
   // A regional project's request keeps its target in its region, read back for
   // the agent that made it; when the region cannot be read, the row's stand-in
-  // (lib/mcp/approval-request-bodies.ts).
+  // and `readable: false` (lib/mcp/approval-request-bodies.ts).
   const [row] = await withApprovalRequests(projectId, [found])
   const view = effectiveView(row)
   return {
@@ -248,6 +250,7 @@ export async function getApprovalForProject(projectId: string, id: string) {
     status: view.status,
     tool: row.tool,
     target: row.target,
+    readable: row.readable,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
     resultSummary: view.resultSummary,
@@ -302,7 +305,7 @@ export async function listApprovals(projectId: string) {
   })
   // A regional project's requests keep their words and targets in its region,
   // read back for the approver; when the region cannot be read, the rows as
-  // stored (lib/mcp/approval-request-bodies.ts).
+  // stored and `readable: false` (lib/mcp/approval-request-bodies.ts).
   const rows = await withApprovalRequests(projectId, found)
   return rows.map((r) => {
     const view = effectiveView(r)
@@ -319,8 +322,21 @@ export async function listApprovals(projectId: string) {
       decidedAt: r.decidedAt?.toISOString() ?? null,
       executedAt: r.executedAt?.toISOString() ?? null,
       resultSummary: view.resultSummary,
+      /** False when the card can show only stand-ins: its request cannot be approved from it. */
+      readable: r.readable,
+      /** What an approval of this card sends back (decideApproval's shownDigest). */
+      shownDigest: view.status === 'pending' && r.readable ? digestOf(r) : null,
     }
   })
+}
+
+/** The digest of a request as a card shows it, or null when none can be made. */
+function digestOf(row: { id: string; tool: string; message: string; target: string; toolArgs: unknown }): string | null {
+  try {
+    return shownDigest(row.id, row.tool, row)
+  } catch {
+    return null
+  }
 }
 
 export async function decideApproval(input: {
@@ -328,6 +344,12 @@ export async function decideApproval(input: {
   approvalId: string
   approverUserId: string
   decision: 'approve' | 'reject'
+  /**
+   * The digest of the request as its card showed it (listApprovals'
+   * `shownDigest`). Required to approve a regional project's request, whose
+   * card is read from its region; checked for any request whenever it is given.
+   */
+  shownDigest?: string
 }): Promise<{ ok: boolean; status: string; error?: string; resultSummary?: string }> {
   const row = await prisma.agentApprovalRequest.findFirst({
     where: { id: input.approvalId, projectId: input.projectId },
@@ -348,19 +370,26 @@ export async function decideApproval(input: {
     return { ok: true, status: 'rejected' }
   }
 
-  // The exact call. A regional project's request keeps it in the project's
-  // region, and its row only the call's shape (lib/mcp/approval-request-bodies.ts).
-  // It is read back before the request is claimed. When it cannot be read, the
-  // request is closed unrun: the shape is never run in its place, and the agent
-  // asking again makes a new request whose call can be read.
-  let exactArgs: unknown = row.toolArgs
-  if (callKeptInRegion(row.toolArgs)) {
-    const kept = await keptCallForReplay(input.projectId, row.id)
-    if ('unreadable' in kept) {
-      return closeUnrun(input, row, CALL_UNREADABLE_SUMMARY[kept.unreadable], 'AGENT_APPROVAL_UNREADABLE_REFUSED')
-    }
-    exactArgs = kept.toolArgs
+  // The request as it would run: its row, or the record its project's region
+  // keeps, where a regional project's request keeps its words and exact call
+  // and its row only their shape (lib/mcp/approval-request-bodies.ts). Read
+  // before the request is claimed. When the call cannot be read the request is
+  // closed unrun: the shape is never run in its place, and the agent asking
+  // again makes a new request whose call can be read.
+  const read = await requestAsKept(input.projectId, row)
+  if ('unreadable' in read) {
+    return closeUnrun(input, row, CALL_UNREADABLE_SUMMARY[read.unreadable], 'AGENT_APPROVAL_UNREADABLE_REFUSED')
   }
+
+  // What runs is what the approver was shown. A regional project's card is
+  // read from its region, so its approval must carry the digest of what that
+  // card showed: one that does not, or that the request no longer matches,
+  // runs nothing, and the request keeps waiting for an approval that does.
+  const boundToCard = read.keptInRegion || input.shownDigest !== undefined
+  if (boundToCard && !matchesShown(input.shownDigest, row.id, row.tool, read.request)) {
+    return { ok: false, status: 'pending', error: NOT_AS_SHOWN }
+  }
+  const exactArgs = read.request.toolArgs
 
   // A request that does not name its exact call cannot be executed safely:
   // the only thing left to run would be the request's MESSAGE, and replaying a
@@ -408,6 +437,11 @@ const UNBOUND_SUMMARY =
 
 const ASK_AGAIN =
   'Ask your agent to make the change again: it will be held again, as a new request, for your approval.'
+
+/** Why an approval that did not match what its card showed ran nothing. */
+const NOT_AS_SHOWN =
+  'Not run. This approval does not match the request as it is kept now, so nothing was changed and the ' +
+  'request is still waiting. Refresh the Review Queue, review it and approve it again.'
 
 /** Why an approved request whose call is kept in its project's region ran nothing. */
 const CALL_UNREADABLE_SUMMARY: Record<CallUnreadable, string> = {

@@ -13,13 +13,17 @@
  * names only the tool, the tool and a keyed stand-in for the target, the
  * arguments' shape (lib/data-plane/residency.ts) and `keptInRegion`.
  *
- * A home project's rows keep all three, as they always have.
+ * A home project's rows keep all three, as they always have, and are read as
+ * stored even when the arguments an agent sent carry a `keptInRegion` of their
+ * own: only a regional project's row is read from its region.
  *
  * Every writer and reader of a request's words and call goes through here. The
  * surfaces that show a request read them from the region and, when the region
- * cannot be read, show the row as the platform has it. Approval does not fall
- * back: it runs exactly the call the request was made with, so a region it
- * cannot read, or one without the call, runs nothing.
+ * cannot be read, show the row as the platform has it, marked unreadable, and
+ * such a card cannot be approved. An approval carries the digest of the request
+ * as its card showed it (shownDigest) and runs only a call that still matches
+ * it. It never falls back to the row, so a region it cannot read, or one
+ * without the call, runs nothing.
  *
  * The region keeps them for REGIONAL_BODY_RETENTION_DAYS. A request can be
  * approved only until it expires, a day after it was made (APPROVAL_TTL_MS), so
@@ -27,7 +31,7 @@
  * stand-ins.
  */
 
-import { createHmac } from 'crypto'
+import { createHmac, timingSafeEqual } from 'crypto'
 import { regionalBodiesFor, type RegionalBodies } from '@/lib/data-plane/regional-bodies'
 import { argumentShape } from '@/lib/data-plane/residency'
 
@@ -38,9 +42,18 @@ export interface ApprovalRequestBody {
   toolArgs: Record<string, unknown>
 }
 
+/** A request as its approver is shown it and as an approval runs it: from its row, or from its region. */
+export interface ShownRequest {
+  message: string
+  target: string
+  toolArgs: unknown
+}
+
 /**
- * Whether a row's call is kept in its project's region: the row then has the
- * call's shape and `keptInRegion` in its place, which must never be run.
+ * Whether a row carries the mark this module writes in place of a regional
+ * project's call: the call's shape and `keptInRegion`, which must never be run.
+ * The mark alone does not make a row regional (withApprovalRequests,
+ * requestAsKept): a home project's agent can send the same field.
  */
 export function callKeptInRegion(toolArgs: unknown): boolean {
   return (
@@ -51,12 +64,51 @@ export function callKeptInRegion(toolArgs: unknown): boolean {
   )
 }
 
+function keyFor(what: string): string {
+  const key = process.env.ENV_VAR_ENCRYPTION_KEY || process.env.JWT_SECRET
+  if (!key) throw new Error(`No key for ${what}: set ENV_VAR_ENCRYPTION_KEY or JWT_SECRET.`)
+  return key
+}
+
 /** The stand-in a regional project's row keeps for a request's target. */
 export function approvalTargetStandIn(projectId: string, target: string): string {
-  const key = process.env.ENV_VAR_ENCRYPTION_KEY || process.env.JWT_SECRET
-  if (!key) throw new Error('No key for approval request stand-ins: set ENV_VAR_ENCRYPTION_KEY or JWT_SECRET.')
-  const digest = createHmac('sha256', key).update(`backenly:approval-request-target:v1:${projectId}:${target}`).digest('base64url')
+  const digest = createHmac('sha256', keyFor('approval request stand-ins'))
+    .update(`backenly:approval-request-target:v1:${projectId}:${target}`)
+    .digest('base64url')
   return `t_${digest.slice(0, 32)}`
+}
+
+/** JSON with every object's keys in order, so a request digests the same however its record was stored. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item === undefined ? null : item)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const fields = value as Record<string, unknown>
+    const keys = Object.keys(fields).filter((key) => fields[key] !== undefined).sort()
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(fields[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/**
+ * The digest of a request as its approver is shown it: its tool, its words, its
+ * target and its exact call, bound to its id. The Review Queue sends it back
+ * with an approval, which runs only a request that still digests to it, so what
+ * runs is what was on screen. Keyed, so the digest a member is given says
+ * nothing about a value the call carries.
+ */
+export function shownDigest(requestId: string, tool: string, request: ShownRequest): string {
+  return createHmac('sha256', keyFor('approval request digests'))
+    .update(`backenly:approval-request-shown:v1:${requestId}:`)
+    .update(canonicalJson({ tool, message: request.message, target: request.target, toolArgs: request.toolArgs }))
+    .digest('hex')
+}
+
+/** Whether `given` is the digest of the request as it is kept now. */
+export function matchesShown(given: string | undefined, requestId: string, tool: string, request: ShownRequest): boolean {
+  if (typeof given !== 'string') return false
+  const expected = Buffer.from(shownDigest(requestId, tool, request))
+  const actual = Buffer.from(given)
+  return actual.length === expected.length && timingSafeEqual(actual, expected)
 }
 
 /** What a regional project's row says in place of the agent's request: the tool, and nothing the agent wrote. */
@@ -137,52 +189,62 @@ function withBody<T extends object>(row: T, body: ApprovalRequestBody): T {
 }
 
 /**
- * Requests with their words, targets and calls read back from the region for
- * a regional project, for the surfaces that show them. A region that cannot be
- * read, or that no longer has a request's record, leaves the row as the
- * platform has it: the tool, a message naming it, the target's stand-in and the
- * call's shape. Never throws.
+ * Requests as the surfaces that show them read them: a regional project's
+ * words, targets and calls read back from its region, and each row with whether
+ * it could be. A row its region could not answer for, because the region could
+ * not be read or no longer has its record, is left as the platform has it (the
+ * tool, a message naming it, the target's stand-in and the call's shape) with
+ * `readable: false`, and a card made from it cannot be approved. Never throws.
  */
 export async function withApprovalRequests<T extends { id: string; toolArgs: unknown }>(
   projectId: string,
   rows: T[],
-): Promise<T[]> {
-  const kept = rows.filter((row) => callKeptInRegion(row.toolArgs))
-  if (kept.length === 0) return rows
+): Promise<Array<T & { readable: boolean }>> {
+  const asStored = (row: T) => ({ ...row, readable: true })
+  const marked = rows.filter((row) => callKeptInRegion(row.toolArgs))
+  if (marked.length === 0) return rows.map(asStored)
+  let found = new Map<string, { payload: unknown }>()
   try {
     const bodies = await regionalBodiesFor(projectId)
-    const found = bodies.region ? await bodies.getMany('approval_request', kept.map((row) => row.id)) : new Map()
-    return rows.map((row) => {
-      const body = callKeptInRegion(row.toolArgs) ? bodyOf(found.get(row.id)?.payload) : null
-      return body ? withBody(row, body) : row
-    })
+    // A home project's rows are its requests, whatever its agents' arguments say.
+    if (!bodies.region) return rows.map(asStored)
+    found = await bodies.getMany('approval_request', marked.map((row) => row.id))
   } catch (err) {
     console.warn(`[approvals] the requests of ${projectId} could not be read in its region: ${why(err)}`)
-    return rows
   }
+  return rows.map((row) => {
+    if (!callKeptInRegion(row.toolArgs)) return asStored(row)
+    const body = bodyOf(found.get(row.id)?.payload)
+    return body ? { ...withBody(row, body), readable: true } : { ...row, readable: false }
+  })
 }
 
 /** Why a call kept in a project's region cannot be run. */
 export type CallUnreadable = 'unreachable' | 'missing'
 
 /**
- * The exact call a regional project's request was made with, read from its
- * region for the approval that runs it; or why it cannot be: the region could
- * not be reached, or it has no record of the request that names a call. There
- * is no fallback to the row, whose shape of the call is not the call.
+ * A request as an approval would run it: its row, or for a regional project's
+ * row, the record its region keeps, with `keptInRegion`; or why that record
+ * cannot be read: the region could not be reached, or it has no record of the
+ * request that names a call. There is no fallback to the row, whose shape of
+ * the call is not the call.
  */
-export async function keptCallForReplay(
+export async function requestAsKept(
   projectId: string,
-  requestId: string,
-): Promise<{ toolArgs: Record<string, unknown> } | { unreadable: CallUnreadable }> {
+  row: { id: string; message: string; target: string; toolArgs: unknown },
+): Promise<{ request: ShownRequest; keptInRegion: boolean } | { unreadable: CallUnreadable }> {
+  const asStored = { request: { message: row.message, target: row.target, toolArgs: row.toolArgs }, keptInRegion: false }
+  if (!callKeptInRegion(row.toolArgs)) return asStored
   let payload: unknown = null
   try {
     const bodies = await regionalBodiesFor(projectId)
-    if (bodies.region) payload = (await bodies.get('approval_request', requestId))?.payload
+    // A home project's row is its request, whatever its agent's arguments say.
+    if (!bodies.region) return asStored
+    payload = (await bodies.get('approval_request', row.id))?.payload
   } catch (err) {
-    console.warn(`[approvals] request ${requestId} of ${projectId} could not be read in its region: ${why(err)}`)
+    console.warn(`[approvals] request ${row.id} of ${projectId} could not be read in its region: ${why(err)}`)
     return { unreadable: 'unreachable' }
   }
   const body = bodyOf(payload)
-  return body ? { toolArgs: body.toolArgs } : { unreadable: 'missing' }
+  return body ? { request: body, keptInRegion: true } : { unreadable: 'missing' }
 }

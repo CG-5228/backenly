@@ -9,10 +9,14 @@
  *   - a request the region cannot keep is not created, and the chat door says
  *     the call was not queued, whatever the model's summary says;
  *   - the Review Queue, check_approval and the briefing tools show the request
- *     read back from the region, and the row as stored when it cannot be read;
- *   - approval runs exactly the call read back from the region; when that call
- *     cannot be read it runs nothing, never marks the request approved, and
- *     closes it with a note to ask the agent again;
+ *     read back from the region, and the row as stored, marked unreadable,
+ *     when it cannot be read;
+ *   - approval runs exactly the call read back from the region, and only for
+ *     an approval that carries the digest of what its card showed; when that
+ *     call cannot be read it runs nothing, never marks the request approved,
+ *     and closes it with a note to ask the agent again;
+ *   - a home project's request is read from its row, even when its agent's
+ *     arguments carry the mark a regional row has;
  *   - the region keeps the request with its other log bodies, for longer than
  *     a request can wait for approval.
  * A home project's requests are unchanged.
@@ -169,6 +173,14 @@ jest.mock('@/lib/entitlements/policy', () => ({ enforceAiCredits: jest.fn(async 
 jest.mock('@/lib/entitlements/credit-holds', () => ({ closeCreditTurn: jest.fn(async () => {}) }))
 jest.mock('@/lib/usage/account', () => ({ creditAccountOf: jest.fn(async () => 'account-1') }))
 
+// The console's approvals route: the project's administrator, deciding on the
+// project the request names.
+jest.mock('@/lib/auth/route-protection', () => ({
+  withProjectAccess: (handler: any) => (req: any) =>
+    handler(req, { user: { userId: 'u-owner', email: 'owner@backenly.test' }, project: {}, projectId: req.projectId }),
+}))
+jest.mock('@/lib/edition/guard', () => ({ canAdministerProject: jest.fn(async () => true) }))
+
 import { randomBytes } from 'crypto'
 import { NextRequest } from 'next/server'
 import { NOT_QUOTED } from '@/lib/data-plane/residency'
@@ -179,6 +191,7 @@ import { listPendingAgentApprovals } from '@/lib/mcp/pending-approvals'
 import { dispatchTool } from '@/lib/ai/brain/tools'
 import { notifyApprovalRequested } from '@/lib/notifications/platform'
 import { POST as chat } from '@/app/api/mcp/chat/route'
+import { GET as listByRoute, POST as decideByRoute } from '@/app/api/projects/[id]/agent-approvals/route'
 
 const EMAIL = 'alice@example.com'
 const MESSAGE = `Block ${EMAIL}, she keeps posting spam`
@@ -212,8 +225,19 @@ const auditOf = (projectId: string, action: string) => {
 }
 const noticesOf = (projectId: string) => notified.mock.calls.filter(([, request]) => request.projectId === projectId)
 const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)) }
-const approve = (projectId: string, approvalId: string) =>
-  decideApproval({ projectId, approvalId, approverUserId: 'u-owner', decision: 'approve' })
+const approve = (projectId: string, approvalId: string, shownDigest?: string) =>
+  decideApproval({ projectId, approvalId, approverUserId: 'u-owner', decision: 'approve', shownDigest })
+/** The digest the Review Queue's card for a request carries, as listApprovals gives it. */
+const shownOf = async (projectId: string, id: string) =>
+  (await listApprovals(projectId)).find((r) => r.id === id)?.shownDigest ?? undefined
+/** The console's approvals route, as the Review Queue calls it. */
+async function viaRoute(projectId: string, body?: Record<string, unknown>) {
+  const res: any = body
+    ? await decideByRoute({ projectId, json: async () => body } as any)
+    : await listByRoute({ projectId } as any)
+  return { status: res.status as number, body: await res.json() }
+}
+const HEX_DIGEST = /^[0-9a-f]{64}$/
 
 /** Run `fn` with the region's and the door's own complaints kept out of the test output. */
 async function quietly<T>(fn: () => Promise<T>): Promise<T> {
@@ -303,8 +327,14 @@ describe('showing a request', () => {
     const row = await createApprovalRequest(blockAlice('p-use1-show'))
 
     const [listed] = await listApprovals('p-use1-show')
-    expect(listed).toMatchObject({ id: row.id, tool: 'block_end_user', message: MESSAGE, target: TARGET, status: 'pending' })
-    expect(await getApprovalForProject('p-use1-show', row.id)).toMatchObject({ id: row.id, status: 'pending', target: TARGET })
+    expect(listed).toMatchObject({
+      id: row.id, tool: 'block_end_user', message: MESSAGE, target: TARGET, status: 'pending',
+      readable: true, shownDigest: expect.stringMatching(HEX_DIGEST),
+    })
+    expect(await getApprovalForProject('p-use1-show', row.id)).toMatchObject({ id: row.id, status: 'pending', target: TARGET, readable: true })
+    // The console's route lists the same, digest included.
+    const { body } = await viaRoute('p-use1-show')
+    expect(body.approvals.find((a: any) => a.id === row.id)).toMatchObject({ message: MESSAGE, readable: true, shownDigest: listed.shownDigest })
 
     // The briefing tools' list: the target, and never the call.
     const { createdAt, expiresAt } = mockApprovals.get(row.id)
@@ -313,26 +343,27 @@ describe('showing a request', () => {
     ])
   })
 
-  it('shows the row as stored, and never fails, when the region cannot be read or no longer has the request', async () => {
+  it('shows the row as stored, marked unreadable and with nothing to approve it by, when the region cannot answer for it', async () => {
     mockRegions.set('p-use1-unread', 'us-east-1')
     const row = await createApprovalRequest(blockAlice('p-use1-unread'))
     const stored = mockApprovals.get(row.id)
+    const asStored = { id: row.id, message: stored.message, target: stored.target, readable: false, shownDigest: null }
 
     mockUnreachable.add('p-use1-unread')
     try {
       const [listed] = await quietly(() => listApprovals('p-use1-unread'))
-      expect(listed).toMatchObject({ id: row.id, message: stored.message, target: stored.target })
-      expect((await quietly(() => getApprovalForProject('p-use1-unread', row.id)))?.target).toBe(stored.target)
+      expect(listed).toMatchObject(asStored)
+      expect(await quietly(() => getApprovalForProject('p-use1-unread', row.id))).toMatchObject({ target: stored.target, readable: false })
       expect((await quietly(() => listPendingAgentApprovals('p-use1-unread')))[0]).toMatchObject({ id: row.id, target: stored.target })
     } finally {
       mockUnreachable.delete('p-use1-unread')
     }
 
-    // A request older than the region keeps its record shows its stand-ins too.
+    // A region that no longer has the request's record answers the same way.
     mockBodies.delete(`approval_request:${row.id}`)
-    const [pruned] = await listApprovals('p-use1-unread')
-    expect(pruned).toMatchObject({ message: stored.message, target: stored.target })
-    expect(JSON.stringify(pruned)).not.toContain(EMAIL)
+    const [gone] = await listApprovals('p-use1-unread')
+    expect(gone).toMatchObject(asStored)
+    expect(JSON.stringify(gone)).not.toContain(EMAIL)
   })
 })
 
@@ -342,8 +373,10 @@ describe('approving a regional request', () => {
     const row = await createApprovalRequest(blockAlice('p-use1-run'))
     dispatched.mockImplementation(async () => ({ ok: true, summary: `Blocked ${EMAIL}` }))
 
-    // The approver reads the outcome in full.
-    expect(await approve('p-use1-run', row.id)).toEqual({ ok: true, status: 'executed', resultSummary: `Blocked ${EMAIL}` })
+    // Approved from the card, which carries the digest of what it showed. The
+    // approver reads the outcome in full.
+    const shown = await shownOf('p-use1-run', row.id)
+    expect(await approve('p-use1-run', row.id, shown)).toEqual({ ok: true, status: 'executed', resultSummary: `Blocked ${EMAIL}` })
     expect(dispatched.mock.calls).toEqual([
       ['block_end_user', CALL, expect.objectContaining({ projectId: 'p-use1-run', userId: 'u-owner', destructiveConfirmed: true })],
     ])
@@ -392,18 +425,64 @@ describe('approving a regional request', () => {
     expect(dispatched).not.toHaveBeenCalled()
   })
 
-  it('never runs a row that carries the mark from the row itself, wherever its project is', async () => {
-    mockRegions.set('p-home-marked', null)
-    mockApprovals.set('marked', {
-      id: 'marked', projectId: 'p-home-marked', userId: 'u-agent', apiKeyId: 'k1', tool: 'block_end_user',
-      message: 'An agent asked to run block_end_user.', target: 'block_end_user target t_x', rowCount: null, reversible: true,
-      toolArgs: { keptInRegion: true, shape: { email: '[string]' } },
-      status: 'pending', decidedBy: null, decidedAt: null, executedAt: null, resultSummary: null,
-      createdAt: new Date(), expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
+  it('runs nothing, and keeps the request waiting, when an approval does not carry the request as its card showed it', async () => {
+    mockRegions.set('p-use1-bound', 'us-east-1')
+    const row = await createApprovalRequest(blockAlice('p-use1-bound'))
+    const other = await createApprovalRequest({ ...blockAlice('p-use1-bound'), toolArgs: { email: 'bob@example.com', reason: 'spam' } })
+    dispatched.mockImplementation(async () => ({ ok: true, summary: 'Blocked' }))
+    const refused = {
+      ok: false,
+      status: 'pending',
+      error: expect.stringMatching(/does not match the request as it is kept now, so nothing was changed and the request is still waiting/),
+    }
+
+    // A card that showed only stand-ins has no digest to send.
+    expect(await approve('p-use1-bound', row.id)).toEqual(refused)
+    // Neither another request's digest nor a made-up one approves it.
+    expect(await approve('p-use1-bound', row.id, await shownOf('p-use1-bound', other.id))).toEqual(refused)
+    expect(await approve('p-use1-bound', row.id, 'f'.repeat(64))).toEqual(refused)
+    // A record that changed after its card was shown no longer matches that card.
+    const shown = await shownOf('p-use1-bound', row.id)
+    mockBodies.set(`approval_request:${row.id}`, {
+      projectId: 'p-use1-bound',
+      payload: { message: MESSAGE, target: TARGET, toolArgs: { email: 'mallory@example.com', reason: 'spam' } },
     })
-    expect(await approve('p-home-marked', 'marked')).toMatchObject({ ok: false, status: 'failed' })
+    expect(await approve('p-use1-bound', row.id, shown)).toEqual(refused)
+
     expect(dispatched).not.toHaveBeenCalled()
-    expect(statusesOf('marked')).toEqual(['failed'])
+    expect(statusesOf(row.id)).toEqual([])
+    expect(mockApprovals.get(row.id).status).toBe('pending')
+    expect(auditOf('p-use1-bound', 'AGENT_APPROVAL_GRANTED')).toBeUndefined()
+  })
+
+  it('answers the console with 409 for an approval without the card\'s digest, and runs the call for one with it', async () => {
+    mockRegions.set('p-use1-route', 'us-east-1')
+    const row = await createApprovalRequest(blockAlice('p-use1-route'))
+    dispatched.mockImplementation(async () => ({ ok: true, summary: 'Blocked' }))
+
+    const blind = await viaRoute('p-use1-route', { approvalId: row.id, decision: 'approve' })
+    expect(blind).toMatchObject({ status: 409, body: { success: false, status: 'pending' } })
+    expect(dispatched).not.toHaveBeenCalled()
+
+    const shownDigest = await shownOf('p-use1-route', row.id)
+    const seen = await viaRoute('p-use1-route', { approvalId: row.id, decision: 'approve', shownDigest })
+    expect(seen).toMatchObject({ status: 200, body: { success: true, status: 'executed' } })
+    expect(dispatched.mock.calls.map(([tool, args]) => [tool, args])).toEqual([['block_end_user', CALL]])
+  })
+
+  it('reads a home project\'s row as stored, and runs its arguments as sent, even when they carry the mark', async () => {
+    mockRegions.set('p-home-marked', null)
+    const sent = { keptInRegion: true, shape: { email: '[string]' }, email: EMAIL }
+    const row = await createApprovalRequest({ ...blockAlice('p-home-marked'), toolArgs: sent })
+    expect(mockApprovals.get(row.id)).toMatchObject({ message: MESSAGE, target: TARGET, toolArgs: sent })
+
+    const [listed] = await listApprovals('p-home-marked')
+    expect(listed).toMatchObject({ message: MESSAGE, target: TARGET, readable: true, shownDigest: expect.stringMatching(HEX_DIGEST) })
+    expect(await getApprovalForProject('p-home-marked', row.id)).toMatchObject({ target: TARGET, readable: true })
+
+    dispatched.mockImplementation(async () => ({ ok: true, summary: 'Blocked' }))
+    expect(await approve('p-home-marked', row.id)).toMatchObject({ ok: true, status: 'executed' })
+    expect(dispatched.mock.calls.map(([tool, args]) => [tool, args])).toEqual([['block_end_user', sent]])
   })
 
   it('is rejected without its region', async () => {
@@ -431,8 +510,8 @@ describe('a home project\'s request', () => {
     await flush()
     expect(noticesOf('p-home').map(([, request]) => request.target)).toEqual([TARGET])
 
-    expect((await listApprovals('p-home'))[0]).toMatchObject({ message: MESSAGE, target: TARGET })
-    expect(await getApprovalForProject('p-home', row.id)).toMatchObject({ target: TARGET })
+    expect((await listApprovals('p-home'))[0]).toMatchObject({ message: MESSAGE, target: TARGET, readable: true })
+    expect(await getApprovalForProject('p-home', row.id)).toMatchObject({ target: TARGET, readable: true })
     const { createdAt, expiresAt } = mockApprovals.get(row.id)
     expect(await listPendingAgentApprovals('p-home')).toEqual([
       { id: row.id, tool: 'block_end_user', target: TARGET, createdAt, expiresAt },
@@ -442,6 +521,16 @@ describe('a home project\'s request', () => {
     expect(await approve('p-home', row.id)).toEqual({ ok: true, status: 'executed', resultSummary: `Blocked ${EMAIL}` })
     expect(dispatched.mock.calls.map(([tool, args]) => [tool, args])).toEqual([['block_end_user', CALL]])
     expect(mockApprovals.get(row.id).resultSummary).toBe(`Blocked ${EMAIL}`)
+  })
+
+  it('checks the digest an approval carries, though it needs none', async () => {
+    mockRegions.set('p-home-digest', null)
+    const row = await createApprovalRequest(blockAlice('p-home-digest'))
+    dispatched.mockImplementation(async () => ({ ok: true, summary: 'Blocked' }))
+
+    expect(await approve('p-home-digest', row.id, 'f'.repeat(64))).toMatchObject({ ok: false, status: 'pending' })
+    expect(dispatched).not.toHaveBeenCalled()
+    expect(await approve('p-home-digest', row.id, await shownOf('p-home-digest', row.id))).toMatchObject({ ok: true, status: 'executed' })
   })
 })
 
