@@ -28,6 +28,7 @@ import {
   quotesKeptHere,
   recordedFixAction,
   recordedFixResult,
+  recordedResultMessage,
   recordedStatements,
 } from '@/lib/data-plane/residency'
 import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
@@ -696,10 +697,13 @@ export async function executeApprovedFix(
   // What the record keeps of the call (lib/data-plane/residency.ts). A held
   // action's arguments are its caller's own values, a secret among them
   // (SET_ENV_VAR), which its finding keeps sealed or in the project's region,
-  // and the statements replaying it bind them: the record keeps the arguments'
-  // shape and the statements' text, in every region. Undo reads none of them
-  // (revertAutoFix). For a project kept in another region no repair's
-  // arguments, bound values, result or error text is kept here either.
+  // the statements replaying it bind them, and its result can carry a value
+  // its approver is shown once (ROTATE_KEY's new key): the record keeps the
+  // arguments' shape, the statements' text and whether it succeeded, in every
+  // region. The approver still reads the result in full, in the response.
+  // Undo reads none of them (revertAutoFix). For a project kept in another
+  // region no repair's arguments, bound values, result or error text is kept
+  // here either.
   const quote = await quotesKeptHere(projectId)
   const keep = { quote, held: finding.type === 'ai_action_pending' }
 
@@ -1284,12 +1288,17 @@ export async function resolveFindingFromChat(
     },
   })
 
+  // The requester reads the result in full in the reply below; the audit row
+  // keeps it as the record keeps a result (lib/data-plane/residency.ts), so a
+  // held action's row says only that it ran.
+  const keep = { quote: await quotesKeptHere(projectId), held: finding.type === 'ai_action_pending' }
+  const action = typeof details.executorAction === 'string' ? details.executorAction : type
   await _writeAuditLog(projectId, 'HEALTH_FIX_RESOLVED_VIA_CHAT', {
     findingId,
     findingType: type,
     tableName: (details.tableName ?? details.table ?? details.location ?? null) as string | null,
     columnName: (details.columnName ?? details.column ?? null) as string | null,
-    message: result.message,
+    message: recordedResultMessage(result.message, action, keep),
     snapshotId: result.snapshotId ?? null,
   })
 
@@ -1502,13 +1511,15 @@ async function _executeAutoFix(
       : _escalate(findingId, projectId, type, details, full)
   }
 
-  // What the finding and the audit row keep of the call, decided once so the
-  // two agree (lib/data-plane/residency.ts): for a project kept in another
-  // region, the action's name, its arguments' shape and the statements' text.
+  // What the finding and the audit rows keep of the call, decided once so they
+  // agree (lib/data-plane/residency.ts): for a project kept in another region
+  // or a held action, the action's name, its arguments' shape and the
+  // statements' text, and not the result's text.
   const keep = { quote: await quotesKeptHere(projectId), held: type === 'ai_action_pending' }
   const recorded = {
     fixAction: recordedFixAction(fixAction, keep),
     statements: recordedStatements(statements, keep),
+    message: recordedResultMessage(result.message, fixAction.action, keep),
   }
 
   // ── TRUST GUARANTEE: a fix is only "fixed" if the gap actually closed ───────
@@ -1583,7 +1594,7 @@ async function _executeAutoFix(
         fixAction: recorded.fixAction,
         statements: recorded.statements,
         preSnapshotId: pre.preSnapshotId,
-        message: result.message,
+        message: recorded.message,
         verifierError,
       })
     }
@@ -1658,7 +1669,7 @@ async function _executeAutoFix(
     tableName: (details.tableName ?? details.table ?? details.location ?? null) as string | null,
     columnName: (details.columnName ?? details.column ?? null) as string | null,
     fixAction: recorded.fixAction,
-    message: result.message,
+    message: recorded.message,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     // The statements this fix actually ran. Duplicated onto the audit row rather

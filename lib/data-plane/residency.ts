@@ -153,11 +153,12 @@ export function argumentShape(args: Record<string, unknown> | null | undefined):
  *     statements it ran, as they were;
  *   - for a project kept in another region, the action's name, its arguments'
  *     shape, the statements' text and whether it succeeded.
- * An action held for approval keeps its arguments' shape and the statements'
- * text in place of its arguments and their bound values, in every region: its
- * arguments are its caller's own values, a secret among them (SET_ENV_VAR),
- * which its finding keeps sealed or in the project's region, and the
- * statements replaying it bind them (BLOCK_USER binds the end user's email).
+ * An action held for approval keeps the same as a project kept in another
+ * region, in every region: its arguments are its caller's own values, a secret
+ * among them (SET_ENV_VAR), which its finding keeps sealed or in the project's
+ * region; the statements replaying it bind them (BLOCK_USER binds the end
+ * user's email); and its result can carry a value its approver is shown once
+ * (ROTATE_KEY answers with the new key).
  * Undo reads none of these: it restores the pre-fix snapshot and preMetadata
  * (revertAutoFix in lib/core/auto-fix-engine.ts).
  */
@@ -186,14 +187,25 @@ export function recordedStatements(
 
 /**
  * A repair's result as its records keep it: the executor's message and data,
- * which can quote rows, for a project kept in the home region; otherwise only
- * whether it succeeded.
+ * which can quote rows, for a project kept in the home region; for a project
+ * kept in another region or an action held for approval, only whether it
+ * succeeded.
  */
 export function recordedFixResult(
   result: { success: boolean; message?: string; data?: unknown },
-  { quote }: { quote: boolean },
+  { quote, held }: RepairRecordKeeping,
 ): Record<string, unknown> {
-  return quote ? { message: result.message, data: result.data } : { success: result.success }
+  return quote && !held ? { message: result.message, data: result.data } : { success: result.success }
+}
+
+/**
+ * A repair's result message as its audit row keeps it: for an action held for
+ * approval, only that the action ran, by the platform's own name for it;
+ * otherwise the executor's message. Either is then kept as quotedError keeps an
+ * executor's words for the project's region.
+ */
+export function recordedResultMessage(message: string, action: string, { quote, held }: RepairRecordKeeping): string {
+  return quotedError(held ? `Ran ${action}` : message, quote)
 }
 
 /**

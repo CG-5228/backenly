@@ -10,10 +10,12 @@
  * repair whose check could not run, for an approved repair and for a
  * person-approved AI proposal.
  *
- * A home project's records are unchanged, except for an approved held action:
- * its arguments already keep only their shape, in every region, and now its
- * statements keep only their text, since they bind those arguments (BLOCK_USER
- * binds the end user's email).
+ * A home project's records are unchanged, except for an approved held action,
+ * whose records keep what a regional project's keep, in every region: its
+ * arguments' shape, its statements' text and whether it succeeded. Its
+ * statements bind its arguments (BLOCK_USER binds the end user's email), and
+ * its result can carry a value its approver is shown once (ROTATE_KEY answers
+ * with the new key), which the approver still reads in the response.
  *
  * Undo reads none of this, and restores the state before a repair from a
  * regional record as from any other.
@@ -22,17 +24,22 @@
  * is a recorder and each project's region is whatever the test says it is. The
  * SQL recorder is the real one. The executor is a stand-in that runs
  * BLOCK_USER's statements for every repair, one without values and one binding
- * the end user's email, and answers naming that user.
+ * the end user's email, and answers naming that user; ROTATE_KEY answers with
+ * a new key, as the real one does.
  */
 
 const mockRegions = new Map<string, string | null>()
 const mockFindings = new Map<string, any>()
 const mockAudits: any[] = []
+const mockEvents: any[] = []
+const mockCorrections: any[] = []
 const mockExecuted: any[] = []
 const mockRepair = {
   email: 'alice@example.com',
   ddl: 'ALTER TABLE "users" ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE',
   bound: 'UPDATE "users" SET is_blocked = TRUE WHERE "email" = $1 RETURNING id',
+  // Shaped like nothing real, so the public repository's secret scanners pass it.
+  newKey: 'fixture-rotated-key-not-a-real-key-0123456789abcdef',
 }
 const mockLoop = {
   outcome: async (): Promise<unknown> => ({ accepted: true, recheck: 'resolved', regressions: [], regressionCheck: 'ran', reason: '' }),
@@ -54,7 +61,7 @@ jest.mock('@/lib/db/prisma', () => {
           mockRegions.has(where.id) ? { region: mockRegions.get(where.id), userId: 'u-owner', name: 'Shop' } : null),
       },
       backendEvent: {
-        create: jest.fn(async ({ data }: any) => ({ id: `e-${data.projectId}`, ...data })),
+        create: jest.fn(async ({ data }: any) => { mockEvents.push(data); return { id: `e-${data.projectId}`, ...data } }),
         update: jest.fn(async ({ data }: any) => data),
         updateMany: jest.fn(async () => ({ count: 0 })),
       },
@@ -73,7 +80,10 @@ jest.mock('@/lib/db/prisma', () => {
         }),
       },
       auditLog: { create: jest.fn(async ({ data }: any) => { mockAudits.push(data); return data }) },
-      correctionEvent: { findFirst: jest.fn(async () => null), create: jest.fn(async ({ data }: any) => data) },
+      correctionEvent: {
+        findFirst: jest.fn(async () => null),
+        create: jest.fn(async ({ data }: any) => { mockCorrections.push(data); return data }),
+      },
       backendPattern: { upsert: jest.fn(async () => ({})) },
       // The pre-fix snapshot Undo restores.
       workspaceSchemaSnapshot: { findUnique: jest.fn(async ({ where }: any) => ({ id: where.id, versionNum: 7 })) },
@@ -87,6 +97,16 @@ jest.mock('@/lib/db', () => jest.requireMock('@/lib/db/prisma'))
 jest.mock('@/lib/ai/minimal-executor', () => ({
   executeAction: jest.fn(async (action: any) => {
     mockExecuted.push(action)
+    // ROTATE_KEY answers with the new key, to be shown once, as the real
+    // executor does; it changes the key's row through the typed client, so no
+    // statement is captured.
+    if (action.action === 'ROTATE_KEY') {
+      return {
+        success: true,
+        message: `API key rotated. New key (copy now, shown once): ${mockRepair.newKey}`,
+        data: { rotated: true, keyId: action.params?.keyId, newKey: mockRepair.newKey },
+      }
+    }
     const { noteStatement } = jest.requireActual('@/lib/execution/sql-recorder')
     const email = action.params?.email ?? mockRepair.email
     noteStatement(mockRepair.ddl)
@@ -133,14 +153,20 @@ jest.mock('@/lib/auth/route-protection', () => ({
 jest.mock('@/lib/edition/guard', () => ({ canWriteProject: jest.fn(async () => true) }))
 
 import { randomBytes } from 'crypto'
-import { NOT_QUOTED, recordedFixAction, recordedFixResult, recordedStatements } from '@/lib/data-plane/residency'
+import {
+  NOT_QUOTED,
+  recordedFixAction,
+  recordedFixResult,
+  recordedResultMessage,
+  recordedStatements,
+} from '@/lib/data-plane/residency'
 import { buildFixAction } from '@/lib/core/fix-actions'
 import { executeApprovedProposal, revertAutoFix, runAutoFix } from '@/lib/core/auto-fix-engine'
 import { queuePendingActionFinding } from '@/lib/operational-memory/ledger'
 import { rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
 import { POST as approve } from '@/app/api/projects/[id]/health/approve/route'
 
-const { email: ALICE, ddl: DDL, bound: BOUND } = mockRepair
+const { email: ALICE, ddl: DDL, bound: BOUND, newKey: NEW_KEY } = mockRepair
 /** Every repair's statements as the SQL recorder captures them. */
 const CAPTURED = [{ sql: DDL }, { sql: BOUND, params: [ALICE] }]
 /** The same statements as a record keeps them without their bound values. */
@@ -186,6 +212,14 @@ const auditOf = (projectId: string, action: string) => {
   const row = auditsOf(projectId).find((a) => a.action === action)
   return row ? JSON.parse(row.details) : undefined
 }
+/** Every row the platform client stored for a project: findings, audit rows, timeline events and fix history. */
+const storedFor = (projectId: string) =>
+  JSON.stringify([
+    ...[...mockFindings.values()].filter((row) => row.projectId === projectId),
+    ...auditsOf(projectId),
+    ...mockEvents.filter((event) => event.projectId === projectId),
+    ...mockCorrections.filter((correction) => correction.projectId === projectId),
+  ])
 
 async function approveFinding(projectId: string, findingId: string) {
   const res: any = await approve({ projectId, json: async () => ({ findingId }) } as any)
@@ -198,14 +232,15 @@ describe('what a repair\'s record keeps', () => {
   const result = { success: true, ...RESULT('BLOCK_USER') }
 
   it.each([
-    ['a home project\'s repair', { quote: true, held: false }, call, CAPTURED, RESULT('BLOCK_USER')],
-    ['a home project\'s held action', { quote: true, held: true }, shape, TEXT_ONLY, RESULT('BLOCK_USER')],
-    ['a regional project\'s repair', { quote: false, held: false }, shape, TEXT_ONLY, { success: true }],
-    ['a regional project\'s held action', { quote: false, held: true }, shape, TEXT_ONLY, { success: true }],
-  ])('for %s', (_what, keep, fixAction, statements, fixResult) => {
+    ['a home project\'s repair', { quote: true, held: false }, call, CAPTURED, RESULT('BLOCK_USER'), result.message],
+    ['a home project\'s held action', { quote: true, held: true }, shape, TEXT_ONLY, { success: true }, 'Ran BLOCK_USER'],
+    ['a regional project\'s repair', { quote: false, held: false }, shape, TEXT_ONLY, { success: true }, NOT_QUOTED],
+    ['a regional project\'s held action', { quote: false, held: true }, shape, TEXT_ONLY, { success: true }, NOT_QUOTED],
+  ])('for %s', (_what, keep, fixAction, statements, fixResult, message) => {
     expect(recordedFixAction(call, keep)).toEqual(fixAction)
     expect(recordedStatements(CAPTURED, keep)).toEqual(statements)
     expect(recordedFixResult(result, keep)).toEqual(fixResult)
+    expect(recordedResultMessage(result.message, 'BLOCK_USER', keep)).toBe(message)
   })
 })
 
@@ -295,7 +330,9 @@ describe('an approved repair', () => {
     expect(record.fixAction).toEqual(WORKFLOW_CALL)
     expect(record.fixResult).toEqual(RESULT('FIX_WORKFLOW'))
     expect(record.statements).toEqual(CAPTURED)
-    expect(auditOf('p-home-approved', 'HEALTH_FIX_EXECUTED').statements).toEqual(CAPTURED)
+    const audit = auditOf('p-home-approved', 'HEALTH_FIX_EXECUTED')
+    expect(audit.statements).toEqual(CAPTURED)
+    expect(audit.message).toBe(RESULT('FIX_WORKFLOW').message)
   })
 
   it('keeps only names and shapes for a regional project, on the finding and the audit row', async () => {
@@ -315,7 +352,7 @@ describe('an approved repair', () => {
     expect(JSON.stringify(auditsOf('p-use1-approved'))).not.toContain(ALICE)
   })
 
-  it('of a held action keeps its statements\' text and its arguments\' shape for a home project, and its result as before', async () => {
+  it('of a held action keeps its arguments\' shape, its statements\' text and whether it succeeded for a home project', async () => {
     mockRegions.set('p-home-held', null)
     const finding = await queuePendingActionFinding({
       projectId: 'p-home-held',
@@ -335,8 +372,33 @@ describe('an approved repair', () => {
     const record = mockFindings.get(finding.id).details.rollbackData
     expect(record.fixAction).toEqual({ action: 'BLOCK_USER', params: { userId: '[string]', email: '[string]', confirmed: true } })
     expect(record.statements).toEqual(TEXT_ONLY)
-    expect(record.fixResult).toEqual(RESULT('BLOCK_USER'))
-    expect(auditOf('p-home-held', 'HEALTH_FIX_EXECUTED').statements).toEqual(TEXT_ONLY)
+    expect(record.fixResult).toEqual({ success: true })
+    const audit = auditOf('p-home-held', 'HEALTH_FIX_EXECUTED')
+    expect(audit.statements).toEqual(TEXT_ONLY)
+    expect(audit.message).toBe('Ran BLOCK_USER')
+  })
+
+  it('of a held action that answers with a new key shows it to the approver and stores it nowhere, for a home project', async () => {
+    mockRegions.set('p-home-rotate', null)
+    const finding = await queuePendingActionFinding({
+      projectId: 'p-home-rotate',
+      action: 'ROTATE_KEY',
+      params: { keyId: 'key_0123456789' },
+      target: 'Production key',
+      riskLevel: 'medium',
+      source: 'brain-risk',
+      reason: 'Rotating a key needs the owner',
+    })
+    const { status, body } = await approveFinding('p-home-rotate', finding.id)
+    expect(status).toBe(200)
+    // Shown once, to the approver, in the response.
+    expect(body.message).toContain(NEW_KEY)
+
+    const record = mockFindings.get(finding.id).details.rollbackData
+    expect(record.fixAction).toEqual({ action: 'ROTATE_KEY', params: { keyId: 'key_0123456789', confirmed: true } })
+    expect(record.fixResult).toEqual({ success: true })
+    expect(auditOf('p-home-rotate', 'HEALTH_FIX_EXECUTED').message).toBe('Ran ROTATE_KEY')
+    expect(storedFor('p-home-rotate')).not.toContain(NEW_KEY)
   })
 })
 
