@@ -1211,3 +1211,9 @@ tests/integration/auth-rate-windows.spec.ts
 # it pending within the time allowed, and a lockdown reports where it stands.
 # Both databases and the real SQL are the property, so it needs a real Postgres.
 tests/integration/auth-projection-confirm.spec.ts
+
+# The SDK's data routes (/database/insert, update, delete and query) bind each
+# value as its column's type: a uuid, timestamp, numeric, integer, boolean and
+# jsonb column are written and filtered through each route. What PostgreSQL
+# accepts is the property, so it needs a real Postgres.
+tests/integration/v1-database-typed-columns.spec.ts
