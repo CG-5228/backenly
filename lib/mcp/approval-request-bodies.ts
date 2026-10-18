@@ -25,10 +25,13 @@
  * it. It never falls back to the row, so a region it cannot read, or one
  * without the call, runs nothing.
  *
- * The region keeps them for REGIONAL_BODY_RETENTION_DAYS. A request can be
- * approved only until it expires, a day after it was made (APPROVAL_TTL_MS), so
- * approval never needs them after that; an older request is shown with its
- * stand-ins.
+ * The region keeps them exactly as long as the request's row. The daily cleanup
+ * that deletes approval requests past their retention deletes their records
+ * first (lib/queue/worker.ts), and keeps a row whose region it cannot reach
+ * until it can. Deleting the project deletes every record its region keeps
+ * (lib/projects/delete.ts). A record whose row could not be written is removed
+ * straight away, while its region can be reached (lib/mcp/approvals.ts
+ * createApprovalRequest).
  */
 
 import { createHmac, timingSafeEqual } from 'crypto'
@@ -167,6 +170,28 @@ export async function keepApprovalRequest(
     throw new ApprovalRequestNotKept()
   }
   return stored
+}
+
+/**
+ * Delete what the regions keep for requests whose rows are being deleted, and
+ * return the ids of those it could not, because their project's region could
+ * not be reached: those rows must stay until it can be, or their records would
+ * outlive every row that names them. A home project's rows keep their requests
+ * themselves, so for them there is nothing to delete.
+ */
+export async function forgetApprovalRequests(rows: Array<{ id: string; projectId: string }>): Promise<string[]> {
+  const byProject = new Map<string, string[]>()
+  for (const row of rows) byProject.set(row.projectId, [...(byProject.get(row.projectId) ?? []), row.id])
+  const unreached: string[] = []
+  for (const [projectId, ids] of byProject) {
+    try {
+      await (await regionalBodiesFor(projectId)).remove('approval_request', ids)
+    } catch (err) {
+      console.warn(`[approvals] ${ids.length} request record(s) of ${projectId} could not be deleted in its region: ${why(err)}`)
+      unreached.push(...ids)
+    }
+  }
+  return unreached
 }
 
 /** A request's record as the region keeps it, or null when what is there is not one. */

@@ -64,12 +64,11 @@ export const REGIONAL_BODY_RETENTION_DAYS = 30
  * project keeps them as long as the project. A regional project's are kept the
  * same way, until the messages or the project are deleted. A backfill's cursor
  * is needed only while its chain of batches runs, minutes or hours. A file's
- * names last as long as its row, and so do a held action's target and arguments.
- * An approval request's words and call are run from only until the request
- * expires, a day after it was made (APPROVAL_TTL_MS in lib/mcp/approvals.ts),
- * and are shown while they are kept; its row shows their stand-ins after that.
+ * names last as long as its row, and so do a held action's target and arguments
+ * and an approval request's words and call, which the daily cleanup deletes
+ * with the request (lib/queue/worker.ts).
  */
-const PRUNED_KINDS: BodyKind[] = ['webhook', 'trigger', 'function_run', 'function_error', 'backfill_cursor', 'approval_request']
+const PRUNED_KINDS: BodyKind[] = ['webhook', 'trigger', 'function_run', 'function_error', 'backfill_cursor']
 
 export interface Body {
   payload: unknown

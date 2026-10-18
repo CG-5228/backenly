@@ -38,6 +38,7 @@ import { prisma } from '@/lib/db/prisma'
 import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import {
+  forgetApprovalRequests,
   keepApprovalRequest,
   matchesShown,
   requestAsKept,
@@ -104,21 +105,28 @@ export async function createApprovalRequest(input: {
     toolArgs: input.toolArgs,
   }
   const stored = quote ? request : await keepApprovalRequest(input.projectId, id, input.danger.tool, request)
-  const row = await prisma.agentApprovalRequest.create({
-    data: {
-      id,
-      projectId: input.projectId,
-      userId: input.userId,
-      apiKeyId: input.apiKeyId ?? null,
-      message: stored.message,
-      tool: input.danger.tool,
-      target: stored.target,
-      rowCount: input.danger.rowCount,
-      reversible: input.danger.reversible,
-      toolArgs: stored.toolArgs as Prisma.InputJsonValue,
-      expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
-    },
-  })
+  const row = await prisma.agentApprovalRequest
+    .create({
+      data: {
+        id,
+        projectId: input.projectId,
+        userId: input.userId,
+        apiKeyId: input.apiKeyId ?? null,
+        message: stored.message,
+        tool: input.danger.tool,
+        target: stored.target,
+        rowCount: input.danger.rowCount,
+        reversible: input.danger.reversible,
+        toolArgs: stored.toolArgs as Prisma.InputJsonValue,
+        expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
+      },
+    })
+    .catch(async (err: unknown) => {
+      // A record kept in the region lasts as long as its row, so one whose row
+      // could not be written goes again. Nothing is queued either way.
+      if (!quote) await forgetApprovalRequests([{ id, projectId: input.projectId }]).catch(() => [])
+      throw err
+    })
 
   // The audit copy of the target is left out for a project kept in another
   // region, where it can name a row or a file (lib/data-plane/residency.ts).

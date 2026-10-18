@@ -18,8 +18,10 @@
  *     request approved, and closes it with a note to ask the agent again;
  *   - a home project's request is read from its row, even when its agent's
  *     arguments carry the mark a regional row has;
- *   - the region keeps the request with its other log bodies, for longer than
- *     a request can wait for approval.
+ *   - the region keeps the request exactly as long as its row: the enforced
+ *     daily cleanup deletes the record before the row and keeps a row whose
+ *     region cannot be reached, and a record whose row could not be written
+ *     is removed again.
  * A home project's requests are unchanged.
  *
  * Database-free: the platform client is a recorder, each project's region is
@@ -41,6 +43,8 @@ const mockBodies = new Map<string, { projectId: string; payload: unknown }>()
 const mockUnreachable = new Set<string>()
 /** Records the region refuses to write: any that contains one of these. */
 const mockRefusedWrites = new Set<string>()
+/** Projects whose approval rows the platform database refuses to write. */
+const mockRefusedRows = new Set<string>()
 /** The values of each statement the region's prune ran. */
 const mockPrunes: unknown[][] = []
 /** What the stubbed brain answers the chat door with, and whose key asks. */
@@ -50,9 +54,17 @@ let mockKeyProject = ''
 jest.mock('@/lib/db/prisma', () => {
   const matches = (row: any, where: any): boolean =>
     Object.entries(where ?? {}).every(([key, want]: [string, any]) => {
-      if (want && typeof want === 'object' && !(want instanceof Date) && 'gt' in want) return row[key] > want.gt
+      if (key === 'AND') return want.every((clause: any) => matches(row, clause))
+      if (key === 'OR') return want.some((clause: any) => matches(row, clause))
+      if (want && typeof want === 'object' && !(want instanceof Date)) {
+        if ('path' in want) return row[key]?.[want.path[0]] === want.equals
+        if ('gt' in want) return row[key] !== null && row[key] > want.gt
+        if ('lt' in want) return row[key] !== null && row[key] < want.lt
+        if ('notIn' in want) return !want.notIn.includes(row[key])
+      }
       return row[key] === want
     })
+  const none = { deleteMany: jest.fn(async () => ({ count: 0 })), count: jest.fn(async () => 0) }
   const pick = (row: any, select: any) =>
     select ? Object.fromEntries(Object.keys(select).filter((key) => select[key]).map((key) => [key, row[key]])) : row
   // Copies, as a database returns them: a caller's object is never the stored row.
@@ -69,6 +81,7 @@ jest.mock('@/lib/db/prisma', () => {
       },
       agentApprovalRequest: {
         create: jest.fn(async ({ data }: any) => {
+          if (mockRefusedRows.has(data.projectId)) throw new Error('Can\'t reach database server')
           const row = structuredClone({
             id: data.id ?? `a${mockApprovals.size + 1}`,
             status: 'pending',
@@ -103,9 +116,23 @@ jest.mock('@/lib/db/prisma', () => {
           write(row, data)
           return { count: 1 }
         }),
+        deleteMany: jest.fn(async ({ where }: any) => {
+          const doomed = [...mockApprovals.values()].filter((row) => matches(row, where))
+          for (const row of doomed) {
+            mockWrites.push(`delete:${row.id}`)
+            mockApprovals.delete(row.id)
+          }
+          return { count: doomed.length }
+        }),
+        count: jest.fn(async ({ where }: any) => [...mockApprovals.values()].filter((row) => matches(row, where)).length),
       },
       auditLog: { create: jest.fn(async ({ data }: any) => { mockAudits.push(data); return data }) },
       platformNotification: { findFirst: jest.fn(async () => null) },
+      // The daily cleanup's other tables, which this suite does not fill.
+      webhookLog: none,
+      apiRequestLog: none,
+      intentLog: none,
+      securityEvent: none,
     },
   }
 })
@@ -142,7 +169,14 @@ jest.mock('@/lib/data-plane/regional-bodies', () => {
           reach()
           return new Map(ids.flatMap((id) => { const body = read(kind, id); return body ? [[id, body]] : [] }) as any)
         },
-        remove: async () => {},
+        remove: async (kind: string, ids: string[]) => {
+          reach()
+          for (const id of ids) {
+            if (mockBodies.get(`${kind}:${id}`)?.projectId !== projectId) continue
+            mockWrites.push(`forget:${id}`)
+            mockBodies.delete(`${kind}:${id}`)
+          }
+        },
         idsMatching: async () => [],
       }
     }),
@@ -185,9 +219,10 @@ jest.mock('@/lib/edition/guard', () => ({ canAdministerProject: jest.fn(async ()
 import { randomBytes } from 'crypto'
 import { NextRequest } from 'next/server'
 import { NOT_QUOTED } from '@/lib/data-plane/residency'
-import { REGIONAL_BODY_RETENTION_DAYS, pruneRegionalBodies } from '@/lib/data-plane/regional-bodies'
+import { pruneRegionalBodies } from '@/lib/data-plane/regional-bodies'
 import { ApprovalRequestNotKept, approvalTargetStandIn } from '@/lib/mcp/approval-request-bodies'
-import { APPROVAL_TTL_MS, createApprovalRequest, decideApproval, getApprovalForProject, listApprovals } from '@/lib/mcp/approvals'
+import { createApprovalRequest, decideApproval, getApprovalForProject, listApprovals } from '@/lib/mcp/approvals'
+import { handleCleanupJob } from '@/lib/queue/worker'
 import { listPendingAgentApprovals } from '@/lib/mcp/pending-approvals'
 import { dispatchTool } from '@/lib/ai/brain/tools'
 import { notifyApprovalRequested } from '@/lib/notifications/platform'
@@ -240,15 +275,13 @@ async function viaRoute(projectId: string, body?: Record<string, unknown>) {
 }
 const HEX_DIGEST = /^[0-9a-f]{64}$/
 
-/** Run `fn` with the region's and the door's own complaints kept out of the test output. */
+/** Run `fn` with the region's, the door's and the cleanup's own notes kept out of the test output. */
 async function quietly<T>(fn: () => Promise<T>): Promise<T> {
-  const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
-  const error = jest.spyOn(console, 'error').mockImplementation(() => {})
+  const notes = (['warn', 'error', 'info'] as const).map((level) => jest.spyOn(console, level).mockImplementation(() => {}))
   try {
     return await fn()
   } finally {
-    warn.mockRestore()
-    error.mockRestore()
+    for (const note of notes) note.mockRestore()
   }
 }
 
@@ -646,16 +679,84 @@ describe('the chat door', () => {
 })
 
 describe('how long the region keeps a request', () => {
-  it('is longer than a request can wait for approval', () => {
-    expect(APPROVAL_TTL_MS).toBeLessThan(REGIONAL_BODY_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+  const DAY_MS = 24 * 60 * 60 * 1000
+  const savedMode = process.env.BACKENLY_RETENTION_PURGE
+  afterEach(() => {
+    if (savedMode === undefined) delete process.env.BACKENLY_RETENTION_PURGE
+    else process.env.BACKENLY_RETENTION_PURGE = savedMode
   })
 
-  it('is the region\'s retention of its log bodies', async () => {
+  /** A request made in `projectId` and decided `days` ago. */
+  async function decided(projectId: string, days: number) {
+    const row = await createApprovalRequest(blockAlice(projectId))
+    Object.assign(mockApprovals.get(row.id), {
+      status: 'rejected',
+      decidedAt: new Date(Date.now() - days * DAY_MS),
+      expiresAt: new Date(Date.now() - (days - 1) * DAY_MS),
+    })
+    return row.id
+  }
+  const kept = (id: string) => ({ row: mockApprovals.has(id), record: mockBodies.has(`approval_request:${id}`) })
+
+  it('is as long as its row: the region does not prune it on a schedule of its own', async () => {
     mockPrunes.length = 0
     await pruneRegionalBodies('us-east-1')
     expect(mockPrunes).toHaveLength(1)
     const [, kinds] = mockPrunes[0]
-    expect(kinds).toContain('approval_request')
-    expect(kinds).not.toContain('conversation_message')
+    expect(kinds).not.toContain('approval_request')
+    expect(kinds).toContain('webhook')
+  })
+
+  it('ends with its row: the enforced cleanup deletes the record first, and keeps a row whose region cannot be reached', async () => {
+    process.env.BACKENLY_RETENTION_PURGE = 'enforce'
+    mockRegions.set('p-use1-old', 'us-east-1')
+    mockRegions.set('p-use1-old-down', 'us-east-1')
+    mockRegions.set('p-home-old', null)
+    const gone = await decided('p-use1-old', 91)
+    const recent = await decided('p-use1-old', 89)
+    const unreachable = await decided('p-use1-old-down', 91)
+    const home = await decided('p-home-old', 91)
+
+    mockUnreachable.add('p-use1-old-down')
+    let result: Record<string, any>
+    try {
+      result = await quietly(() => handleCleanupJob({ cleanupType: 'old_logs' }))
+    } finally {
+      mockUnreachable.delete('p-use1-old-down')
+    }
+
+    expect(result).toMatchObject({ retentionMode: 'enforce', approvalRequests: 2 })
+    expect(kept(gone)).toEqual({ row: false, record: false })
+    expect(mockWrites.filter((w) => w.endsWith(gone)).slice(-2)).toEqual([`forget:${gone}`, `delete:${gone}`])
+    expect(kept(home)).toEqual({ row: false, record: false })
+    // Its region could not be reached, so its row waits for a later run with its record.
+    expect(kept(unreachable)).toEqual({ row: true, record: true })
+    expect(kept(recent)).toEqual({ row: true, record: true })
+
+    // The next run, with the region back, finishes the job.
+    const again = await handleCleanupJob({ cleanupType: 'old_logs' })
+    expect(again).toMatchObject({ approvalRequests: 1 })
+    expect(kept(unreachable)).toEqual({ row: false, record: false })
+  })
+
+  it('deletes neither a record nor its row until the cleanup is enforced', async () => {
+    delete process.env.BACKENLY_RETENTION_PURGE
+    mockRegions.set('p-use1-dry', 'us-east-1')
+    const old = await decided('p-use1-dry', 91)
+    const result = await quietly(() => handleCleanupJob({ cleanupType: 'old_logs' }))
+    expect(result).toMatchObject({ retentionMode: 'dry-run', approvalRequests: 0 })
+    expect(kept(old)).toEqual({ row: true, record: true })
+  })
+
+  it('removes a record again when its row cannot be written', async () => {
+    mockRegions.set('p-use1-norow', 'us-east-1')
+    mockRefusedRows.add('p-use1-norow')
+    try {
+      await expect(createApprovalRequest(blockAlice('p-use1-norow'))).rejects.toThrow(/Can't reach database server/)
+    } finally {
+      mockRefusedRows.delete('p-use1-norow')
+    }
+    expect(rowsOf('p-use1-norow')).toEqual([])
+    expect([...mockBodies.values()].filter((b) => b.projectId === 'p-use1-norow')).toEqual([])
   })
 })
