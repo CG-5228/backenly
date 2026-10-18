@@ -3221,6 +3221,11 @@ function expectationsFor(action: AIAction): Array<{ action: string; table?: stri
       return table && p.columnName ? [{ action: 'DROP_COLUMN', table, column: p.columnName }] : []
     case 'RENAME_COLUMN':
       return table && p.newName ? [{ action: 'RENAME_COLUMN', table, column: p.oldName, newName: p.newName }] : []
+    // The table whose access rules this step was asked to set (set_rls, add_rls):
+    // what it sets there is the request, not a side effect (lib/changes/verify.ts).
+    case 'SET_PERMISSION':
+    case 'REMOVE_PERMISSION':
+      return table ? [{ action: action.action, table }] : []
     default:
       return []
   }

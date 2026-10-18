@@ -132,6 +132,10 @@ function expectedEffects({ after, expectations }: VerifyInput): VerificationChec
       case 'RENAME_COLUMN':
         if (e.table && e.newName && !hasColumn(t, e.newName)) missing.push(`${e.table}.${e.newName} was reported renamed and does not exist`)
         break
+      case 'SET_PERMISSION':
+      case 'REMOVE_PERMISSION':
+        if (e.table && !t) missing.push(`the access rules of ${e.table} were reported set and the table does not exist`)
+        break
     }
   }
   if (missing.length > 0) return bad('expected_effects', label, missing.join('; '))
@@ -179,23 +183,34 @@ function collateralDamage({ before, after, footprint, statements }: VerifyInput)
 
 // ── Row-level security not weakened ──────────────────────────────────────────
 
-function protectionsKept({ before, after, footprint }: VerifyInput, humanDecided: boolean): VerificationCheck {
+/** Steps whose request is a table's access rules (set_rls, add_rls). */
+const ACCESS_RULE_ACTIONS = new Set(['SET_PERMISSION', 'REMOVE_PERMISSION'])
+
+function protectionsKept({ before, after, footprint, expectations }: VerifyInput, humanDecided: boolean): VerificationCheck {
   const label = 'Row-level security kept'
+  // A table whose access rules a step was asked to set: replacing its policies,
+  // or opening it, is that request, not a side effect. Anything weakened on any
+  // other table still is one.
+  const asked = new Set(expectations.filter((e) => e.table && ACCESS_RULE_ACTIONS.has(e.action)).map((e) => e.table!.toLowerCase()))
   const weakened: string[] = []
+  const requested: string[] = []
   for (const c of footprint) {
     if (c.object || !c.before || !c.after) continue
     const B = before.tables[c.before]
     const A = after.tables[c.after]
     if (!B || !A) continue
-    if (B.rls.enabled && !A.rls.enabled) weakened.push(`row-level security turned off on ${A.name}`)
-    if (B.rls.forced && !A.rls.forced) weakened.push(`row-level security no longer forced on ${A.name}`)
+    const into = asked.has(A.name.toLowerCase()) ? requested : weakened
+    if (B.rls.enabled && !A.rls.enabled) into.push(`row-level security turned off on ${A.name}`)
+    if (B.rls.forced && !A.rls.forced) into.push(`row-level security no longer forced on ${A.name}`)
     for (const p of B.policies) {
       const now = A.policies.find((x) => x.name === p.name)
-      if (!now) weakened.push(`policy ${p.name} removed from ${A.name}`)
-      else if (now.using === 'true' && p.using !== 'true') weakened.push(`policy ${p.name} on ${A.name} now allows every row`)
+      if (!now) into.push(`policy ${p.name} removed from ${A.name}`)
+      else if (now.using === 'true' && p.using !== 'true') into.push(`policy ${p.name} on ${A.name} now allows every row`)
     }
   }
-  if (weakened.length === 0) return ok('rls', label, 'no table lost row-level security')
+  if (weakened.length === 0) {
+    return ok('rls', label, requested.length > 0 ? `access rules set as asked: ${requested.join('; ')}` : 'no table lost row-level security')
+  }
   if (humanDecided) return ok('rls', label, `changed by a person's explicit decision: ${weakened.join('; ')}`)
   return bad('rls', label, weakened.join('; '))
 }

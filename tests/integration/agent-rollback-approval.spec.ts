@@ -19,7 +19,9 @@
  *   the agent cannot reach the change record through SQL;
  *   a migration that fails part-way is recovered automatically;
  *   an agent that turns the autonomy dial off and sends arguments meant to skip
- *   recovery still has its breaking change recovered.
+ *   recovery still has its breaking change recovered;
+ *   an agent's set_rls replacing a table's policies is verified as what it
+ *   asked for, not recovered as a side effect.
  */
 
 jest.mock('@cloud/entitlements', () => {
@@ -300,5 +302,31 @@ describe('an agent switching off what protects production', () => {
     const recovery = await prisma.backendChange.findUniqueOrThrow({ where: { id: failed.recoveredById! } })
     expect(recovery).toMatchObject({ kind: 'recovery', source: 'system', status: 'healthy' })
     expect((recovery.verification as any).outcome).toBe('confirmed')
+  }, 120_000)
+})
+
+describe('an agent setting a table\'s access rules', () => {
+  it('replaces its policies as asked: verified as the request, not recovered as a side effect', async () => {
+    await call('apply_migration', { sql: 'CREATE TABLE diary (author_id uuid NOT NULL, entry text)' })
+    const policies = async () => (await prisma.$queryRawUnsafe<Array<{ policyname: string }>>(
+      `SELECT policyname FROM pg_policies WHERE schemaname = '${schema}' AND tablename = 'diary' ORDER BY policyname`,
+    )).map((p) => p.policyname)
+    const before = await policies()
+    expect(before.length).toBeGreaterThan(0)
+
+    const owner = "author_id = (backenly_jwt_claim('sub'))::uuid"
+    const r = await call('set_rls', { tableName: 'diary', select: { using: 'true' }, insert: { check: owner } })
+    expect({ status: r.status, ok: r.body.ok }).toEqual({ status: 200, ok: true })
+
+    const change = await prisma.backendChange.findFirstOrThrow({ where: { projectId, apiKeyId: keyId }, orderBy: { seq: 'desc' } })
+    expect(change.status).toBe('healthy')
+    const rls = (change.verification as any).checks.find((c: any) => c.id === 'rls')
+    expect(rls).toMatchObject({ outcome: 'confirmed', detail: expect.stringMatching(/^access rules set as asked: .*diary/) })
+    // The commands it named were replaced; the ones it did not name are untouched.
+    const after = await policies()
+    const named = before.filter((p) => /_(select|insert)$/.test(p))
+    expect(named.length).toBeGreaterThan(0)
+    for (const p of named) expect(after).not.toContain(p)
+    for (const p of before.filter((x) => /_(update|delete)$/.test(x))) expect(after).toContain(p)
   }, 120_000)
 })
