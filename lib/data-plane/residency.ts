@@ -57,25 +57,50 @@ export function quotedError(message: string, quote: boolean): string {
 }
 
 /**
+ * Where a finding's details carry an executor's or PostgreSQL's own words: why
+ * a repair failed, why the loop gave it back to a person, why the check that
+ * would confirm it could not run, and why the state before it could not be read.
+ */
+const FINDING_ERROR_TEXTS: Array<{ path: [string] | [string, string]; what: string }> = [
+  { path: ['fixError'], what: 'repair failed' },
+  { path: ['escalation', 'reason'], what: 'repair escalated' },
+  { path: ['appliedUnverified', 'verifierError'], what: 'repair check failed' },
+  { path: ['rollbackData', 'baselineError'], what: 'repair baseline failed' },
+]
+
+function textAt(details: Record<string, unknown>, [field, sub]: [string] | [string, string]): unknown {
+  const value = details?.[field]
+  return sub === undefined ? value : (value as Record<string, unknown> | null | undefined)?.[sub]
+}
+
+/**
  * A finding's details as the platform row may keep them. This row is in the
- * home region; for a project kept in another region a failed repair's message
- * is kept only when it is an error code (lib/data-plane/residency.ts), since
- * PostgreSQL can fill a message with the offending values. The full message
- * goes to this process's log only when this process serves the project's
- * region, so it stays there too.
+ * home region; for a project kept in another region each error text it carries
+ * (FINDING_ERROR_TEXTS) is kept only when it is an error code, since PostgreSQL
+ * can fill a message with the offending values. The full text goes to this
+ * process's log only when this process serves the project's region, so it
+ * stays there too.
  */
 export async function findingDetailsKeptHere(
   projectId: string,
   type: string,
   details: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const message = details?.fixError
-  if (typeof message !== 'string' || (await quotesKeptHere(projectId))) return details
-  const kept = quotedError(message, false)
-  if (kept !== message && (await servedHere(projectId).catch(() => false))) {
-    console.warn(`[autonomy] ${type} repair failed on project ${projectId}: ${message}`)
+  const texts = FINDING_ERROR_TEXTS.filter(({ path }) => typeof textAt(details, path) === 'string')
+  if (texts.length === 0 || (await quotesKeptHere(projectId))) return details
+  const logHere = await servedHere(projectId).catch(() => false)
+  let kept = details
+  for (const { path, what } of texts) {
+    const message = textAt(details, path) as string
+    const quoted = quotedError(message, false)
+    if (quoted === message) continue
+    if (logHere) console.warn(`[autonomy] ${type} ${what} on project ${projectId}: ${message}`)
+    const [field, sub] = path
+    kept = sub === undefined
+      ? { ...kept, [field]: quoted }
+      : { ...kept, [field]: { ...(kept[field] as Record<string, unknown>), [sub]: quoted } }
   }
-  return { ...details, fixError: kept }
+  return kept
 }
 
 /** Argument names whose values are a project's structure, not its data. */

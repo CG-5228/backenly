@@ -22,7 +22,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
-import { argumentShape, quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
+import { argumentShape, findingDetailsKeptHere, quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
 import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
 import { captureSchemaSnapshot, rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
 import {
@@ -1626,7 +1626,9 @@ async function _executeAutoFix(
       status: 'auto_fixed',
       autoFixed: true,
       fixAppliedAt: new Date(),
-      details: { ...details, rollbackData } as any,
+      // A baseline's error only as an error code for a project kept in another
+      // region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, { ...details, rollbackData })) as any,
     },
   })
 
@@ -1700,7 +1702,9 @@ async function _appliedUnverified(
       // finding whose gap is actually gone, so a fix that worked resolves
       // itself next tick and one that did not stays visible.
       status: 'pending_approval',
-      details: {
+      // The check's error, and the reason that quotes it, only as an error
+      // code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         // The mutation is on the record even though the verdict is not, so a
         // later reader can tell "we changed this and do not know the result"
@@ -1717,7 +1721,7 @@ async function _appliedUnverified(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
 
@@ -1807,7 +1811,9 @@ async function _escalate(
       // loop tried, verified, and the fix did not hold" apart from "policy
       // gates this on a human", and renders the guardrail line for both. That
       // mislabel made Autopilot look like it asks permission for safe fixes.
-      details: {
+      // The reason is the executor's or PostgreSQL's own words, kept only as an
+      // error code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         escalation: {
           // Carry the retry bookkeeping the reconciler wrote before handing this
@@ -1820,7 +1826,7 @@ async function _escalate(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
   await _writeAuditLog(projectId, 'HEALTH_FIX_ESCALATED', {
@@ -1887,17 +1893,31 @@ async function _deferred(
   }
 }
 
+/** Audit payload fields that carry an executor's or PostgreSQL's own words, which can quote rows. */
+const AUDIT_ERROR_TEXTS = new Set(['message', 'error', 'escalationReason', 'verifierError', 'deferReason', 'rejectedBecause'])
+
 async function _writeAuditLog(
   projectId: string,
   action: string,
   payload: Record<string, unknown>,
 ) {
+  // Those words only as an error code for a project kept in another region
+  // (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
+  const kept = quote
+    ? payload
+    : Object.fromEntries(
+        Object.entries(payload).map(([key, value]) => [
+          key,
+          AUDIT_ERROR_TEXTS.has(key) && typeof value === 'string' ? quotedError(value, false) : value,
+        ]),
+      )
   await prisma.auditLog.create({
     data: {
       projectId,
       action,
       type: 'health',
-      details: JSON.stringify(payload),
+      details: JSON.stringify(kept),
       timestamp: new Date(),
     },
   })

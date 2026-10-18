@@ -6,8 +6,11 @@
  *   - a broken contract probe keeps what failed and how (surface, request,
  *     status, size of the answer), never the answer's body or the handler's
  *     message, which can echo a row;
- *   - a failed repair keeps its message only when it is an error code, and the
- *     full message goes only to the log of a process serving that region;
+ *   - a repair's error texts (why it failed, why it was escalated, why its
+ *     check could not run, why its baseline could not be read) are kept only
+ *     when each is an error code, on the finding, in the audit log and in the
+ *     reconciler's retry record; the full text goes only to the log of a
+ *     process serving that region;
  *   - an action held for approval keeps its target and arguments in the region
  *     (founders: held-action targets move into the region). Its finding keeps
  *     the action, the arguments' shape and the target's stand-in, and its
@@ -165,6 +168,7 @@ jest.mock('@/lib/autonomy/desired-state', () => ({
   captureCheckBaseline: jest.fn(() => mockLoop.baseline()),
   evaluateFixOutcome: jest.fn(() => mockLoop.outcome()),
   recheckGap: jest.fn(async () => 'unknown'),
+  gapIdentity: (type: string, d: any) => `${type}::${d?.tableName ?? ''}.${d?.columnName ?? ''}`,
 }))
 jest.mock('@/lib/autonomy/circuit-breaker', () => ({
   checkBreaker: jest.fn(async () => ({ allowed: true })),
@@ -214,6 +218,8 @@ import { queuePendingActionFinding } from '@/lib/operational-memory/ledger'
 import { heldTargetStandIn, withHeldActions } from '@/lib/operational-memory/held-action-targets'
 import { sealParams } from '@/lib/operational-memory/sealed-params'
 import { buildFixAction, getManualRemediationHint } from '@/lib/core/fix-actions'
+import { runAutoFix } from '@/lib/core/auto-fix-engine'
+import { ensureFinding } from '@/lib/autonomy/reconciler'
 import { diagnoseEscalatedFindings } from '@/lib/autonomy/escalation-diagnosis'
 import { createApprovalRequest, getParkedActionForProject } from '@/lib/mcp/approvals'
 import { notifyApprovalRequested } from '@/lib/notifications/platform'
@@ -328,6 +334,90 @@ describe('a failed repair on a finding', () => {
       if (saved === undefined) delete process.env.BACKENLY_SERVICE_REGION
       else process.env.BACKENLY_SERVICE_REGION = saved
     }
+  })
+
+  it('keeps every error text of a regional finding only as an error code', async () => {
+    mockRegions.set('p-use1-texts', 'us-east-1')
+    const details = await findingDetailsKeptHere('p-use1-texts', 'missing_fk_index', {
+      tableName: 'orders',
+      escalation: { reason: ROW_ECHO, retryCount: 1 },
+      appliedUnverified: { verifierError: ROW_ECHO, statements: [] },
+      rollbackData: { baselineError: ROW_ECHO, rollbackFormat: 2 },
+    })
+    expect(details).toEqual({
+      tableName: 'orders',
+      escalation: { reason: NOT_QUOTED, retryCount: 1 },
+      appliedUnverified: { verifierError: NOT_QUOTED, statements: [] },
+      rollbackData: { baselineError: NOT_QUOTED, rollbackFormat: 2 },
+    })
+  })
+})
+
+describe('the loop\'s repairs', () => {
+  const repairable = (projectId: string, region: string | null) => {
+    mockRegions.set(projectId, region)
+    const id = `fx-${projectId}`
+    mockFindings.set(id, {
+      id, projectId, type: 'missing_fk_index', severity: 'warning', status: 'open', detectedAt: new Date(),
+      details: { tableName: 'orders', columnName: 'customer_id' },
+    })
+    return id
+  }
+  const human = { actor: { kind: 'human' as const, userId: 'u-owner' }, skipCooldown: true }
+  const saved = { ...mockLoop }
+  afterEach(() => Object.assign(mockLoop, saved))
+
+  it.each([
+    ['p-home-esc', null, ROW_ECHO],
+    ['p-use1-esc', 'us-east-1', NOT_QUOTED],
+  ])('escalate a failure with its text kept as the region allows (%s)', async (projectId, region, kept) => {
+    const id = repairable(projectId, region)
+    mockLoop.executor = () => ({ success: false, message: ROW_ECHO, error: ROW_ECHO })
+    expect((await runAutoFix(id, projectId, human)).outcome).toBe('escalated')
+    expect(mockFindings.get(id).details.escalation.reason).toBe(kept)
+    expect(auditOf(projectId, 'HEALTH_FIX_ESCALATED').escalationReason).toBe(kept)
+  })
+
+  it.each([
+    ['p-home-unv', null, ROW_ECHO],
+    ['p-use1-unv', 'us-east-1', NOT_QUOTED],
+  ])('record a repair whose check could not run with its error kept as the region allows (%s)', async (projectId, region, kept) => {
+    const id = repairable(projectId, region)
+    mockLoop.outcome = async () => { throw new Error(ROW_ECHO) }
+    expect((await runAutoFix(id, projectId, human)).outcome).toBe('applied_unverified')
+    const details = mockFindings.get(id).details
+    expect(details.appliedUnverified.verifierError).toBe(kept)
+    if (region) expect(details.escalation.reason).toBe(NOT_QUOTED)
+    else expect(details.escalation.reason).toContain(ROW_ECHO)
+    expect(auditOf(projectId, 'HEALTH_FIX_UNVERIFIED').verifierError).toBe(kept)
+  })
+
+  it.each([
+    ['p-home-base', null, ROW_ECHO],
+    ['p-use1-base', 'us-east-1', NOT_QUOTED],
+  ])('record a repair whose baseline could not be read with that error kept as the region allows (%s)', async (projectId, region, kept) => {
+    const id = repairable(projectId, region)
+    mockLoop.baseline = async () => { throw new Error(ROW_ECHO) }
+    mockLoop.executor = () => ({ success: true, message: `Indexed orders after ${ROW_ECHO}` })
+    expect((await runAutoFix(id, projectId, human)).outcome).toBe('auto_fixed')
+    expect(mockFindings.get(id).details.rollbackData.baselineError).toBe(kept)
+    expect(auditOf(projectId, 'HEALTH_AUTO_FIXED').message).toBe(region ? NOT_QUOTED : `Indexed orders after ${ROW_ECHO}`)
+  })
+
+  it.each([
+    ['p-home-retry', null, ROW_ECHO],
+    ['p-use1-retry', 'us-east-1', NOT_QUOTED],
+  ])('hand a failed repair back to the loop with its failure copied as the region allows (%s)', async (projectId, region, kept) => {
+    mockRegions.set(projectId, region)
+    const id = `esc-${projectId}`
+    const details = { tableName: 'orders', columnName: 'customer_id' }
+    mockFindings.set(id, {
+      id, projectId, type: 'missing_fk_index', severity: 'warning', status: 'pending_approval', detectedAt: new Date(),
+      details: { ...details, escalation: { reason: ROW_ECHO } },
+    })
+    const result = await ensureFinding(projectId, { invariantId: 'fk-indexed', type: 'missing_fk_index', severity: 'warning', tier: 1, details } as any)
+    expect(result).toEqual({ findingId: id, skip: null })
+    expect(auditOf(projectId, 'AUTONOMY_ESCALATION_RETRIED').priorFailure).toBe(kept)
   })
 })
 
