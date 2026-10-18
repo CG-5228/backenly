@@ -135,76 +135,38 @@ export async function getSchemaVersion(
 }
 
 /**
- * Rollback to a previous schema version.
- * Computes the diff between current schema and target version,
- * then executes the necessary DDL to revert.
+ * Retired: rolling back is per change, through the change ledger.
  *
- * WARNING: Rollback drops columns/tables — data loss possible.
- * Returns list of DDL statements that were executed.
+ * This used to diff the live schema against a SchemaVersion and run
+ * `DROP TABLE … CASCADE` on every table newer than it. Those snapshots never
+ * recorded columns, so it could not restore a column, a constraint or a policy;
+ * it could only destroy tables and their rows, non-transactionally, under the
+ * name "rollback".
+ *
+ * Restoring now goes through lib/changes/recovery.ts: one change at a time,
+ * proven first, in one transaction, keeping what it removes in a vault, and
+ * verified against the restore point afterwards. It runs automatically only
+ * when that is lossless and the change failed its checks; otherwise a person
+ * decides, from Database → Changes or by approving a request. This function
+ * stays exported so nothing that still imports it can reach the old behaviour;
+ * it changes nothing and says where restoring lives.
  */
 export async function rollbackToVersion(
   projectId: string,
-  targetVersionId: string
+  targetVersionId: string,
 ): Promise<{ success: boolean; statementsExecuted: string[]; message: string }> {
-  // Scoped to this project. Unscoped, a caller could name any version in the
-  // system and roll their own schema into another tenant's shape.
+  // Still scoped: another project's version is not found, never described.
   const target = await getSchemaVersion(targetVersionId, projectId)
   if (!target) {
     return { success: false, statementsExecuted: [], message: 'Version not found.' }
   }
-
-  // Snapshot current state before rollback (for audit)
-  await snapshotSchema(
-    projectId,
-    `Pre-rollback snapshot (reverting to v${target.versionNum})`,
-    'system:rollback'
-  ).catch(() => {})
-
-  const statements: string[] = []
-  const errors: string[] = []
-
-  // Import workspace DB access
-  const { getWorkspacePostgresClient } = await import('@/lib/services/workspaceDatabase')
-  const db = await getWorkspacePostgresClient(projectId)
-
-  if (!db?.executeRaw) {
-    return { success: false, statementsExecuted: [], message: 'Cannot connect to workspace database.' }
-  }
-
-  // Get current live schema
-  const { introspectSchema } = await import('@/lib/ai/minimal-executor')
-  const currentText = await introspectSchema(projectId)
-  const currentTables = parseSchemaText(currentText)
-
-  const targetTables = target.snapshot.tables
-  const targetTableNames = new Set(targetTables.map(t => t.name))
-  const currentTableNames = new Set(currentTables.map(t => t.name))
-
-  // Drop tables that exist now but didn't exist in target version
-  for (const table of currentTables) {
-    if (!targetTableNames.has(table.name)) {
-      const sql = `DROP TABLE IF EXISTS {schema}."${table.name}" CASCADE`
-      try {
-        await db.executeRaw(sql)
-        statements.push(sql)
-      } catch (err: any) {
-        errors.push(`DROP ${table.name}: ${err.message}`)
-      }
-    }
-  }
-
-  if (errors.length > 0) {
-    return {
-      success: false,
-      statementsExecuted: statements,
-      message: `Rollback partially failed: ${errors.join('; ')}`,
-    }
-  }
-
   return {
-    success: true,
-    statementsExecuted: statements,
-    message: `Rolled back to schema v${target.versionNum}. Dropped ${statements.length} table(s).`,
+    success: false,
+    statementsExecuted: [],
+    message:
+      `Schema v${target.versionNum} cannot be restored wholesale. Each schema change since then is recorded with a ` +
+      'restore point, and the state before any one of them can be restored from Database → Changes, checked ' +
+      'first and verified afterwards. Nothing was changed.',
   }
 }
 

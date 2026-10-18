@@ -139,6 +139,11 @@ export async function listApprovals(projectId: string) {
     status: effectiveStatus(r),
     tool: r.tool,
     target: r.target,
+    // Who asked: a coding agent's key, or Backenly itself (a change that failed
+    // its checks and could not be recovered without a person).
+    requestedBy: r.apiKeyId ? ('agent' as const) : ('backenly' as const),
+    // The change a restore request is about, so the inbox can link to it.
+    changeId: r.tool === 'revert_schema_change' ? ((r.toolArgs as { changeId?: string } | null)?.changeId ?? null) : null,
     rowCount: r.rowCount,
     reversible: r.reversible,
     message: r.message,
@@ -166,12 +171,33 @@ export async function decideApproval(input: {
     return { ok: false, status: current, error: `Request is ${current}, not pending` }
   }
 
+  // A restore rewrites production, so approving one takes the same authority
+  // as running one from the console: admin rights on the project, not access.
+  // Declining one is a decision too (it keeps a change that failed its checks),
+  // so it takes the same.
+  if (row.tool === 'revert_schema_change') {
+    const { canAdministerProject } = await import('@/lib/edition/guard')
+    if (!(await canAdministerProject(input.approverUserId, input.projectId))) {
+      return { ok: false, status: 'forbidden', error: 'Only a project admin can decide whether to restore a previous state.' }
+    }
+  }
+
   if (input.decision === 'reject') {
     await prisma.agentApprovalRequest.update({
       where: { id: row.id },
       data: { status: 'rejected', decidedBy: input.approverUserId, decidedAt: new Date() },
     })
     await auditDecision(input, row.tool, row.target, 'rejected')
+    // Declining to restore a change that failed its checks is a decision to
+    // keep it. A no-op for a change that was not waiting on one (an agent
+    // asking to restore a healthy change, say).
+    if (row.tool === 'revert_schema_change') {
+      const changeId = (row.toolArgs as { changeId?: string } | null)?.changeId
+      if (changeId) {
+        const { keepChange } = await import('@/lib/changes/recovery')
+        await keepChange(input.projectId, changeId, input.approverUserId, { via: 'approval' }).catch(() => {})
+      }
+    }
     return { ok: true, status: 'rejected' }
   }
 
@@ -186,6 +212,19 @@ export async function decideApproval(input: {
   }
   await auditDecision(input, row.tool, row.target, 'approved')
 
+  // Every schema change the approved work makes is recorded as the approver's
+  // decision on the agent's request, so the change history can say both.
+  const { withChangeAttribution } = await import('@/lib/changes/ledger')
+  return withChangeAttribution(
+    { source: 'approval', actorUserId: input.approverUserId, apiKeyId: row.apiKeyId },
+    () => executeApproved(input, row),
+  )
+}
+
+async function executeApproved(
+  input: { projectId: string; approvalId: string; approverUserId: string },
+  row: Awaited<ReturnType<typeof prisma.agentApprovalRequest.findFirstOrThrow>>,
+): Promise<{ ok: boolean; status: string; error?: string; resultSummary?: string }> {
   // An exact call runs verbatim. Only requests without one (raised by
   // backend_chat from prose) replay their message through the brain below.
   const exactArgs = row.toolArgs

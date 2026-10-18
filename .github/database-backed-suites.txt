@@ -670,3 +670,27 @@ tests/integration/branch-auth.spec.ts
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
 # Real provisioned projects (encrypted secrets) and real users are the property.
+
+# Governed changes and restoring them: every class of schema change (additive,
+# destructive, rename, retype, data rewrite) is checkpointed, applied and
+# verified; restoring one is lossless or waits for approval of exactly what it
+# would set aside, keeps what it removes for a reapply, refuses a tampered
+# restore point, and a later change to the same table blocks it. Status edges,
+# write-once evidence and append-only events are enforced by the database's own
+# guard trigger. Real catalog, DDL, transactions and triggers are the property.
+tests/integration/change-recovery.spec.ts
+
+# Protected verification and automatic recovery: a change that breaks
+# production without being asked to (RLS off, a CASCADE, a step that did not
+# take effect, a part-way failure) is recovered on the spot when that is
+# lossless; otherwise it waits in the approvals inbox with Backenly's measured
+# impact; a failed recovery stops automation until a person decides; work a
+# restart interrupted is settled from the catalog. Real locks and approvals.
+tests/integration/change-verification-recovery.spec.ts
+
+# An agent can ask for a restore and only a person can approve one: the agent's
+# migration is its governed change, nothing it sends weakens verification,
+# revert_change parks with only Backenly's numbers, the direct tool and the
+# decision routes refuse its key, and approval runs it verified and records
+# whose decision it was. Real MCP route, keys and approvals.
+tests/integration/agent-rollback-approval.spec.ts

@@ -65,7 +65,7 @@ One tool per dashboard section, each with an `action`:
 | `monitoring` | `metrics`, `errors`, `usage`, `incidents`, `request_logs` | https://backenly.com/docs/agents/monitoring.md |
 | `autonomy` | `status`, `findings`, `maintenance`, `set_level` | https://backenly.com/docs/agents/autonomy.md |
 | `webhooks` | `list`, `create`, `update`, `test`, `logs`, `replay`, `rotate_secret`, `triggers`, `trigger_deliveries`, `replay_trigger_delivery`, `rotate_trigger_secret`; `delete` waits for approval | https://backenly.com/docs/agents/webhooks.md |
-| `deploy` | `status`, `history`, `readiness`; `deploy`, `rollback` wait for approval | https://backenly.com/docs/agents/deploy.md |
+| `deploy` | `status`, `history`, `readiness`, `changes`; `deploy`, `rollback`, `revert_change` wait for approval | https://backenly.com/docs/agents/deploy.md |
 | `connect` | `whoami`, `create_api_key`, `list_api_keys`, `set_key_permissions`, `set_env`, `list_env`, `database_credentials`, `connect_frontend`, `list_apps`; `revoke_api_key`, `delete_env`, `disconnect_frontend` wait for approval | https://backenly.com/docs/agents/connect.md |
 <!-- end generated -->
 

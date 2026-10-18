@@ -78,6 +78,9 @@ interface AgentApproval {
   status: string
   tool: string
   target: string
+  /** Absent on responses that predate it: those were all agent requests. */
+  requestedBy?: 'agent' | 'backenly'
+  changeId?: string | null
   rowCount: number | null
   reversible: boolean
   message: string
@@ -320,11 +323,16 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
 
       if (res.ok && j?.success) {
         setRow(approvalId, { phase: 'verified' })
+        const request = agentApprovals.find(a => a.id === approvalId)
+        const restore = request?.tool === 'revert_schema_change'
+        const fromBackenly = request?.requestedBy === 'backenly'
         flashBanner(
-          decision === 'approve' ? 'Agent request executed' : 'Agent request rejected',
+          decision === 'approve'
+            ? (restore ? 'Previous state restored' : 'Agent request executed')
+            : (restore ? 'Restore declined' : 'Agent request rejected'),
           decision === 'approve'
             ? (j?.resultSummary ? String(j.resultSummary).slice(0, 120) : 'the agent sees the result on its next poll')
-            : 'the agent is told not to retry',
+            : fromBackenly ? 'the change stays as it is' : 'the agent is told not to retry',
         )
         const t = setTimeout(async () => {
           await fetchReport(true)
@@ -465,6 +473,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
           {pendingAgents.map(a => (
             <AgentRequestRow
               key={a.id}
+              projectId={projectId}
               request={a}
               state={rowState[a.id] ?? { phase: 'idle' }}
               onApprove={() => decideAgentRequest(a.id, 'approve')}
@@ -565,12 +574,14 @@ function GhostAction({
  * the requester is a machine, so the human is the only judgment in the loop.
  */
 function AgentRequestRow({
+  projectId,
   request: a,
   state,
   onApprove,
   onReject,
   onResetError,
 }: {
+  projectId: string
   request: AgentApproval
   state: RowState
   onApprove: () => void
@@ -578,23 +589,44 @@ function AgentRequestRow({
   onResetError: () => void
 }) {
   const busy = state.phase === 'applying' || state.phase === 'dismissing'
+  // Restoring a change reads as what it does, whoever asked for it: Backenly
+  // raises one when a change fails its checks and recovering it would affect
+  // data written since. The details are on the change itself.
+  const restore = a.tool === 'revert_schema_change'
+  const fromBackenly = a.requestedBy === 'backenly'
+  const message = a.message.length > 180 ? a.message.slice(0, 180) + '…' : a.message
   return (
     <li className="px-5 py-3.5">
       <div className="flex items-start gap-3">
-        <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-violet-400" />
+        <span className={`mt-1.5 size-1.5 shrink-0 rounded-full ${restore ? 'bg-amber-400' : 'bg-violet-400'}`} />
         <div className="min-w-0 flex-1">
           <p className="text-[13px] font-medium text-zinc-100">
-            Your coding agent wants to run <span className="font-mono text-[12px] text-violet-200">{a.tool}</span> on {a.target}
+            {restore ? (
+              a.target
+            ) : (
+              <>Your coding agent wants to run <span className="font-mono text-[12px] text-violet-200">{a.tool}</span> on {a.target}</>
+            )}
           </p>
           <p className="mt-1 break-words text-[12px] leading-relaxed text-zinc-500">
-            “{a.message.length > 180 ? a.message.slice(0, 180) + '…' : a.message}”
+            {restore || fromBackenly ? message : `“${message}”`}
           </p>
           <p className="mt-1.5 font-mono text-[12px] text-zinc-600">
             {a.rowCount !== null && a.rowCount > 0 && (
-              <span className="text-amber-400/90">{a.rowCount} live row{a.rowCount === 1 ? '' : 's'} · </span>
+              <span className="text-amber-400/90">{a.rowCount} row{a.rowCount === 1 ? '' : 's'} affected · </span>
             )}
-            {a.reversible ? 'restore point available' : 'not auto-reversible'}
-            {' · '}MCP · {timeAgo(a.createdAt)}
+            {restore ? 'current state protected first' : a.reversible ? 'restore point available' : 'not auto-reversible'}
+            {' · '}{fromBackenly ? 'Backenly' : 'MCP'} · {timeAgo(a.createdAt)}
+            {restore && a.changeId && (
+              <>
+                {' · '}
+                <a
+                  href={`/app/projects/${projectId}/database?view=changes&change=${encodeURIComponent(a.changeId)}`}
+                  className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200"
+                >
+                  View details
+                </a>
+              </>
+            )}
           </p>
           {state.phase === 'error' && (
             <p className="mt-2 text-[12px] text-rose-300/90">
@@ -614,8 +646,8 @@ function AgentRequestRow({
                 {state.phase === 'dismissing' ? <Loader2 className="size-3 animate-spin" /> : <XCircle className="size-3.5" />}
                 Reject
               </GhostAction>
-              <PrimaryAction onClick={onApprove} busy={state.phase === 'applying'} busyLabel="Running…">
-                <CheckCircle2 className="size-3.5" /> Approve &amp; run
+              <PrimaryAction onClick={onApprove} busy={state.phase === 'applying'} busyLabel={restore ? 'Restoring…' : 'Running…'}>
+                <CheckCircle2 className="size-3.5" /> {restore ? 'Approve restore' : <>Approve &amp; run</>}
               </PrimaryAction>
             </>
           )}

@@ -51,6 +51,9 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, projectId
   if (!result.ok && result.status === 'missing') {
     return NextResponse.json({ success: false, error: result.error }, { status: 404 })
   }
+  if (!result.ok && result.status === 'forbidden') {
+    return NextResponse.json({ success: false, error: result.error }, { status: 403 })
+  }
   if (!result.ok && result.error && result.status !== 'failed') {
     // Already decided / expired — tell the truth, not a 500.
     return NextResponse.json(

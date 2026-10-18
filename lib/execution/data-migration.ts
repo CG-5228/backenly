@@ -340,6 +340,7 @@ export async function executeDataMigration(
 
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
   const backupTables: Record<string, string> = {}
+  let captured: { commit: () => void } | null = null
   const applied: Array<{ op: string; table: string; affectedRows: number }> = []
 
   try {
@@ -376,8 +377,16 @@ export async function executeDataMigration(
         }
         applied.push({ op: op.op, table: op.table, affectedRows })
       }
+
+      // Inside a governed change, keep what this migration produced beside what
+      // it replaced (the checkpoint tables above), in this same transaction, so
+      // restoring the state before it can give original values back to the rows
+      // nobody has changed since and leave every later write alone.
+      const { captureRewrite } = await import('@/lib/changes/preserve')
+      captured = await captureRewrite(tx, projectId, schemaName, rewritesOf(built.map((b) => b.op)), backupTables)
     }, { timeout: 120_000, maxWait: 10_000 })
 
+    captured?.commit()
     return { success: true, applied, backupTables }
   } catch (err: any) {
     // Transaction rolled back — backups created inside it are gone too.
@@ -388,6 +397,19 @@ export async function executeDataMigration(
       error: err?.message ?? String(err),
     }
   }
+}
+
+/** The columns each operation rewrites, by table. */
+function rewritesOf(ops: DataMigrationOp[]): Array<{ table: string; columns: string[] }> {
+  const by = new Map<string, string[]>()
+  for (const op of ops) {
+    const cols =
+      op.op === 'split_column' ? op.targets
+        : op.op === 'merge_columns' ? [op.target]
+          : [op.column]
+    by.set(op.table, [...(by.get(op.table) ?? []), ...cols])
+  }
+  return [...by].map(([table, columns]) => ({ table, columns }))
 }
 
 /**

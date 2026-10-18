@@ -40,7 +40,7 @@
  */
 
 import { prisma } from '@/lib/db'
-import { workspaceSchemaName } from '@/lib/security/workspace-schema'
+import { isChangeVaultSchema, workspaceSchemaName } from '@/lib/security/workspace-schema'
 
 /**
  * A branch schema, and nothing else that merely contains `_br_`.
@@ -259,7 +259,9 @@ export async function unregisteredSchemas(): Promise<string[]> {
       WHERE schema_name LIKE 'workspace\\_%'`,
   )
 
-  return existing.map(e => e.schema_name).filter(s => !registered.has(s))
+  // A change vault is unregistered by design (lib/changes/preserve.ts): it
+  // keeps what a schema change removed and is never served.
+  return existing.map(e => e.schema_name).filter(s => !registered.has(s) && !isChangeVaultSchema(s))
 }
 
 /**
