@@ -270,15 +270,17 @@ export async function POST(request: NextRequest) {
     //
     // The model wrote its summary after the gate told it every stopped call
     // would be queued, so the summary can say so for a call whose request could
-    // not be created. Say plainly that it was not, and that it did not run. When
-    // nothing was queued at all the turn is not an escalation, and not a success.
+    // not be created. Say plainly that it was not, and that it did not run. The
+    // rest of the turn keeps its own answer, what it applied and any code the
+    // brain gave it: only a turn that did nothing else is answered as this
+    // failure, rather than as a success.
     const notQueuedNote = notQueued.length
       ? `Not queued, and not run: ${notQueued.map((q) => `${q.tool} on ${q.target}`).join('; ')}. ` +
         `${notQueued.length === 1 ? 'It needs' : 'They need'} a human's approval, but the request for ` +
         `${notQueued.length === 1 ? 'it' : 'them'} could not be created, so nothing is waiting in the ` +
         `Review Queue. Send the request again.`
       : ''
-    const nothingQueued = notQueued.length > 0 && !escalated
+    const onlyNotQueued = notQueued.length > 0 && !escalated && !result.applied?.length && !result.failureCode
     const summary =
       (escalated
         ? `${result.summary}\n\n⏸ This operation needs a human's approval, so Backenly did not run it. ` +
@@ -296,7 +298,7 @@ export async function POST(request: NextRequest) {
     const budgetPartial = !!result.budgetStopped && (result.applied?.length ?? 0) > 0
 
     const body = {
-      ok: nothingQueued ? false : escalated || budgetPartial ? true : result.success,
+      ok: onlyNotQueued ? false : escalated || budgetPartial ? true : result.success,
       /** Set only on escalation, so an agent can branch without parsing prose. */
       ...(escalated ? { status: 'awaiting_approval' as const } : {}),
       ...(budgetPartial
@@ -325,9 +327,9 @@ export async function POST(request: NextRequest) {
       // `code` is the stable slug, `retryable` says whether an identical retry is
       // worth making, and `applied` lists what DID land — the fact that decides
       // whether retrying is safe or duplicates work.
-      // A turn whose stopped calls could not be queued takes the code the
-      // typed door gives the same failure.
-      ...(nothingQueued
+      // A turn that did nothing but stop calls it could not queue takes the code
+      // the typed door gives the same failure.
+      ...(onlyNotQueued
         ? { code: 'APPROVAL_FAILED', retryable: true }
         : escalated || budgetPartial || result.success ? {} : {
           code: result.failureCode ?? 'BRAIN_FAILED',

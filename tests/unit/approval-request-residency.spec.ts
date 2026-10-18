@@ -7,7 +7,9 @@
  * row keeps the tool, a message naming it, a keyed stand-in for the target and
  * the arguments' shape (lib/mcp/approval-request-bodies.ts):
  *   - a request the region cannot keep is not created, and the chat door says
- *     the call was not queued, whatever the model's summary says;
+ *     the call was not queued, whatever the model's summary says, as it does
+ *     for any project's request it could not create; the rest of the turn
+ *     keeps its own answer;
  *   - the Review Queue, check_approval and the briefing tools show the request
  *     read back from the region, and the row as stored, marked unreadable,
  *     when it cannot be read;
@@ -606,7 +608,7 @@ describe('the chat door', () => {
     rowCount: null,
     reversible: true,
   })
-  async function ask(projectId: string, calls: ReturnType<typeof blocked>[]) {
+  async function ask(projectId: string, calls: ReturnType<typeof blocked>[], turn: Record<string, unknown> = {}) {
     mockKeyProject = projectId
     // The model wrote its summary after the gate told it the call would be queued.
     mockBrainTurn = {
@@ -619,6 +621,7 @@ describe('the chat door', () => {
       tokensUsed: 10,
       applied: [],
       blockedCalls: calls,
+      ...turn,
     }
     const res = await chat(
       new NextRequest('https://backenly.test/api/mcp/chat', {
@@ -675,6 +678,66 @@ describe('the chat door', () => {
     expect(body.summary).toContain('⏸ This operation needs a human')
     expect(body.summary).toContain(`Not queued, and not run: block_end_user on ${blocked('bob@example.com').target}.`)
     expect(rowsOf('p-use1-chat-some').map((row) => row.id)).toEqual([body.approval.id])
+  })
+
+  it('keeps the answer of a turn that applied something, and adds only what was not queued', async () => {
+    mockRegions.set('p-use1-chat-applied', 'us-east-1')
+    mockUnreachable.add('p-use1-chat-applied')
+    let answer: Awaited<ReturnType<typeof ask>>
+    try {
+      answer = await quietly(() =>
+        ask('p-use1-chat-applied', [blocked(EMAIL)], { applied: ['Created table `reports`'], toolsRun: ['create_table', 'finish'] }))
+    } finally {
+      mockUnreachable.delete('p-use1-chat-applied')
+    }
+    const { body } = answer
+    expect(body).toMatchObject({
+      ok: true,
+      applied: ['Created table `reports`'],
+      notQueued: [{ tool: 'block_end_user', target: blocked(EMAIL).target }],
+    })
+    // Neither a retry nor a failure: the table is in place, and only the block is missing.
+    expect(body.code).toBeUndefined()
+    expect(body.retryable).toBeUndefined()
+    expect(body.summary).toContain(`Not queued, and not run: block_end_user on ${blocked(EMAIL).target}.`)
+  })
+
+  it('keeps the code the brain gave its turn, and adds only what was not queued', async () => {
+    mockRegions.set('p-use1-chat-coded', 'us-east-1')
+    mockUnreachable.add('p-use1-chat-coded')
+    let answer: Awaited<ReturnType<typeof ask>>
+    try {
+      answer = await quietly(() =>
+        ask('p-use1-chat-coded', [blocked(EMAIL)], { success: false, failureCode: 'UNVERIFIED', retryable: false }))
+    } finally {
+      mockUnreachable.delete('p-use1-chat-coded')
+    }
+    const { body } = answer
+    expect(body).toMatchObject({
+      ok: false,
+      code: 'UNVERIFIED',
+      retryable: false,
+      notQueued: [{ tool: 'block_end_user', target: blocked(EMAIL).target }],
+    })
+    expect(body.summary).toContain(`Not queued, and not run: block_end_user on ${blocked(EMAIL).target}.`)
+  })
+
+  it('reports a home project\'s calls it could not queue the same way', async () => {
+    mockRegions.set('p-home-chat-down', null)
+    mockRefusedRows.add('p-home-chat-down')
+    let answer: Awaited<ReturnType<typeof ask>>
+    try {
+      answer = await quietly(() => ask('p-home-chat-down', [blocked(EMAIL)]))
+    } finally {
+      mockRefusedRows.delete('p-home-chat-down')
+    }
+    expect(answer.body).toMatchObject({
+      ok: false,
+      code: 'APPROVAL_FAILED',
+      approval: null,
+      notQueued: [{ tool: 'block_end_user', target: blocked(EMAIL).target }],
+    })
+    expect(answer.body.summary).toContain('nothing is waiting in the Review Queue')
   })
 })
 
