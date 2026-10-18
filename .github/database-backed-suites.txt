@@ -1232,3 +1232,13 @@ tests/integration/project-creation-order.spec.ts
 # runtime's. Each server's insert answer is pinned. Real tables behind both
 # servers are the property, so it needs a real Postgres.
 tests/integration/sdk-data-routes.spec.ts
+
+# Workspace SQL after a table's columns change. Prisma reused a prepared
+# statement per pooled connection, and PostgreSQL refuses to run one whose
+# result columns changed (0A000), so after an ALTER TABLE the v1 query and
+# insert routes failed until the connection was replaced. Each case runs a
+# statement, changes the table, and runs it again on the same client: the home
+# and a regional client (a second database), executeWithUserContext, and a
+# route-module function on its own login. What PostgreSQL refuses is the
+# property, so it needs a real Postgres.
+tests/integration/workspace-sql-cached-plan.spec.ts
