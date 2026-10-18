@@ -128,7 +128,16 @@ jest.mock('@/lib/db/prisma', () => {
         }),
         count: jest.fn(async ({ where }: any) => [...mockApprovals.values()].filter((row) => matches(row, where)).length),
       },
-      auditLog: { create: jest.fn(async ({ data }: any) => { mockAudits.push(data); return data }) },
+      auditLog: {
+        create: jest.fn(async ({ data }: any) => { mockAudits.push(data); return data }),
+        // The activity feed's read: a project's rows, newest first.
+        findMany: jest.fn(async ({ where }: any) =>
+          mockAudits
+            .map((row, index) => ({ id: `audit-${index}`, metadata: null, ...row }))
+            .filter((row) => row.projectId === where.projectId)
+            .reverse()),
+      },
+      correctionEvent: { findMany: jest.fn(async () => []) },
       platformNotification: { findFirst: jest.fn(async () => null) },
       // The daily cleanup's other tables, which this suite does not fill.
       webhookLog: none,
@@ -225,6 +234,7 @@ import { pruneRegionalBodies } from '@/lib/data-plane/regional-bodies'
 import { ApprovalRequestNotKept, approvalTargetStandIn } from '@/lib/mcp/approval-request-bodies'
 import { createApprovalRequest, decideApproval, getApprovalForProject, listApprovals } from '@/lib/mcp/approvals'
 import { handleCleanupJob } from '@/lib/queue/worker'
+import { buildActivityFeed } from '@/lib/activity/feed'
 import { listPendingAgentApprovals } from '@/lib/mcp/pending-approvals'
 import { dispatchTool } from '@/lib/ai/brain/tools'
 import { notifyApprovalRequested } from '@/lib/notifications/platform'
@@ -738,6 +748,29 @@ describe('the chat door', () => {
       notQueued: [{ tool: 'block_end_user', target: blocked(EMAIL).target }],
     })
     expect(answer.body.summary).toContain('nothing is waiting in the Review Queue')
+  })
+})
+
+describe('the activity feed', () => {
+  it('says an approved request that ran nothing was not run, never that the agent made a change', async () => {
+    mockRegions.set('p-use1-feed', 'us-east-1')
+    // Approved, but its region has no record of its call.
+    const missing = await createApprovalRequest(blockAlice('p-use1-feed'))
+    mockBodies.delete(`approval_request:${missing.id}`)
+    expect(await quietly(() => approve('p-use1-feed', missing.id))).toMatchObject({ ok: false, status: 'failed' })
+    // Approved, but raised before requests named their exact call.
+    mockApprovals.set('unbound-feed', {
+      id: 'unbound-feed', projectId: 'p-use1-feed', userId: 'u-agent', apiKeyId: 'k1', tool: 'drop_table',
+      message: 'drop the old table', target: 'the `old` table', rowCount: null, reversible: false, toolArgs: null,
+      status: 'pending', decidedBy: null, decidedAt: null, executedAt: null, resultSummary: null,
+      createdAt: new Date(), expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    })
+    expect(await approve('p-use1-feed', 'unbound-feed')).toMatchObject({ ok: false, status: 'failed' })
+
+    const labels = (await buildActivityFeed('p-use1-feed', { limit: 20 })).rows.map((row) => row.label)
+    expect(labels).toContain('An agent request was not run: its exact call could not be read')
+    expect(labels).toContain('An agent request was not run: it named no exact call')
+    expect(labels.filter((label) => label.startsWith('Your coding agent made a change'))).toEqual([])
   })
 })
 
