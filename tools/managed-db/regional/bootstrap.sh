@@ -174,7 +174,9 @@ step regional-bodies "$ROOT/scripts/sql/regional-bodies.sql"
 # 5. The region's copy of what authorizes its projects' requests, delivered
 #    from the home region (lib/auth-projection/deliver.ts).
 step auth-projection "$ROOT/scripts/sql/auth-projection.sql"
-# 6. Direct database access and its two DDL-capture event triggers.
+# 6. Direct database access and its two DDL-capture event triggers. Each apply
+#    also gives the backup role read on every workspace that already exists,
+#    which verify.sql then requires (the file's section 7).
 step direct-access "$ROOT/scripts/setup-direct-access.sql"
 # 7. Extensions the data plane and its probes use.
 step extensions "$HERE/sql/extensions.sql"
