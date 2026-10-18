@@ -200,8 +200,8 @@ export function connectionString(role: ManagedRole, password: string, db: Launch
 /** One AWS CLI call: its arguments, and what it reads on standard input. Resolves to stdout. */
 export type Aws = (args: string[], stdin?: string) => Promise<string>
 
-/** The real AWS CLI, in one region, answering JSON. */
-export function awsCli(region: string): Aws {
+/** The real AWS CLI, in one region, answering JSON. `env` is the CLI's environment (PATH, AWS_PROFILE). */
+export function awsCli(region: string, env: NodeJS.ProcessEnv = process.env): Aws {
   return (args, stdin) =>
     new Promise((resolve, reject) => {
       const full = [...args, '--region', region, '--output', 'json']
@@ -211,8 +211,8 @@ export function awsCli(region: string): Aws {
       // passes only through memory and the kernel, never a file or an argument.
       const child =
         process.platform === 'win32'
-          ? spawn('aws', full, { stdio: ['pipe', 'pipe', 'pipe'] })
-          : spawn('/bin/sh', ['-c', 'cat | exec aws "$@"', 'aws', ...full], { stdio: ['pipe', 'pipe', 'pipe'] })
+          ? spawn('aws', full, { stdio: ['pipe', 'pipe', 'pipe'], env })
+          : spawn('/bin/sh', ['-c', 'cat | exec aws "$@"', 'aws', ...full], { stdio: ['pipe', 'pipe', 'pipe'], env })
       let out = ''
       let err = ''
       child.stdout.on('data', (d) => (out += d))

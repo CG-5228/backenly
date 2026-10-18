@@ -448,13 +448,13 @@ describe('the AWS CLI it calls', () => {
   unix('hands the CLI a standard input it can open as /dev/stdin, without an argument or a file', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-aws-'))
     fs.writeFileSync(path.join(dir, 'aws'), '#!/bin/sh\ncat /dev/stdin\nprintf " args:%s" "$*"\n', { mode: 0o755 })
-    const saved = process.env.PATH
-    process.env.PATH = `${dir}${path.delimiter}${saved}`
+    // Passed as the CLI's environment: jest's sandboxed process.env does not
+    // reach a child, which would then find a real `aws` on the runner instead.
+    const env = { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` }
     try {
-      const out = await awsCli(REGION)(['secretsmanager', 'put-secret-value', '--secret-string', 'file:///dev/stdin'], 'kept-off-the-process-list')
+      const out = await awsCli(REGION, env)(['secretsmanager', 'put-secret-value', '--secret-string', 'file:///dev/stdin'], 'kept-off-the-process-list')
       expect(out).toBe(`kept-off-the-process-list args:secretsmanager put-secret-value --secret-string file:///dev/stdin --region ${REGION} --output json`)
     } finally {
-      process.env.PATH = saved
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
