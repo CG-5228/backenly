@@ -246,7 +246,7 @@ describe('failure recovery', () => {
     expect(r.body.applied).toEqual([])
     expect(r.body.rolledBack.map((a: any) => a.statement)).toEqual(['CREATE TABLE partial_first (x text)'])
     expect(r.body.remaining).toEqual(['CREATE TABLE partial_never (z text)'])
-    expect(r.body.change).toMatchObject({ status: 'auto_reverted' })
+    expect(r.body.change).toMatchObject({ status: 'recovered' })
     expect(r.body.hint).toMatch(/Nothing was applied/)
   }, 120_000)
 
