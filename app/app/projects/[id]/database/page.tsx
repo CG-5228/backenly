@@ -1246,7 +1246,10 @@ export default function ProjectDatabasePage() {
           Tables and Schema read the workspace schema; SQL, Changes, Types,
           Extensions and Snapshots are project-wide and need no table. */}
       {selectedSchema && (
-        <KitTabs className="flex-shrink-0 px-3 sm:px-4">
+        // contain:inline-size: seven tabs in one row are wider than a phone,
+        // and as min-content they widened the whole console column past the
+        // screen. Contained, the row scrolls sideways as overflow-x-auto intends.
+        <KitTabs className="flex-shrink-0 px-3 sm:px-4 [contain:inline-size]">
           {DATABASE_VIEWS.map((view) => {
             const Icon = view.icon
             return (

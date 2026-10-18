@@ -152,7 +152,7 @@ describe('a change that breaks production, recovered automatically', () => {
     const { changes } = await listChanges(projectId)
     const entry = changes.find((c) => c.id === change!.id)!
     expect(entry.outcome.state).toBe('recovered')
-    expect(entry.outcome.note).toMatch(/row-level security turned off on secrets/)
+    expect(entry.outcome.note).toBe('Row-level security turned off on secrets')
   })
 
   it('the same thing from a person in the dashboard is their decision, and stays', async () => {

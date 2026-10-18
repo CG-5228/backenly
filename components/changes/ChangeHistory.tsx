@@ -227,7 +227,7 @@ export function ChangeHistory({ projectId }: { projectId: string }) {
                     onClick={() => setDetailsFor(c.id)}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setDetailsFor(c.id) } }}
                     aria-label={`Change #${c.seq}: ${c.summary}. ${s.label}`}
-                    className={`grid cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-4 py-3 pr-12 transition-colors hover:bg-white/[0.025] sm:px-5 sm:pr-14 ${FOCUS_INSET}`}
+                    className={`grid cursor-pointer grid-cols-[2.75rem_minmax(0,1fr)_auto] items-start gap-x-2 px-4 py-3 pr-12 transition-colors hover:bg-white/[0.025] sm:px-5 sm:pr-14 ${FOCUS_INSET}`}
                   >
                     <span className="pt-px font-mono text-[12.5px] tabular-nums text-zinc-500">#{c.seq}</span>
                     <span className="min-w-0">

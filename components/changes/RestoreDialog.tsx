@@ -23,6 +23,19 @@ import { KitButton, KitModal, KitNote, Skeleton } from '@/components/inspector/k
 import type { ChangeSummary } from '@/lib/changes/history'
 import type { RecoveryPreview } from '@/lib/changes/recovery'
 
+/** What each effect of a restore on data written since is, in a few words. */
+const EFFECT: Record<string, string> = {
+  rows_set_aside: 'Rows set aside',
+  values_set_aside: 'Values set aside',
+  values_converted: 'Values converted back',
+  restore_incomplete: 'Comes back without its data',
+  unknown_since: 'New rows cannot be told apart',
+  writes_kept: 'Changed since, kept as they are',
+  rows_without_value: 'Written since, left empty',
+}
+/** The effects whose count is a number of rows or values. */
+const COUNTED = new Set(['rows_set_aside', 'values_set_aside', 'values_converted', 'writes_kept', 'rows_without_value'])
+
 type Phase =
   | { kind: 'checking' }
   | { kind: 'ready'; preview: RecoveryPreview }
@@ -132,6 +145,7 @@ export function RestoreDialog({
 
   const affected = preview?.impact?.items.filter((i) => i.needsApproval) ?? []
   const keptSince = preview?.impact?.items.filter((i) => !i.needsApproval) ?? []
+  const affectedRows = [...affected, ...keptSince]
 
   const footer =
     phase.kind === 'done' ? (
@@ -199,8 +213,7 @@ export function RestoreDialog({
 
           {safety === 'needs_approval' && preview?.reason && (
             <KitNote tone="warn" icon={AlertTriangle}>
-              <span className="[overflow-wrap:anywhere]">{preview.reason}</span>{' '}
-              Anything set aside is kept with this restore, so reapplying the change brings it back.
+              <span className="[overflow-wrap:anywhere]">{preview.reason}</span>
             </KitNote>
           )}
 
@@ -216,17 +229,27 @@ export function RestoreDialog({
                 Review affected data
               </button>
               {showAffected && (
-                <ul className="mt-2 space-y-1.5 border-l border-white/[0.08] pl-3">
-                  {affected.map((i, n) => (
-                    <li key={`a${n}`} className="text-[12.5px] leading-[18px] text-zinc-300 [overflow-wrap:anywhere]">{i.detail}</li>
-                  ))}
-                  {preview?.unrecoverable.map((u, n) => (
-                    <li key={`u${n}`} className="text-[12.5px] leading-[18px] text-zinc-300 [overflow-wrap:anywhere]">{u}</li>
-                  ))}
-                  {keptSince.map((i, n) => (
-                    <li key={`k${n}`} className="text-[12.5px] leading-[18px] text-zinc-500 [overflow-wrap:anywhere]">{i.detail}</li>
-                  ))}
-                </ul>
+                <div className="mt-2 overflow-hidden rounded-[8px] border border-white/[0.07]">
+                  <ul className="divide-y divide-white/[0.05]">
+                    {affectedRows.map((i, n) => (
+                      <li key={n} className="flex items-baseline gap-3 px-3 py-2 text-[12.5px]">
+                        <span className={`w-[11rem] flex-shrink-0 ${i.needsApproval ? 'text-zinc-200' : 'text-zinc-500'}`}>{EFFECT[i.effect] ?? i.effect}</span>
+                        <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-zinc-400" title={`${i.table}${i.column ? `.${i.column}` : ''}`}>
+                          {i.table}{i.column ? `.${i.column}` : ''}
+                        </span>
+                        {COUNTED.has(i.effect) && (
+                          <span className="flex-shrink-0 tabular-nums text-zinc-300">{i.count.toLocaleString('en-US')}</span>
+                        )}
+                      </li>
+                    ))}
+                    {preview?.unrecoverable.map((u, n) => (
+                      <li key={`u${n}`} className="px-3 py-2 text-[12.5px] leading-[18px] text-zinc-300 [overflow-wrap:anywhere]">{u}</li>
+                    ))}
+                  </ul>
+                  <p className="border-t border-white/[0.05] bg-white/[0.015] px-3 py-2 text-[12px] leading-[17px] text-zinc-500">
+                    Nothing is deleted. What is set aside is kept with this restore; reapplying the change brings it back.
+                  </p>
+                </div>
               )}
             </div>
           )}

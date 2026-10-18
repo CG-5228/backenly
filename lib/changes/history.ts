@@ -144,7 +144,9 @@ function footprintOf(r: Row): TableChange[] {
 function failingNote(r: Row): string | null {
   const v = r.verification as unknown as ChangeVerification | null
   const failing = v?.checks.find((c) => c.outcome === 'contradicted')
-  if (failing) return `${failing.label}: ${failing.detail}`
+  // The finding, not the check's name: "Row-level security kept: row-level
+  // security turned off on invoices" contradicts itself on one line.
+  if (failing) return failing.detail.charAt(0).toUpperCase() + failing.detail.slice(1)
   if (r.status === 'partially_applied' || r.error) return r.error ? r.error.split('\n')[0].slice(0, 300) : null
   return null
 }
