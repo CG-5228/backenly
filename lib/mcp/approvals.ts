@@ -33,6 +33,7 @@ import { prisma } from '@/lib/db/prisma'
 import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
+import { withHeldActions } from '@/lib/operational-memory/held-action-targets'
 
 export const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -230,10 +231,15 @@ export async function getApprovalForProject(projectId: string, id: string) {
  * an id the agent can poll instead of vanishing from its point of view.
  */
 export async function getParkedActionForProject(projectId: string, id: string) {
-  const row = await prisma.healthFinding.findFirst({
+  const found = await prisma.healthFinding.findFirst({
     where: { id, projectId, type: 'ai_action_pending' },
   })
-  if (!row) return null
+  if (!found) return null
+  // A regional project's parked action keeps its target in its region, read
+  // back for the agent that asked for it; when the region cannot be read the
+  // target is not given, rather than its stand-in
+  // (lib/operational-memory/held-action-targets.ts).
+  const [row] = await withHeldActions(projectId, [found])
   const details = (row.details as Record<string, unknown> | null) ?? {}
   const statusMap: Record<string, string> = {
     pending_approval: 'pending',
@@ -252,7 +258,7 @@ export async function getParkedActionForProject(projectId: string, id: string) {
         : typeof details.title === 'string'
           ? details.title
           : row.type,
-    target: typeof details.location === 'string' ? details.location : null,
+    target: typeof details.location === 'string' && details.keptInRegion !== true ? details.location : null,
     createdAt: row.detectedAt.toISOString(),
     resultSummary: null,
   }

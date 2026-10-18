@@ -22,7 +22,8 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
-import { argumentShape } from '@/lib/data-plane/residency'
+import { argumentShape, quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
+import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
 import { captureSchemaSnapshot, rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
 import {
   withSqlCapture,
@@ -406,6 +407,8 @@ export async function executeApprovedFix(
   verification?: FixVerification
   /** Whether other guarantees were compared before and after the fix. */
   regressionCheck?: FixOutcome['regressionCheck']
+  /** Nothing ran because the project's region, which keeps what it replays, could not be reached. */
+  regionUnavailable?: boolean
 }> {
   const finding = await prisma.healthFinding.findUnique({ where: { id: findingId } })
   if (!finding) return { success: false, message: 'Finding not found.' }
@@ -416,7 +419,19 @@ export async function executeApprovedFix(
   // correct snapshot/rollback treatment via their canonical base.
   const baseType = (normalizeFindingType(finding.type, details)?.base ?? type) as FindingType
 
-  const fixAction = buildFixAction(finding.type, details)
+  // A held action replays exactly the target and arguments it was held with,
+  // which a project kept in another region keeps there
+  // (lib/operational-memory/held-action-targets.ts). They are read for the
+  // replay only, and nothing runs when they cannot be read.
+  let replayDetails: Record<string, unknown>
+  try {
+    replayDetails = await heldActionForReplay(projectId, findingId, details)
+  } catch (err) {
+    if (!(err instanceof HeldActionUnreadable)) throw err
+    return { success: false, message: err.message, regionUnavailable: err.regionUnreachable }
+  }
+
+  const fixAction = buildFixAction(finding.type, replayDetails)
   if (!fixAction) {
     // Friendly fallback for findings that require user input (e.g. orphan tables,
     // credential rotation). Surfaced verbatim to the dashboard instead of a
@@ -673,16 +688,19 @@ export async function executeApprovedFix(
 
   // What the record keeps of the call. A held action's arguments are its
   // caller's own values, a secret among them (SET_ENV_VAR), which its finding
-  // keeps sealed: the record keeps their shape. Undo reads none of them
-  // (revertAutoFix).
+  // keeps sealed or in the project's region: the record keeps their shape, in
+  // every region. Undo reads none of them (revertAutoFix). For a project kept
+  // in another region no repair's arguments, result or error text is kept here
+  // either (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
   const recordedAction =
-    finding.type === 'ai_action_pending'
+    finding.type === 'ai_action_pending' || !quote
       ? { action: fixAction.action, params: argumentShape(fixAction.params as Record<string, unknown>) }
       : fixAction
 
   const rollbackData: Record<string, unknown> = {
     fixAction: recordedAction,
-    fixResult: { message: result.message, data: result.data },
+    fixResult: quote ? { message: result.message, data: result.data } : { success: result.success },
     // The statements the executor actually sent, captured at the driver. This
     // is the half of the audit trail that used to be missing: the change was
     // derivable by diffing two schema snapshots, but the statement itself was
@@ -699,7 +717,7 @@ export async function executeApprovedFix(
     // Whether other guarantees were compared before and after. 'unavailable'
     // means nobody looked, so no claim of "nothing else broke" may be made.
     regressionCheck,
-    ...(baselineError ? { baselineError } : {}),
+    ...(baselineError ? { baselineError: quotedError(baselineError, quote) } : {}),
   }
 
   return {
