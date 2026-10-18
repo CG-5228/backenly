@@ -1248,3 +1248,10 @@ tests/integration/change-classes-executor.spec.ts
 # result fails verification or the replay fails part-way, and the branch stays
 # open. Real branch schemas, replay and approvals.
 tests/integration/branch-merge-governed.spec.ts
+
+# A restore point that cannot bring everything back says so: kept data lost
+# outside Backenly makes a restore need a person who approves exactly what comes
+# back empty, never a lossless one; retention purges a vault only past the
+# window and the grace week, marks the record, and touches nothing younger, the
+# workspace or another project. Real schemas, vaults and purges.
+tests/integration/change-restore-point-unavailable.spec.ts
