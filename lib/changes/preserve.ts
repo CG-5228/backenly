@@ -33,14 +33,13 @@
 import type { PoolClient } from 'pg'
 import { currentChange, ensureVault, recordStatement, type OpenChange } from './ledger'
 import { tableChecksum } from './integrity'
-import { qualified, quoteIdent as q, vaultTableName } from './names'
+import { AFTER_COLUMN, qualified, quoteIdent as q, vaultTableName } from './names'
 import type { PreservedEntry } from './types'
+
+export { AFTER_COLUMN }
 
 /** How long a destructive step waits for its table before giving up. */
 const LOCK_TIMEOUT = '5s'
-
-/** The column in a vault table holding the value a change produced. */
-export const AFTER_COLUMN = '__bkn_after'
 
 async function inTransaction<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
   await client.query('BEGIN')

@@ -147,7 +147,7 @@ export async function measureImpact(db: Runner, input: ImpactInput): Promise<Imp
       if (before.has(k) || ac.generated) continue
       const rewritten = findEntry(preserved, A.name, ac.name, 'rewritten')
       let where: string
-      if (rewritten && rewritten.keyColumns.length > 0) {
+      if (rewritten && rewritten.keyColumns.length > 0 && rewritten.afterColumn) {
         const match = rewritten.keyColumns.map((kc) => `a.${q(kc)} = t.${q(kc)}`).join(' AND ')
         where = `t.${q(ac.name)} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ${qualified(rewritten.vault, rewritten.vaultTable)} a WHERE ${match} AND a.${q(rewritten.afterColumn!)} IS NOT DISTINCT FROM t.${q(ac.name)})`
       } else if (!ac.identity && isConstantDefault(ac.default)) {
@@ -251,8 +251,9 @@ async function measureRewritten(
   const since = Number(r.since)
   const lost = Number(r.lossy)
   if (entry && !keyed) {
-    add('unknown_since', table, now.name, 1,
-      `${table}.${now.name}'s values from before this change are kept, but ${table} has no primary key to tell rows written since from rows the change left.`)
+    add('unknown_since', table, now.name, 1, entry.keyColumns.length === 0
+      ? `${table}.${now.name}'s values from before this change are kept, but ${table} has no primary key to tell rows written since from rows the change left.`
+      : `${table}.${now.name}'s values from before this change are kept, but not what the change left on each row, so rows written since cannot be told apart.`)
     return
   }
   if (!entry && since > 0) {
@@ -267,8 +268,9 @@ async function measureRewritten(
     add('values_converted', table, now.name, lost,
       `${plural(lost, 'value')} in ${table}.${now.name} written since this change would change when converted back to ${then.type}. The current values would be kept in a recovery snapshot.`)
   }
-  add('writes_kept', table, now.name, since - lost,
-    `${plural(since - lost, 'row')} in ${table} changed since this change keep their current ${now.name}; the rest get their original value back.`)
+  const kept = since - lost
+  add('writes_kept', table, now.name, kept,
+    `${plural(kept, 'row')} in ${table} changed since this change ${kept === 1 ? 'keeps its' : 'keep their'} current ${now.name}; the rest get their original value back.`)
 }
 
 function findEntry(

@@ -37,7 +37,7 @@
 import type { CatalogSnapshot, ColumnState, ConstraintState, ObjectState, PolicyState, TableState, TriggerState } from './catalog'
 import { sameObject, sameTable } from './catalog'
 import { columnKey, describeTableChange } from './diff'
-import { literal, qualified, quoteIdent as q, vaultTableName } from './names'
+import { AFTER_COLUMN, literal, qualified, quoteIdent as q, vaultTableName } from './names'
 import type { PreservedEntry, TableChange } from './types'
 
 export interface PlannedStep {
@@ -115,6 +115,8 @@ export interface PlanInput {
  *     free before the original is renamed back into it;
  *   - which rows still hold the change's values is recorded before any type is
  *     converted back, and the original values go back after it;
+ *   - what the restore leaves in a column it converts or fills is recorded once
+ *     every value is in place, so reapplying can tell it from later writes;
  *   - columns get their values before NOT NULL is asserted on them;
  *   - types come back before the columns that use them, functions before the
  *     triggers and policies that call them, views after everything they read;
@@ -141,6 +143,7 @@ export const PHASE = {
   RESTORE_COLUMNS: 10,
   ALTER_COLUMNS: 11,
   RESTORE_VALUES: 11.5,
+  AFTER_IMAGES: 11.8,
   DROP_ADDED_FUNCTIONS: 11.9,
   NOT_NULL: 12,
   IDENTITY: 12.5,
@@ -169,6 +172,15 @@ export function planRestore(input: PlanInput): RestorePlan {
   const add = (phase: number, sql: string, describe: string) => plan.steps.push({ phase, sql, describe })
   const tableEntries = footprint.filter((c) => !c.object)
   const objectEntries = footprint.filter((c) => !!c.object)
+  // Names inside this restore's vault: an archived table keeps its own name
+  // there, and every copy of values gets one no other copy has.
+  const vaultNames = new Set(tableEntries.flatMap((c) => (c.kind === 'added' || c.kind === 'replaced') && c.after ? [c.after] : []))
+  const vaultName = (...parts: string[]) => {
+    let name = vaultTableName(...parts)
+    for (let i = 2; vaultNames.has(name); i++) name = vaultTableName(...parts, String(i))
+    vaultNames.add(name)
+    return name
+  }
 
   // ── 1. Does everything still look the way the change left it? ──────────────
   const currentNames = new Set(tableEntries.map((c) => c.after).filter((n): n is string => !!n))
@@ -408,7 +420,7 @@ export function planRestore(input: PlanInput): RestorePlan {
     for (const [k, ac] of aCols) {
       if (bCols.has(k)) continue
       const keys = pk.filter((col) => col !== ac.name)
-      const vt = vaultTableName(cur, ac.name)
+      const vt = vaultName(cur, ac.name)
       const select = keys.length > 0 ? [...keys, ac.name].map(q).join(', ') : '*'
       add(PHASE.ARCHIVE_COLUMNS,
         `CREATE TABLE ${qualified(vault, vt)} AS SELECT ${select} FROM ${T(cur)} WHERE ${q(ac.name)} IS NOT NULL`,
@@ -454,6 +466,14 @@ export function planRestore(input: PlanInput): RestorePlan {
           describe: `Every kept value of ${fin}.${bc.name} is back on its row.`,
         })
         plan.restores.push({ table: fin, column: bc.name, from: 'vault', kept: { vault: kept.vault, vaultTable: kept.vaultTable } })
+        // What this restore put back, so reapplying the change sets aside only
+        // the values written after it, not these.
+        const it = vaultName(fin, bc.name, 'restored')
+        add(PHASE.AFTER_IMAGES,
+          `CREATE TABLE ${qualified(vault, it)} AS SELECT ${kept.keyColumns.map((kc) => `t.${q(kc)}`).join(', ')}, t.${q(bc.name)} AS ${q(AFTER_COLUMN)} ` +
+          `FROM ${T(fin)} AS t WHERE t.${q(bc.name)} IS NOT NULL`,
+          `Record the values of ${fin}.${bc.name} this restore put back, so reapplying the change can tell them from values written after it.`)
+        plan.archives.push({ kind: 'column', table: fin, column: bc.name, reason: 'rewritten', keyColumns: kept.keyColumns, vault, vaultTable: it, afterColumn: AFTER_COLUMN, rows: null })
       } else {
         plan.restores.push({ table: fin, column: bc.name, from: 'structure' })
         plan.unrecoverable.push(
@@ -502,21 +522,28 @@ export function planRestore(input: PlanInput): RestorePlan {
       } else if (bc.generated && ac.generated !== bc.generated) {
         plan.conflicts.push({ table: fin, reason: `${fin}.${bc.name}'s generation expression cannot be restored in place by PostgreSQL` })
       }
+      // Every current value, keyed, before any is converted or put back (values
+      // converting back may not survive the conversion), and beside each, once
+      // every value is in place, the value this restore leaves. Reapplying the
+      // change then puts these back on the rows nobody has changed since, as
+      // this restore does for the change.
+      const keys = imaged?.keyColumns.length ? imaged.keyColumns : pk.filter((c) => c !== ac.name)
+      if ((typeChanged || keep) && keys.length > 0) {
+        const vt = vaultName(cur, ac.name, 'before_restore')
+        add(PHASE.KEEP_CONVERTED,
+          `CREATE TABLE ${qualified(vault, vt)} AS SELECT ${keys.map((kc) => `t.${q(kc)}`).join(', ')}, t.${q(ac.name)} AS ${col} FROM ${T(cur)} AS t`,
+          `Keep every current value of ${cur}.${ac.name} in the recovery snapshot before it is ${typeChanged ? 'converted' : 'put'} back.`)
+        add(PHASE.AFTER_IMAGES, `ALTER TABLE ${qualified(vault, vt)} ADD COLUMN ${q(AFTER_COLUMN)} ${bc.type}`,
+          `Make room beside them for the values this restore leaves in ${fin}.${bc.name}.`)
+        add(PHASE.AFTER_IMAGES,
+          `UPDATE ${qualified(vault, vt)} AS v SET ${q(AFTER_COLUMN)} = t.${col} FROM ${T(fin)} AS t WHERE ${keys.map((kc) => `v.${q(kc)} = t.${q(kc)}`).join(' AND ')}`,
+          `Record the values this restore leaves in ${fin}.${bc.name}, so reapplying the change can tell them from values written after it.`)
+        plan.archives.push({
+          kind: 'column', table: fin, column: bc.name, reason: typeChanged ? 'retyped' : 'rewritten',
+          keyColumns: keys, vault, vaultTable: vt, afterColumn: AFTER_COLUMN, rows: null,
+        })
+      }
       if (typeChanged) {
-        // Values converting back may not survive the conversion: the current
-        // ones are kept first, for every row that will not get its original.
-        const keys = (imaged?.keyColumns.length ? imaged.keyColumns : pk.filter((c) => c !== ac.name))
-        if (keys.length > 0) {
-          const vt = vaultTableName(cur, ac.name, 'before_restore')
-          const notRestored = keep
-            ? ` AND NOT EXISTS (SELECT 1 FROM ${q(keep)} k WHERE ${keys.map((kc) => `k.${q(kc)} = t.${q(kc)}`).join(' AND ')})`
-            : ''
-          add(PHASE.KEEP_CONVERTED,
-            `CREATE TABLE ${qualified(vault, vt)} AS SELECT ${keys.map((kc) => `t.${q(kc)}`).join(', ')}, t.${q(ac.name)} ` +
-            `FROM ${T(cur)} AS t WHERE t.${q(ac.name)} IS NOT NULL${notRestored}`,
-            `Keep the current values of ${cur}.${ac.name} that are converted back, in the recovery snapshot.`)
-          plan.archives.push({ kind: 'column', table: cur, column: ac.name, reason: 'retyped', keyColumns: keys, vault, vaultTable: vt, rows: null })
-        }
         if (ac.default !== null) {
           add(PHASE.ALTER_COLUMNS, `ALTER TABLE ${T(fin)} ALTER COLUMN ${col} DROP DEFAULT`, `Lift ${bc.name}'s default while its type changes.`)
         }
@@ -546,7 +573,9 @@ export function planRestore(input: PlanInput): RestorePlan {
         })
         plan.restores.push({ table: fin, column: bc.name, from: 'vault', kept: { vault: imaged.vault, vaultTable: imaged.vaultTable } })
       } else if (imaged && typeChanged) {
-        plan.unrecoverable.push(`${fin}.${bc.name}: its original values are kept, but ${fin} has no primary key to put them back by; the column is converted back instead.`)
+        plan.unrecoverable.push(imaged.keyColumns.length === 0
+          ? `${fin}.${bc.name}: its original values are kept, but ${fin} has no primary key to put them back by; the column is converted back instead.`
+          : `${fin}.${bc.name}: its original values are kept, but not which rows were written since; the column is converted back instead.`)
       }
       if (bc.default !== ac.default || (typeChanged && ac.default !== null)) {
         if (bc.default !== null) {

@@ -170,6 +170,14 @@ recorded change with its own checkpoint, so the state it replaces is protected
 first; **Reapply this change** restores that checkpoint. Internally that is a
 recovery of a recovery; the console never presents it as one.
 
+A restore keeps what a reapply needs the way a change does. Every column it
+converts back or puts original values on gets a keyed image in the restore's
+vault: each value before the restore and, beside it, the value the restore
+left. A column it brings back from a vault gets an image of the values it put
+there. Reapplying then puts the change's values back only on rows nobody has
+touched since the restore, and sets aside, for a person to approve, only what
+was written after it, never the values the restore itself put back.
+
 ## Concurrency and idempotency
 
 - One change at a time per project: a PostgreSQL advisory lock held from the

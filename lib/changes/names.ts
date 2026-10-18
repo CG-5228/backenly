@@ -19,6 +19,9 @@
 import { createHash } from 'crypto'
 import { assertValidProjectId, isChangeVaultSchema, quoteIdent } from '@/lib/security/workspace-schema'
 
+/** The column in a vault table holding the value a change produced. */
+export const AFTER_COLUMN = '__bkn_after'
+
 /** PostgreSQL truncates identifiers beyond this many bytes. */
 export const MAX_IDENT_BYTES = 63
 

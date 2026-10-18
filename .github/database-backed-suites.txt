@@ -1235,3 +1235,16 @@ tests/integration/change-verification-recovery.spec.ts
 # decision routes refuse its key, and approval runs it verified and records
 # whose decision it was. Real MCP route, keys and approvals.
 tests/integration/agent-rollback-approval.spec.ts
+
+# Every class of schema change through the real executor (apply_migration's
+# parser, the typed actions, the dashboard's column delete, an approved drop):
+# each is one governed change, its restore puts back the exact prior structure
+# with every row, and reapplying brings it back exactly, counting only what
+# was written after the restore. Real catalog, helper functions and triggers.
+tests/integration/change-classes-executor.spec.ts
+
+# A branch merge is one governed change: checkpointed, verified, restorable
+# with what was written since kept, recovered automatically when the merged
+# result fails verification or the replay fails part-way, and the branch stays
+# open. Real branch schemas, replay and approvals.
+tests/integration/branch-merge-governed.spec.ts

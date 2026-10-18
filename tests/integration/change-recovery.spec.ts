@@ -437,6 +437,34 @@ describe('a data migration that rewrote values', () => {
     expect(out.ok).toBe(true)
     expect((await rows(`SELECT state FROM ${T('tickets')} ORDER BY id`)).map((r) => r.state)).toEqual(['escalated', 'Open', 'closed', 'CLOSED'])
   })
+
+  it('the restore records the values it put back, as a rewrite of its own', async () => {
+    const recoveryId = (await record(changeId)).recoveredById!
+    const rec = await record(recoveryId)
+    expect(rec.risk).toBe('data_rewrite')
+    expect((rec.footprint as any[]).some((c) => c.after === 'tickets' && c.details.some((d: string) => /values rewritten in state/.test(d)))).toBe(true)
+    const image = ((rec.preserved as any).entries as any[]).find((e) => e.table === 'tickets' && e.column === 'state')
+    expect(image).toMatchObject({ kind: 'column', reason: 'rewritten', keyColumns: ['id'], afterColumn: '__bkn_after', rows: 4 })
+  })
+
+  it('reapplying brings the rewrite back on the rows nobody changed since the restore, and keeps the one that was', async () => {
+    const recoveryId = (await record(changeId)).recoveredById!
+    await ddl(`UPDATE ${T('tickets')} SET state = 'reopened' WHERE id = 2`)
+    const p = (await previewRecovery(projectId, recoveryId))!
+    expect({ action: p.action, safety: p.safety }).toEqual({ action: 'reapply', safety: 'lossless' })
+    expect(p.impact!.items.map((i) => [i.effect, i.table, i.column, i.count, i.needsApproval])).toEqual([['writes_kept', 'tickets', 'state', 1, false]])
+    const out = await restore(recoveryId, p.acknowledgement)
+    expect(out).toMatchObject({ ok: true })
+    expect((await rows(`SELECT state FROM ${T('tickets')} ORDER BY id`)).map((r) => r.state)).toEqual(['escalated', 'reopened', 'closed', 'closed'])
+    expect((await record(changeId)).status).toBe('healthy')
+  })
+
+  it('restoring it again puts back what was there before it, keeping every write since', async () => {
+    const p = (await previewRecovery(projectId, changeId))!
+    expect(p.safety).toBe('lossless')
+    expect((await restore(changeId, p.acknowledgement)).ok).toBe(true)
+    expect((await rows(`SELECT state FROM ${T('tickets')} ORDER BY id`)).map((r) => r.state)).toEqual(['escalated', 'reopened', 'closed', 'CLOSED'])
+  })
 })
 
 // ── Ordering ─────────────────────────────────────────────────────────────────
