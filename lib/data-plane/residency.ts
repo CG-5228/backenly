@@ -65,6 +65,8 @@ const FINDING_ERROR_TEXTS: Array<{ path: [string] | [string, string]; what: stri
   { path: ['fixError'], what: 'repair failed' },
   { path: ['escalation', 'reason'], what: 'repair escalated' },
   { path: ['appliedUnverified', 'verifierError'], what: 'repair check failed' },
+  // A proposal run's message (lib/autonomy/ai-proposals.ts), when a row carrying it comes through here.
+  { path: ['appliedUnverified', 'reason'], what: 'repair check failed' },
   { path: ['rollbackData', 'baselineError'], what: 'repair baseline failed' },
 ]
 

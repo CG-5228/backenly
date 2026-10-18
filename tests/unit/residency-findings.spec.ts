@@ -341,15 +341,24 @@ describe('a failed repair on a finding', () => {
     const details = await findingDetailsKeptHere('p-use1-texts', 'missing_fk_index', {
       tableName: 'orders',
       escalation: { reason: ROW_ECHO, retryCount: 1 },
-      appliedUnverified: { verifierError: ROW_ECHO, statements: [] },
+      appliedUnverified: { verifierError: ROW_ECHO, reason: `The fix ran, but the check could not complete: ${ROW_ECHO}.`, statements: [] },
       rollbackData: { baselineError: ROW_ECHO, rollbackFormat: 2 },
     })
     expect(details).toEqual({
       tableName: 'orders',
       escalation: { reason: NOT_QUOTED, retryCount: 1 },
-      appliedUnverified: { verifierError: NOT_QUOTED, statements: [] },
+      appliedUnverified: { verifierError: NOT_QUOTED, reason: NOT_QUOTED, statements: [] },
       rollbackData: { baselineError: NOT_QUOTED, rollbackFormat: 2 },
     })
+  })
+
+  it('keeps a home finding\'s error texts as they are', async () => {
+    mockRegions.set('p-home-texts', null)
+    const kept = {
+      tableName: 'orders',
+      appliedUnverified: { verifierError: ROW_ECHO, reason: `The fix ran, but the check could not complete: ${ROW_ECHO}.`, statements: [] },
+    }
+    expect(await findingDetailsKeptHere('p-home-texts', 'missing_fk_index', kept)).toEqual(kept)
   })
 })
 
