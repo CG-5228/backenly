@@ -21,11 +21,20 @@ const NOUN: Record<string, string> = {
   type: 'type',
 }
 
+/**
+ * The functions Backenly installs beside a project's tables: the updatedAt
+ * stamp and the end-user claim reader every policy calls. They arrive with a
+ * project's first table and are plumbing, not what anyone asked for, so the
+ * summary leaves them out; View details lists them with the rest.
+ */
+const isPlatformHelper = (c: TableChange) => c.object === 'function' && /^(?:backenly_|set_updated_at\()/.test(nameOf(c))
+
 export function describeChange(footprint: TableChange[]): string {
   if (footprint.length === 0) return 'Changed nothing'
-  if (footprint.length === 1) return describeOne(footprint[0])
-  const tables = footprint.filter((c) => !c.object)
-  const objects = footprint.filter((c) => !!c.object)
+  const asked = footprint.some((c) => !isPlatformHelper(c)) ? footprint.filter((c) => !isPlatformHelper(c)) : footprint
+  if (asked.length === 1) return describeOne(asked[0])
+  const tables = asked.filter((c) => !c.object)
+  const objects = asked.filter((c) => !!c.object)
   const groups: Array<[string, string[]]> = [
     ['created', names(tables, 'added')],
     ['changed', names(tables, 'modified')],
