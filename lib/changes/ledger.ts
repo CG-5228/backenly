@@ -241,7 +241,10 @@ export function classifyRisk(footprint: TableChange[], preserved: PreservedEntry
   ) {
     return 'destructive'
   }
-  if (footprint.some((c) => c.kind === 'replaced' || c.details.some((d) => d.startsWith('~') || d.includes('renamed')))) {
+  // Removing an index, a constraint, a policy or a trigger removes no data but
+  // creates nothing either: it changes what the schema guarantees, so it is
+  // transforming. It used to fall through to additive.
+  if (footprint.some((c) => c.kind === 'replaced' || c.details.some((d) => d.startsWith('~') || d.startsWith('− ') || d.includes('renamed')))) {
     return 'transforming'
   }
   return 'additive'
