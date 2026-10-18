@@ -97,6 +97,7 @@ record() {
 }
 
 PENDING=0
+CHANGED=0
 
 # step <id> <files> [command...]: apply the step, then record the checksum of
 # every file in <files> ('|'-separated, so a path may hold spaces). Without a
@@ -108,7 +109,7 @@ step() {
   local have; have="$(recorded "$id")"
   if [ "$APPLY" != true ]; then
     if [ "$have" = "$sum" ]; then echo "  step $id: current (applied, files unchanged)"
-    elif [ -n "$have" ]; then echo "  step $id: changed (applied, but its files have changed since)"
+    elif [ -n "$have" ]; then echo "  step $id: changed (applied, but its files have changed since)"; CHANGED=$((CHANGED + 1))
     else echo "  step $id: pending (not applied)"; PENDING=$((PENDING + 1)); fi
     return 0
   fi
@@ -186,12 +187,22 @@ credentials
 # Verification fails the run when the database is not what the steps promise.
 # It is read-only, so a check runs it too once every step is recorded: that is
 # how a live region is audited.
+#
+# A step whose files changed since it was applied promises something the
+# database has not been given yet, as a pending step does. A check then prints
+# what does not verify and does not fail on it: a launcher checks before it
+# applies (launch.ts), so failing would refuse the one apply that converges it.
+# That apply re-runs every step and fails the run if it still does not verify.
 if [ "$APPLY" = true ]; then
   "${PSQL[@]}" -f "$HERE/sql/verify.sql"
   echo "Regional database initialised and verified."
-elif [ "$PENDING" -eq 0 ]; then
+elif [ "$PENDING" -gt 0 ]; then
+  echo "Check only: nothing was written. $PENDING step(s) not applied yet."
+elif [ "$CHANGED" -eq 0 ]; then
   "${PSQL[@]}" -f "$HERE/sql/verify.sql"
   echo "Check only: nothing was written. Every step is recorded, and the database verifies."
+elif "${PSQL[@]}" -f "$HERE/sql/verify.sql"; then
+  echo "Check only: nothing was written. $CHANGED step(s) changed since applied, and the database verifies."
 else
-  echo "Check only: nothing was written. $PENDING step(s) not applied yet."
+  echo "Check only: nothing was written. $CHANGED step(s) changed since applied: apply them to converge what does not verify."
 fi

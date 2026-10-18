@@ -659,9 +659,21 @@ describe('a workspace made before the backup role was given every one', () => {
     expect(result.status).not.toBe(0)
   })
 
+  it('is reported, and does not refuse the apply, by the check of a region whose step files changed', async () => {
+    // As a region that applied an earlier setup-direct-access.sql. A launcher
+    // checks before it applies, so a failing check would refuse the very apply
+    // that converges this workspace.
+    await rows(superUrl(), `UPDATE backenly_meta.bootstrap_steps SET checksum = 'an earlier file' WHERE step = 'direct-access'`)
+    const result = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', EXPECT_DATABASE: DB })
+    expect(result.output).toContain('step direct-access: changed (applied, but its files have changed since)')
+    expect(result.output).toContain(`backenly_backup cannot use workspace schema ${schema}, so its snapshots fail`)
+    expect(result.output).toContain('Check only: nothing was written. 1 step(s) changed since applied: apply them to converge what does not verify.')
+    expect(result.status).toBe(0)
+  })
+
   it('is converged by applying the procedure again, which then verifies', async () => {
     const result = bootstrap({ DATABASE_URL: superUrl(), BOOTSTRAP_MODE: 'apply', EXPECT_DATABASE: DB })
-    expect(result.output).toContain('step direct-access: re-applied (files unchanged)')
+    expect(result.output).toContain('step direct-access: applied')
     expect(result.output).toContain('Regional database initialised and verified.')
     expect(result.status).toBe(0)
 
@@ -670,6 +682,11 @@ describe('a workspace made before the backup role was given every one', () => {
     // The whole result on a failure, so pg_dump's own error is in the report.
     expect(dump).toMatchObject({ status: 0 })
     expect(dump.stdout).toContain(`CREATE TABLE "${schema}".probe`)
+
+    // The launcher's closing check: every step current, and the database verifies.
+    const check = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', EXPECT_DATABASE: DB })
+    expect(check.output).toContain('Check only: nothing was written. Every step is recorded, and the database verifies.')
+    expect(check.status).toBe(0)
   })
 })
 
