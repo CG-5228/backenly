@@ -134,11 +134,12 @@ person approved (or non-empty for a lossless restore) nothing runs. Then the
 statements, the independent check against the restore point, and protected
 verification of the result.
 
-Strategies: `transaction` (a failure inside one statement leaves nothing to
-recover), `reverse_migration` (the plan above, with vault restores and value
-restores), `snapshot` (a project snapshot taken before the change exists: a
-person can restore it from Snapshots; Backenly never does this on its own), and
-`manual`. Point-in-time recovery is infrastructure-level and not offered here.
+A plan's strategy is `reverse_migration` (the plan above, with vault restores
+and value restores) or `manual` (no plan can be built, and a person decides). A
+change that fails before changing anything leaves nothing to recover and is
+recorded as `failed`. Project snapshots (Database → Snapshots) stay a separate
+restore a person runs: the engine neither takes nor uses them. Point-in-time
+recovery is infrastructure-level and not offered here.
 
 ## Automatic recovery
 
