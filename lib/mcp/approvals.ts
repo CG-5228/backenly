@@ -26,12 +26,23 @@
  *   • A request executes at most once (atomic pending → approved claim).
  *   • Execution happens server-side at decision time, by the approver's
  *     identity, with the standard audit trail.
+ *   • A project kept in another region keeps a request's words and exact call
+ *     in that region (lib/mcp/approval-request-bodies.ts). Approval reads the
+ *     call back from there, and runs nothing when it cannot.
  */
 
+import { randomUUID } from 'crypto'
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
 import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
+import {
+  callKeptInRegion,
+  keepApprovalRequest,
+  keptCallForReplay,
+  withApprovalRequests,
+  type CallUnreadable,
+} from '@/lib/mcp/approval-request-bodies'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 import { withHeldActions } from '@/lib/operational-memory/held-action-targets'
 
@@ -78,25 +89,38 @@ export async function createApprovalRequest(input: {
    */
   toolArgs: Record<string, unknown>
 }) {
+  // The request's words, its target and its exact call are what the approver
+  // reads and what approval runs. A project kept in another region keeps them
+  // there, written first under the id the row then takes, and the row keeps the
+  // tool, a stand-in for the target and the call's shape
+  // (lib/mcp/approval-request-bodies.ts). When the region cannot be written no
+  // row is, and this throws: nothing is queued.
+  const id = randomUUID()
+  const quote = await quotesKeptHere(input.projectId)
+  const request = {
+    message: input.message.slice(0, 4000),
+    target: input.danger.target.slice(0, 300),
+    toolArgs: input.toolArgs,
+  }
+  const stored = quote ? request : await keepApprovalRequest(input.projectId, id, input.danger.tool, request)
   const row = await prisma.agentApprovalRequest.create({
     data: {
+      id,
       projectId: input.projectId,
       userId: input.userId,
       apiKeyId: input.apiKeyId ?? null,
-      message: input.message.slice(0, 4000),
+      message: stored.message,
       tool: input.danger.tool,
-      target: input.danger.target.slice(0, 300),
+      target: stored.target,
       rowCount: input.danger.rowCount,
       reversible: input.danger.reversible,
-      toolArgs: input.toolArgs as Prisma.InputJsonValue,
+      toolArgs: stored.toolArgs as Prisma.InputJsonValue,
       expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
     },
   })
 
-  // The request itself keeps its target, which is what the approver reads. The
-  // audit copy of it is left out for a project kept in another region, where
-  // it can name a row or a file (lib/data-plane/residency.ts).
-  const quote = await quotesKeptHere(input.projectId)
+  // The audit copy of the target is left out for a project kept in another
+  // region, where it can name a row or a file (lib/data-plane/residency.ts).
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
@@ -210,10 +234,14 @@ function effectiveView(row: {
 
 /** Poll shape returned to the agent — never leaks approver identity. */
 export async function getApprovalForProject(projectId: string, id: string) {
-  const row = await prisma.agentApprovalRequest.findFirst({
+  const found = await prisma.agentApprovalRequest.findFirst({
     where: { id, projectId },
   })
-  if (!row) return null
+  if (!found) return null
+  // A regional project's request keeps its target in its region, read back for
+  // the agent that made it; when the region cannot be read, the row's stand-in
+  // (lib/mcp/approval-request-bodies.ts).
+  const [row] = await withApprovalRequests(projectId, [found])
   const view = effectiveView(row)
   return {
     id: row.id,
@@ -267,11 +295,15 @@ export async function getParkedActionForProject(projectId: string, id: string) {
 }
 
 export async function listApprovals(projectId: string) {
-  const rows = await prisma.agentApprovalRequest.findMany({
+  const found = await prisma.agentApprovalRequest.findMany({
     where: { projectId },
     orderBy: { createdAt: 'desc' },
     take: 50,
   })
+  // A regional project's requests keep their words and targets in its region,
+  // read back for the approver; when the region cannot be read, the rows as
+  // stored (lib/mcp/approval-request-bodies.ts).
+  const rows = await withApprovalRequests(projectId, found)
   return rows.map((r) => {
     const view = effectiveView(r)
     return {
@@ -316,33 +348,26 @@ export async function decideApproval(input: {
     return { ok: true, status: 'rejected' }
   }
 
+  // The exact call. A regional project's request keeps it in the project's
+  // region, and its row only the call's shape (lib/mcp/approval-request-bodies.ts).
+  // It is read back before the request is claimed. When it cannot be read, the
+  // request is closed unrun: the shape is never run in its place, and the agent
+  // asking again makes a new request whose call can be read.
+  let exactArgs: unknown = row.toolArgs
+  if (callKeptInRegion(row.toolArgs)) {
+    const kept = await keptCallForReplay(input.projectId, row.id)
+    if ('unreadable' in kept) {
+      return closeUnrun(input, row, CALL_UNREADABLE_SUMMARY[kept.unreadable], 'AGENT_APPROVAL_UNREADABLE_REFUSED')
+    }
+    exactArgs = kept.toolArgs
+  }
+
   // A request that does not name its exact call cannot be executed safely:
   // the only thing left to run would be the request's MESSAGE, and replaying a
   // message runs whatever the model chooses, not the operation the human read.
   // Such rows predate exact-call approvals. Close them, unrun, and say why.
-  const exactArgs = row.toolArgs
   const isExact = !!exactArgs && typeof exactArgs === 'object' && !Array.isArray(exactArgs)
-  if (!isExact) {
-    const summary =
-      'Not executed. This request was raised before approvals were bound to one exact operation, ' +
-      'so approving it could not guarantee that what ran is what you read. Nothing was changed. ' +
-      'Ask the agent to request the operation again; the new request will carry the exact call.'
-    const closed = await prisma.agentApprovalRequest.updateMany({
-      where: { id: row.id, status: 'pending' },
-      data: {
-        status: 'failed',
-        decidedBy: input.approverUserId,
-        decidedAt: new Date(),
-        resultSummary: summary,
-      },
-    })
-    if (closed.count === 0) {
-      const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
-      return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
-    }
-    await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_UNBOUND_REFUSED')
-    return { ok: false, status: 'failed', resultSummary: summary }
-  }
+  if (!isExact) return closeUnrun(input, row, UNBOUND_SUMMARY, 'AGENT_APPROVAL_UNBOUND_REFUSED')
 
   // Claim atomically so a double-click / second tab cannot execute twice.
   const claimed = await prisma.agentApprovalRequest.updateMany({
@@ -376,11 +401,59 @@ export async function decideApproval(input: {
   return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
 
+const UNBOUND_SUMMARY =
+  'Not executed. This request was raised before approvals were bound to one exact operation, ' +
+  'so approving it could not guarantee that what ran is what you read. Nothing was changed. ' +
+  'Ask the agent to request the operation again; the new request will carry the exact call.'
+
+const ASK_AGAIN =
+  'Ask your agent to make the change again: it will be held again, as a new request, for your approval.'
+
+/** Why an approved request whose call is kept in its project's region ran nothing. */
+const CALL_UNREADABLE_SUMMARY: Record<CallUnreadable, string> = {
+  unreachable:
+    'Not executed. This request’s exact call is kept in the project’s region, which could not be reached, ' +
+    `so nothing was changed. ${ASK_AGAIN}`,
+  missing:
+    'Not executed. This request’s exact call was not found in the project’s region, so nothing was changed. ' +
+    ASK_AGAIN,
+}
+
+/**
+ * Close an approved request without running anything, and say why. It is never
+ * claimed: the request goes from pending to failed, so it is not marked
+ * approved and nothing can run it. The summary is the platform's own words.
+ */
+async function closeUnrun(
+  input: { projectId: string; approvalId: string; approverUserId: string },
+  row: { id: string; tool: string; target: string },
+  summary: string,
+  action: ApprovalAuditAction,
+): Promise<{ ok: boolean; status: string; error?: string; resultSummary?: string }> {
+  const closed = await prisma.agentApprovalRequest.updateMany({
+    where: { id: row.id, status: 'pending' },
+    data: {
+      status: 'failed',
+      decidedBy: input.approverUserId,
+      decidedAt: new Date(),
+      resultSummary: summary,
+    },
+  })
+  if (closed.count === 0) {
+    const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
+    return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
+  }
+  await auditDecision(input, row.tool, row.target, action)
+  return { ok: false, status: 'failed', resultSummary: summary }
+}
+
 type ApprovalAuditAction =
   | 'AGENT_APPROVAL_GRANTED'
   | 'AGENT_APPROVAL_REJECTED'
   /** Approved, but the request named no exact call, so nothing was run. */
   | 'AGENT_APPROVAL_UNBOUND_REFUSED'
+  /** Approved, but its exact call, kept in the project's region, could not be read, so nothing was run. */
+  | 'AGENT_APPROVAL_UNREADABLE_REFUSED'
 
 async function auditDecision(
   input: { projectId: string; approverUserId: string; approvalId: string },
@@ -388,8 +461,8 @@ async function auditDecision(
   target: string,
   action: ApprovalAuditAction,
 ) {
-  // No copy of the target for a project kept in another region: the request
-  // row has it (lib/data-plane/residency.ts).
+  // No copy of the target for a project kept in another region, where the
+  // request's own record keeps it (lib/data-plane/residency.ts).
   const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
