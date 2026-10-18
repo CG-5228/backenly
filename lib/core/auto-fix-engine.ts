@@ -22,6 +22,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
+import { argumentShape } from '@/lib/data-plane/residency'
 import { captureSchemaSnapshot, rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
 import {
   withSqlCapture,
@@ -670,8 +671,17 @@ export async function executeApprovedFix(
     ? await captureSchemaSnapshot(projectId, 'post_migration').catch(() => null)
     : null
 
+  // What the record keeps of the call. A held action's arguments are its
+  // caller's own values, a secret among them (SET_ENV_VAR), which its finding
+  // keeps sealed: the record keeps their shape. Undo reads none of them
+  // (revertAutoFix).
+  const recordedAction =
+    finding.type === 'ai_action_pending'
+      ? { action: fixAction.action, params: argumentShape(fixAction.params as Record<string, unknown>) }
+      : fixAction
+
   const rollbackData: Record<string, unknown> = {
-    fixAction,
+    fixAction: recordedAction,
     fixResult: { message: result.message, data: result.data },
     // The statements the executor actually sent, captured at the driver. This
     // is the half of the audit trail that used to be missing: the change was
