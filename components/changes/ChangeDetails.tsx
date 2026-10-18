@@ -65,8 +65,14 @@ function Disclosure({ label, children }: { label: string; children: React.ReactN
   )
 }
 
-function Sql({ statements }: { statements: Array<{ sql: string }> }) {
-  if (statements.length === 0) return <p className="text-[12.5px] text-zinc-500">No statements were recorded.</p>
+function Sql({ statements, quoted = true }: { statements: Array<{ sql: string }>; quoted?: boolean }) {
+  if (statements.length === 0) {
+    return (
+      <p className="text-[12.5px] text-zinc-500">
+        {quoted ? 'No statements were recorded.' : 'Not recorded here: this project’s data, including the SQL that ran, stays in its own region.'}
+      </p>
+    )
+  }
   return (
     <pre className="max-h-[260px] overflow-auto rounded-[8px] border border-white/[0.06] bg-black/30 p-3 font-mono text-[11.5px] leading-[18px] text-zinc-300">
       {statements.map((s) => s.sql.trim()).join(';\n\n')}
@@ -276,14 +282,14 @@ export function ChangeDetails({
                 </ul>
               )}
               <Disclosure label="SQL">
-                <Sql statements={r.statements} />
+                <Sql statements={r.statements} quoted={d.quoted} />
               </Disclosure>
             </Section>
           ))}
 
           <Section title="SQL">
-            <Disclosure label={`${d.statements.length} statement${d.statements.length === 1 ? '' : 's'}`}>
-              <Sql statements={d.statements} />
+            <Disclosure label={d.quoted ? `${d.statements.length} statement${d.statements.length === 1 ? '' : 's'}` : 'Statements'}>
+              <Sql statements={d.statements} quoted={d.quoted} />
             </Disclosure>
             {d.error && <p className="font-mono text-[11.5px] leading-[18px] text-rose-300/80 [overflow-wrap:anywhere]">{d.error}</p>}
           </Section>

@@ -23,11 +23,23 @@
  * Re-entrant within one async context: a rollback started while a change holds
  * the lock (the automatic rollback of a migration that failed part-way) runs on
  * the same connection instead of deadlocking against itself.
+ *
+ * ── In the project's region ─────────────────────────────────────────────────
+ *
+ * The connection holding the lock is also the one the change reads its
+ * catalog on, keeps data in its vault with and restores on, so it is opened on
+ * the database holding the project's data, in its region
+ * (lib/data-plane/regional.ts). The lock is then decided where the schema is,
+ * by every process changing that project. A region this process has no
+ * connection to is refused with RegionNotConfiguredError, never served from
+ * the home database, where the project's schema is not.
  */
 
 import { AsyncLocalStorage } from 'async_hooks'
 import { Pool, type PoolClient } from 'pg'
 import { projectToLockKey } from '@/lib/autonomy/maintenance/single-flight'
+import { projectRegion, requireRegionDatabaseUrl } from '@/lib/data-plane/regional'
+import type { CloudRegionId } from '@/lib/regions'
 import { readCatalog, type CatalogSnapshot } from './catalog'
 
 /** 'chng'. Fixed: changing it would let an old and a new instance both hold a project. */
@@ -43,11 +55,25 @@ export class ChangeInProgressError extends Error {
   }
 }
 
-let pool: Pool | null = null
-function lockPool(): Pool {
-  // Created on first use, so DATABASE_URL is read when a change runs rather
-  // than whenever this module happens to be imported.
-  if (!pool) pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 8 })
+const pools = new Map<CloudRegionId, Pool>()
+
+/**
+ * The pool on the database holding this project's data. One per region,
+ * created on first use, so the region's connection string is read when a
+ * change runs rather than whenever this module happens to be imported; and
+ * checked on every call, so a region whose connection goes away is refused
+ * rather than served from a pool made earlier.
+ */
+async function lockPool(projectId: string): Promise<Pool> {
+  const region = await projectRegion(projectId)
+  const url = requireRegionDatabaseUrl(region, 'app', { projectId })
+  let pool = pools.get(region)
+  if (!pool) {
+    pool = new Pool({ connectionString: url, max: 8 })
+    // An idle client's error is emitted on the pool; unhandled, it ends the process.
+    pool.on('error', (err) => console.error(`[ChangeLock] pool in ${region}:`, err.message))
+    pools.set(region, pool)
+  }
   return pool
 }
 
@@ -69,7 +95,7 @@ export async function withChangeLock<T>(
   const current = held.getStore()
   if (current && current.projectId === projectId) return fn(current.client)
 
-  const client = await lockPool().connect()
+  const client = await (await lockPool(projectId)).connect()
   const key = projectToLockKey(projectId)
   let locked = false
   let broken = false
@@ -104,11 +130,11 @@ export async function withChangeLock<T>(
   }
 }
 
-/** Close the pool. Tests only. */
+/** Close every region's pool. Tests only. */
 export async function closeChangeLockPool(): Promise<void> {
-  const p = pool
-  pool = null
-  await p?.end().catch(() => {})
+  const all = [...pools.values()]
+  pools.clear()
+  await Promise.all(all.map((p) => p.end().catch(() => {})))
 }
 
 /**

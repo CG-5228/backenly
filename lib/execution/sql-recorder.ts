@@ -131,7 +131,13 @@ export function isCapturing(): boolean {
 
 // ── Installation ─────────────────────────────────────────────────────────────
 
-let installed = false
+/**
+ * Every client the middleware is on. Per client, not once per process: a
+ * project outside the home region runs its statements on that region's own
+ * client (lib/data-plane/regional.ts), and a recorder on the home client alone
+ * would capture nothing of its changes.
+ */
+let installedOn = new WeakSet<object>()
 
 /**
  * Attach the recorder to the Prisma singleton.
@@ -148,8 +154,8 @@ let installed = false
 export function installSqlRecorder(client: {
   $use?: (mw: (params: any, next: (p: any) => Promise<any>) => Promise<any>) => void
 }): void {
-  if (installed || typeof client.$use !== 'function') return
-  installed = true
+  if (typeof client.$use !== 'function' || installedOn.has(client)) return
+  installedOn.add(client)
 
   client.$use(async (params: any, next: (p: any) => Promise<any>) => {
     // Raw operations arrive as action 'executeRaw' / 'queryRaw' with no model,
@@ -173,5 +179,5 @@ export function installSqlRecorder(client: {
 
 /** Reset for tests. Never call in production — the middleware cannot be removed. */
 export function __resetInstalledForTests(): void {
-  installed = false
+  installedOn = new WeakSet<object>()
 }

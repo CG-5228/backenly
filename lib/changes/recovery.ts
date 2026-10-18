@@ -67,6 +67,7 @@ import { qualified, quoteIdent as q, vaultSchemaName } from './names'
 import { planRestore, verifyAgainstCheckpoint, type PlanConflict, type PlannedStep, type RestorePlan } from './plan'
 import { rollbackWindowDays, windowEndsAt } from './policy'
 import { IN_EFFECT, RECOVERY_OWED, type ChangePreservation, type ChangeStatus, type PreservedEntry, type TableChange } from './types'
+import { keptText, quotesKeptHere } from './residency'
 import type { ChangeVerification, VerificationCheck } from './verify'
 
 // ── Loading ──────────────────────────────────────────────────────────────────
@@ -639,7 +640,9 @@ export async function recoverChange(projectId: string, changeId: string, opts: R
     }
     if (err instanceof ImpactRefusal) {
       await releaseRecovery(change.id, claim.claim, back)
-      await recordEvent(change.id, projectId, 'recovery_planned', { safety: err.code === 'BLOCKED' ? 'blocked' : 'needs_approval', impact: err.impact.items, blockers: err.impact.blockers })
+      // A blocker can quote a value PostgreSQL refused to convert.
+      const quote = await quotesKeptHere(projectId)
+      await recordEvent(change.id, projectId, 'recovery_planned', { safety: err.code === 'BLOCKED' ? 'blocked' : 'needs_approval', impact: err.impact.items, blockers: err.impact.blockers.map((b) => keptText(b, quote)) })
       const first = err.impact.blockers[0] ?? err.impact.items.find((i) => i.needsApproval)?.detail ?? 'It would affect data written since this change.'
       const message =
         err.code === 'BLOCKED' ? `Not restored: ${first} Nothing was changed.`
@@ -657,7 +660,7 @@ export async function recoverChange(projectId: string, changeId: string, opts: R
       const to: ChangeStatus = opts.mode === 'automatic' ? 'recovery_failed' : back
       await releaseRecovery(change.id, claim.claim, to)
       const step = err instanceof RecoveryStepError && err.step ? { index: err.index, sql: err.step.sql, describe: err.step.describe } : undefined
-      await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'execute', error: String(err?.message ?? err).slice(0, 500), ...(step ? { step: step.describe } : {}) })
+      await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'execute', error: keptText(String(err?.message ?? err), await quotesKeptHere(projectId)).slice(0, 500), ...(step ? { step: step.describe } : {}) })
       recordTiming('recovery', Date.now() - started, { projectId, mode: opts.mode, outcome: 'failed' })
       if (opts.mode === 'automatic') await stopAndEscalate(projectId, change, `The automatic recovery failed and was rolled back: ${err?.message ?? err}`)
       return fail('RECOVERY_FAILED', `${err?.message ?? err}. The restore was rolled back, so nothing was changed.`, {
@@ -668,7 +671,7 @@ export async function recoverChange(projectId: string, changeId: string, opts: R
     }
     // After COMMIT: the restore took effect and could not be confirmed. The
     // claim stays, with its lease, for the reconciler to settle from the catalog.
-    await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'after_commit', error: String(err?.message ?? err).slice(0, 500) })
+    await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'after_commit', error: keptText(String(err?.message ?? err), await quotesKeptHere(projectId)).slice(0, 500) })
     return fail('RECOVERY_FAILED', `The restore was applied but could not be confirmed (${err?.message ?? err}). Backenly will check it again.`, { status: 'recovering' })
   }
 }
@@ -739,6 +742,8 @@ export async function recoverAutomatically(projectId: string, changeId: string):
 async function escalate(projectId: string, change: LoadedChange, explanation: string, impact: Impact | null): Promise<string | null> {
   const moved = await transition(change.id, ['verification_failed', 'partially_applied', 'recovery_failed'], 'awaiting_approval')
   if (!moved) return null
+  // The explanation can carry a database error, which quotes values.
+  const quote = await quotesKeptHere(projectId)
   const project = await prisma.project.findUnique({ where: { id: projectId }, select: { userId: true } })
   let approvalId: string | null = null
   if (project?.userId) {
@@ -747,7 +752,7 @@ async function escalate(projectId: string, change: LoadedChange, explanation: st
     const row = await createApprovalRequest({
       projectId,
       userId: project.userId,
-      message: `Change #${change.seq} (${change.summary}) failed verification. ${explanation}`,
+      message: `Change #${change.seq} (${change.summary}) failed verification. ${keptText(explanation, quote)}`,
       danger: {
         tool: 'revert_schema_change',
         target: `Restore the state before change #${change.seq}: ${change.summary}`,
@@ -758,7 +763,7 @@ async function escalate(projectId: string, change: LoadedChange, explanation: st
     })
     approvalId = row.id
   }
-  await recordEvent(change.id, projectId, 'recovery_escalated', { approvalId, explanation })
+  await recordEvent(change.id, projectId, 'recovery_escalated', { approvalId, explanation: keptText(explanation, quote) })
   await audit(projectId, null, 'CHANGE_RECOVERY_AWAITING_APPROVAL', { changeId: change.id, seq: change.seq, summary: `Change #${change.seq} failed verification and needs your approval to recover: ${change.summary}` })
   return approvalId
 }
@@ -766,8 +771,10 @@ async function escalate(projectId: string, change: LoadedChange, explanation: st
 /** Automation stops here; the evidence stays; a person decides. */
 async function stopAndEscalate(projectId: string, change: LoadedChange, reason: string): Promise<void> {
   await transition(change.id, ['recovery_failed', 'verification_failed', 'partially_applied', 'awaiting_approval'], 'manual_intervention_required').catch(() => false)
-  await recordEvent(change.id, projectId, 'manual_intervention_required', { reason: reason.slice(0, 500) })
-  await audit(projectId, null, 'CHANGE_RECOVERY_NEEDS_ATTENTION', { changeId: change.id, seq: change.seq, summary: `Change #${change.seq} needs attention: ${reason}` })
+  // The reason can be a database error, which quotes values.
+  const kept = keptText(reason, await quotesKeptHere(projectId))
+  await recordEvent(change.id, projectId, 'manual_intervention_required', { reason: kept.slice(0, 500) })
+  await audit(projectId, null, 'CHANGE_RECOVERY_NEEDS_ATTENTION', { changeId: change.id, seq: change.seq, summary: `Change #${change.seq} needs attention: ${kept}` })
 }
 
 // ── Reconciling interrupted work ─────────────────────────────────────────────

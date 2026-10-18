@@ -18,6 +18,7 @@ import { rollbackWindowDays } from './policy'
 import { availabilityOf, type Availability } from './recovery'
 import type { ChangePreservation, ChangeStep, TableChange } from './types'
 import type { ChangeVerification } from './verify'
+import { quotesKeptHere } from './residency'
 
 export interface ChangeActor {
   /** agent: a coding agent's key. person: someone in the console or approving. system: Backenly itself. */
@@ -84,6 +85,11 @@ export interface ChangeDetail extends ChangeSummary {
   preserved: ChangePreservation | null
   events: ChangeEvent[]
   checkpoint: { hash: string | null; intact: boolean; resources: string[]; parentSeq: number | null }
+  /**
+   * False for a project kept outside the home region: its SQL, step summaries
+   * and error text stay there and are not on this record (lib/changes/residency.ts).
+   */
+  quoted: boolean
   /** The recovery records that acted on this change, oldest first. */
   recoveries: Array<{
     id: string
@@ -280,6 +286,7 @@ export async function getChange(projectId: string, changeId: string): Promise<Ch
     preserved: (r.preserved as unknown as ChangePreservation | null) ?? null,
     events: events.map((e) => ({ type: e.type, at: e.at.toISOString(), data: (e.data as Record<string, unknown> | null) ?? null })),
     checkpoint: { hash: r.checkpointHash, intact: checkpointIntact(r), resources: r.resources, parentSeq: parent?.seq ?? null },
+    quoted: await quotesKeptHere(projectId),
     recoveries: recoveries.map((x) => ({
       id: x.id,
       seq: x.seq,

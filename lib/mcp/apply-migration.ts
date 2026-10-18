@@ -302,7 +302,13 @@ export async function applyMigrationToMain(
   const { ChangeInProgressError } = await import('@/lib/changes/lock')
   try {
     const { result, change } = await withGovernedChange(
-      { projectId, title: migrationTitle(ok.planned) },
+      {
+        projectId,
+        title: migrationTitle(ok.planned),
+        // The title quotes the first statement, which can carry values: for a
+        // project kept in another region the record says only how many.
+        regionalTitle: `apply_migration: ${ok.planned.length} statement${ok.planned.length === 1 ? '' : 's'}`,
+      },
       run,
       (outcome) => ({
         ok: outcome.ok,

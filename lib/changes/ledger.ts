@@ -50,6 +50,7 @@ import { checkpointHash } from './integrity'
 import { recordEvent, transition } from './lifecycle'
 import { readCatalogOn, withChangeLock } from './lock'
 import { quoteIdent, vaultSchemaName } from './names'
+import { keptSteps, keptText, keptVerification, quotesKeptHere } from './residency'
 import { verifyChange, type ChangeVerification, type Expectation } from './verify'
 import type { ChangeKind, ChangePreservation, ChangeStatus, ChangeStep, PreservedEntry, RiskClass, TableChange } from './types'
 import type { AutoRecoveryOutcome } from './recovery'
@@ -143,6 +144,13 @@ export interface ClosedChange {
 export interface GovernedChangeInput {
   projectId: string
   title: string
+  /**
+   * The title for a project kept outside the home region, when `title` quotes
+   * the request (a migration's first statement): names and counts only
+   * (lib/changes/residency.ts). Defaults to `title`, which most callers build
+   * from names already.
+   */
+  regionalTitle?: string
   kind?: ChangeKind
   /** For a recovery: the change whose previous state it restores. */
   recoversId?: string
@@ -189,7 +197,7 @@ function pickPlatform(state: PlatformState, tables: string[]): PlatformState {
   }
 }
 
-async function allocateRow(input: GovernedChangeInput, attr: ChangeAttribution, checkpoint: StoredSnapshot) {
+async function allocateRow(input: GovernedChangeInput, attr: ChangeAttribution, checkpoint: StoredSnapshot, quote: boolean) {
   // seq is MAX+1 under the change lock, which serialises every writer for this
   // project; the retry covers a writer from before this code shipped.
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -205,7 +213,7 @@ async function allocateRow(input: GovernedChangeInput, attr: ChangeAttribution, 
           seq: (last?.seq ?? 0) + 1,
           kind: input.kind ?? 'change',
           source: attr.source,
-          title: input.title.slice(0, 300),
+          title: (quote ? input.title : input.regionalTitle ?? input.title).slice(0, 300),
           actorUserId: attr.actorUserId ?? null,
           apiKeyId: attr.apiKeyId ?? null,
           groupId: attr.groupId ?? null,
@@ -254,7 +262,12 @@ export async function withGovernedChange<T>(
   if (currentChange(projectId)) return { result: await fn(), change: null }
   if (!ledgerEnabled(projectId)) return { result: await fn(), change: null }
 
+  // The statements are captured where they are sent: the home client, and the
+  // client of the project's own region, which is a different one for a project
+  // kept outside the home region (lib/data-plane/regional.ts).
   installSqlRecorder(prisma as any)
+  const { workspaceRawClient } = await import('@/lib/data-plane/regional')
+  installSqlRecorder((await workspaceRawClient(projectId)) as any)
 
   return withChangeLock(projectId, async (client) => {
     const { resolveWorkspaceSchema } = await import('@/lib/services/workspace-pool')
@@ -264,7 +277,9 @@ export async function withGovernedChange<T>(
 
     const before = await readCatalogOn(client, schema)
     const platform = await readPlatformState(projectId)
-    const row = await allocateRow(input, attr, before)
+    // Whether this record may quote the work's text (lib/changes/residency.ts).
+    const quote = await quotesKeptHere(projectId)
+    const row = await allocateRow(input, attr, before, quote)
 
     const change: OpenChange = {
       projectId,
@@ -339,8 +354,9 @@ export async function withGovernedChange<T>(
     const preserved: ChangePreservation | null = change.preserved.length > 0 ? { vault: change.vault, entries: change.preserved } : null
     const summary = input.summary ?? describeChange(footprint)
     const evidence = {
-      steps: (verdict.steps ?? null) as unknown as Prisma.InputJsonValue,
-      statements: statements as unknown as Prisma.InputJsonValue,
+      steps: keptSteps(verdict.steps, quote) as unknown as Prisma.InputJsonValue,
+      // For a project kept in another region the SQL stays there: it can carry values.
+      statements: (quote ? statements : []) as unknown as Prisma.InputJsonValue,
       checkpoint: checkpoint as unknown as Prisma.InputJsonValue,
       resultState: resultState as unknown as Prisma.InputJsonValue,
       footprint: footprint as unknown as Prisma.InputJsonValue,
@@ -361,12 +377,12 @@ export async function withGovernedChange<T>(
       status = footprint.length === 0 && change.preserved.length === 0 ? 'failed' : 'partially_applied'
       await transition(change.id, ['applying'], status, {
         ...evidence,
-        error: (verdict.error ?? 'failed').slice(0, 2000),
+        error: keptText(verdict.error ?? 'failed', quote).slice(0, 2000),
         checkpointHash: hash,
         completedAt: new Date(),
       })
       await recordEvent(change.id, projectId, status === 'failed' ? 'apply_failed' : 'partially_applied', {
-        error: (verdict.error ?? 'failed').slice(0, 500),
+        error: keptText(verdict.error ?? 'failed', quote).slice(0, 500),
         objects: footprint.length,
       })
     } else {
@@ -386,11 +402,11 @@ export async function withGovernedChange<T>(
           })
       status = verification.outcome === 'confirmed' ? 'healthy' : verification.outcome === 'contradicted' ? 'verification_failed' : 'unverified'
       await transition(change.id, ['verifying'], status, {
-        verification: verification as unknown as Prisma.InputJsonValue,
+        verification: keptVerification(verification, quote) as unknown as Prisma.InputJsonValue,
         checkpointHash: hash,
         completedAt: new Date(),
       })
-      const failing = verification.checks.filter((c) => c.outcome !== 'confirmed').map((c) => ({ id: c.id, outcome: c.outcome, detail: c.detail }))
+      const failing = keptVerification(verification, quote).checks.filter((c) => c.outcome !== 'confirmed').map((c) => ({ id: c.id, outcome: c.outcome, detail: c.detail }))
       await recordEvent(
         change.id,
         projectId,

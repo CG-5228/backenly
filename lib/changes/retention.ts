@@ -12,6 +12,7 @@
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { isVaultSchema, quoteIdent } from './names'
 import { rollbackWindowDays, VAULT_GRACE_DAYS } from './policy'
 import type { ChangePreservation } from './types'
@@ -20,6 +21,8 @@ export async function purgeExpiredVaults(projectId: string, now = new Date()): P
   const windowDays = await rollbackWindowDays(projectId)
   const cutoff = new Date(now.getTime() - (windowDays + VAULT_GRACE_DAYS) * 24 * 60 * 60 * 1000)
   const purged: string[] = []
+  // Vaults are schemas in the project's own database, in its region.
+  const db = await workspaceRawClient(projectId)
 
   const rows = await prisma.backendChange.findMany({
     where: { projectId, createdAt: { lt: cutoff }, NOT: { preserved: { equals: Prisma.DbNull } } },
@@ -28,7 +31,7 @@ export async function purgeExpiredVaults(projectId: string, now = new Date()): P
   for (const row of rows) {
     const preserved = row.preserved as unknown as ChangePreservation | null
     if (!preserved || preserved.purgedAt || !isVaultSchema(projectId, preserved.vault)) continue
-    await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(preserved.vault)} CASCADE`)
+    await db.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(preserved.vault)} CASCADE`)
     await prisma.backendChange.update({
       where: { id: row.id },
       data: { preserved: { ...preserved, purgedAt: now.toISOString() } as unknown as Prisma.InputJsonValue },
@@ -39,7 +42,7 @@ export async function purgeExpiredVaults(projectId: string, now = new Date()): P
   // A vault whose change left no record of it (a process that died between
   // creating it and recording the change) is dropped once it is as old as the
   // window allows, judged by the change number it was named for.
-  const orphans = await prisma.$queryRawUnsafe<Array<{ nspname: string }>>(
+  const orphans = await db.$queryRawUnsafe<Array<{ nspname: string }>>(
     `SELECT nspname FROM pg_namespace WHERE nspname LIKE $1`,
     `workspace_${projectId}_r%`,
   )
@@ -50,7 +53,7 @@ export async function purgeExpiredVaults(projectId: string, now = new Date()): P
     const recorded = change?.preserved && (change.preserved as unknown as ChangePreservation).vault === nspname
     if (recorded) continue
     if (change && change.createdAt >= cutoff) continue
-    await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(nspname)} CASCADE`)
+    await db.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(nspname)} CASCADE`)
     purged.push(nspname)
   }
 
