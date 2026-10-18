@@ -22,6 +22,8 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
+import { regionRawClient } from '@/lib/data-plane/regional'
+import { HOME_REGION } from '@/lib/regions'
 import {
   findingDetailsKeptHere,
   quotedError,
@@ -55,6 +57,17 @@ import {
   samePolicies,
   type PolicyCapture,
 } from '@/lib/autonomy/maintenance/primitives/recovery-restore-policies'
+
+/**
+ * The SQL recorder (lib/execution/sql-recorder.ts) on both home-region clients.
+ * A home project's workspace SQL runs on the home workspace client, not the
+ * platform client (lib/data-plane/regional.ts), and a repair's statements are
+ * mostly that SQL.
+ */
+function installHomeSqlRecorders(): void {
+  installSqlRecorder(prisma as any)
+  installSqlRecorder(regionRawClient(HOME_REGION) as any)
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -558,7 +571,7 @@ export async function executeApprovedFix(
   // What the executor actually sent to PostgreSQL, for the audit row. Captured
   // at the driver rather than reported by each executor, so a new repair cannot
   // silently record nothing. See lib/execution/sql-recorder.ts.
-  installSqlRecorder(prisma as any)
+  installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
 
   for (let attempt = 0; attempt <= BACKOFFS_MS.length; attempt++) {
@@ -832,7 +845,7 @@ export async function executeApprovedProposal(input: {
     return notStarted('Backenly could not record the state Undo would restore, so nothing was changed.')
   }
 
-  installSqlRecorder(prisma as any)
+  installHomeSqlRecorders()
   let captured
   try {
     captured = await withSqlCapture(() => withBuildLock(
@@ -1462,7 +1475,7 @@ async function _executeAutoFix(
   })
 
   let result
-  installSqlRecorder(prisma as any)
+  installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
   try {
     const captured = await withSqlCapture(() => withBuildLock(

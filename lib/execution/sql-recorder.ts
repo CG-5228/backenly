@@ -43,10 +43,12 @@
  * of them (recordedStatements in lib/data-plane/residency.ts): the bound values
  * are kept for a home project's repairs, and dropped for a project kept in
  * another region and for a held action, whose records keep the statement text
- * only. This recorder is installed on the home region's client alone; a project
- * kept in another region runs its workspace SQL on that region's client
- * (lib/data-plane/regional.ts), so none of that SQL is captured here. Text and
- * values are both bounded in size: an audit row is a record, not a log sink.
+ * only. This recorder is installed on the home region's two clients alone: the
+ * platform client, and the home workspace client a home project's workspace SQL
+ * runs on. A project kept in another region runs its workspace SQL on that
+ * region's client (lib/data-plane/regional.ts), so none of that SQL is captured
+ * here. Text and values are both bounded in size: an audit row is a record, not
+ * a log sink.
  */
 
 import { AsyncLocalStorage } from 'async_hooks'
@@ -138,15 +140,18 @@ export function isCapturing(): boolean {
 
 // ── Installation ─────────────────────────────────────────────────────────────
 
-let installed = false
+/** The clients the recorder is on. A client is never given it twice. */
+let installedOn = new WeakSet<object>()
 
 /**
- * Attach the recorder to the Prisma singleton.
+ * Attach the recorder to a Prisma client: the shared platform client, and the
+ * home workspace client (lib/data-plane/regional.ts).
  *
- * Idempotent, and installed lazily by the auto-fix engine rather than at module
- * load: a middleware on the shared client is a global side effect, and it should
- * exist because something is about to capture, not because a module was
- * imported.
+ * Idempotent per client, and installed lazily by the auto-fix engine rather than
+ * at module load: a middleware on a shared client is a global side effect, and
+ * it should exist because something is about to capture, not because a module
+ * was imported. A client created later, as the workspace client is after
+ * disconnectRegionalClients, gets it at the next install.
  *
  * `$use` mutates the existing client in place. `$extends` would return a new one
  * and every `import { prisma }` in the codebase would keep the un-extended
@@ -155,8 +160,8 @@ let installed = false
 export function installSqlRecorder(client: {
   $use?: (mw: (params: any, next: (p: any) => Promise<any>) => Promise<any>) => void
 }): void {
-  if (installed || typeof client.$use !== 'function') return
-  installed = true
+  if (!client || typeof client.$use !== 'function' || installedOn.has(client)) return
+  installedOn.add(client)
 
   client.$use(async (params: any, next: (p: any) => Promise<any>) => {
     // Raw operations arrive as action 'executeRaw' / 'queryRaw' with no model,
@@ -180,5 +185,5 @@ export function installSqlRecorder(client: {
 
 /** Reset for tests. Never call in production — the middleware cannot be removed. */
 export function __resetInstalledForTests(): void {
-  installed = false
+  installedOn = new WeakSet<object>()
 }
