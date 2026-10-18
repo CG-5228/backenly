@@ -15,9 +15,16 @@
  *   (tableSignature, lib/changes/catalog.ts) with every row intact;
  *   reapplying brings the change back exactly as it left things.
  *
+ * Data moved between columns goes through the typed data migrations
+ * (split_column, merge_columns), each one governed change. Nothing moves rows
+ * between tables inside a schema change: apply_migration refuses DML, so a
+ * table split is a sequence of governed changes (the new table, the rows
+ * written into it, the moved columns dropped with their values kept), and is
+ * restored newest first.
+ *
  * Statements apply_migration refuses (RENAME TABLE, ALTER COLUMN TYPE, DROP
- * COLUMN, DROP TABLE, CREATE TYPE, CREATE VIEW) are asserted refused with
- * nothing applied and nothing recorded. Where the executor still has a real path
+ * COLUMN, DROP TABLE, CREATE TYPE, CREATE VIEW, INSERT, UPDATE, DELETE) are
+ * asserted refused with nothing applied and nothing recorded. Where the executor still has a real path
  * for one of those classes, that path is exercised instead: the dashboard's
  * column delete (lib/services/tableLifecycle.ts), a drop_table a person approves
  * from the review queue (lib/mcp/approvals.ts), and the executor's own
@@ -52,6 +59,8 @@ import { forgetProtection } from '@/lib/branches/protection'
 import { executeAction } from '@/lib/ai/minimal-executor'
 import { dropWorkspaceColumn } from '@/lib/services/tableLifecycle'
 import { createApprovalRequest, decideApproval } from '@/lib/mcp/approvals'
+import { withGovernedChange } from '@/lib/changes/ledger'
+import { keepColumnValues } from '@/lib/changes/preserve'
 import { installChangeLedgerGuard } from '../helpers/change-ledger-guard'
 
 let ownerId: string
@@ -726,6 +735,186 @@ changeClass('a migration of several statements is one change, restored and reapp
   },
 })
 
+// ── Data moved between columns: typed data migrations ────────────────────────
+
+/** A person's typed data migration, as RUN_DATA_MIGRATION runs it once confirmed. Returns the change's id. */
+async function dataMigration(operations: unknown[]): Promise<string> {
+  const result = await asPerson(() =>
+    executeAction({ action: 'RUN_DATA_MIGRATION', params: { operations, confirmed: true } } as any, projectId, undefined, 0, undefined, false))
+  if (!result.success) throw new Error(`RUN_DATA_MIGRATION failed: ${result.message}`)
+  const change = (result as any).change
+  if (!change) throw new Error('RUN_DATA_MIGRATION recorded no change')
+  expect(change.status).toBe('healthy')
+  return change.id
+}
+
+changeClass('values moved into new columns: split_column (a typed data migration)', {
+  tables: ['people'],
+  arrange: async () => {
+    await migrated('CREATE TABLE people (full_name text)')
+    await exec(`INSERT INTO ${T('people')} (full_name) VALUES ('Ada Lovelace'), ('Alan Turing'), (NULL)`)
+  },
+  act: () => dataMigration([{ op: 'split_column', table: 'people', source: 'full_name', separator: ' ', targets: ['first_name', 'last_name'] }]),
+  risk: 'data_rewrite',
+  recorded: async (row) => {
+    expect(await query(`SELECT full_name, first_name, last_name FROM ${T('people')} ORDER BY full_name NULLS LAST`)).toEqual([
+      { full_name: 'Ada Lovelace', first_name: 'Ada', last_name: 'Lovelace' },
+      { full_name: 'Alan Turing', first_name: 'Alan', last_name: 'Turing' },
+      { full_name: null, first_name: null, last_name: null },
+    ])
+    const images = ((row.preserved as any).entries as any[]).filter((e) => e.reason === 'rewritten').map((e) => e.column).sort()
+    expect(images).toEqual(['first_name', 'last_name'])
+  },
+  restored: async () => {
+    expect(await columnsOf('people')).not.toContain('first_name')
+    expect(await columnsOf('people')).not.toContain('last_name')
+  },
+})
+
+changeClass('values moved out of several columns into one: merge_columns (a typed data migration)', {
+  tables: ['postal'],
+  arrange: async () => {
+    await migrated('CREATE TABLE postal (street text, city text)')
+    await exec(`INSERT INTO ${T('postal')} (street, city) VALUES ('1 Loop', 'London'), ('2 Park', NULL)`)
+  },
+  act: () => dataMigration([{ op: 'merge_columns', table: 'postal', sources: ['street', 'city'], target: 'line', separator: ', ' }]),
+  risk: 'data_rewrite',
+  recorded: async () => {
+    expect((await query(`SELECT line FROM ${T('postal')} ORDER BY line`)).map((r) => r.line)).toEqual(['1 Loop, London', '2 Park'])
+  },
+  restored: async () => {
+    expect(await columnsOf('postal')).not.toContain('line')
+  },
+})
+
+// Every Backenly table has a PL/pgSQL updatedAt trigger. One that fired earlier
+// in a transaction keeps returning rows of the table's old shape, so a write
+// after the table changed shape in that transaction loses or garbles values.
+// Data migrations write, then change shape, then write; a restore can too.
+
+changeClass('a data migration that writes a table, then adds columns to it and fills them: no value is lost', {
+  tables: ['signups'],
+  arrange: async () => {
+    await migrated('CREATE TABLE signups (full_name text)')
+    await exec(`INSERT INTO ${T('signups')} (full_name) VALUES ('Ada Lovelace'), (NULL)`)
+  },
+  act: () => dataMigration([
+    { op: 'backfill', table: 'signups', column: 'full_name', value: 'Grace Hopper', onlyNull: true },
+    { op: 'split_column', table: 'signups', source: 'full_name', separator: ' ', targets: ['first_name', 'last_name'] },
+  ]),
+  risk: 'data_rewrite',
+  recorded: async () => {
+    expect(await query(`SELECT full_name, first_name, last_name FROM ${T('signups')} ORDER BY full_name`)).toEqual([
+      { full_name: 'Ada Lovelace', first_name: 'Ada', last_name: 'Lovelace' },
+      { full_name: 'Grace Hopper', first_name: 'Grace', last_name: 'Hopper' },
+    ])
+  },
+})
+
+changeClass('a data migration that writes, retypes, then writes the same table: every value intact', {
+  tables: ['tickets_dm'],
+  arrange: async () => {
+    await migrated('CREATE TABLE tickets_dm (code text, state text)')
+    await exec(`INSERT INTO ${T('tickets_dm')} (code, state) VALUES ('5', 'OPEN'), (NULL, 'closed')`)
+  },
+  act: () => dataMigration([
+    { op: 'backfill', table: 'tickets_dm', column: 'code', value: '7', onlyNull: true },
+    { op: 'cast_column', table: 'tickets_dm', column: 'code', toType: 'integer', onError: 'fail' },
+    { op: 'normalize_values', table: 'tickets_dm', column: 'state', mapping: { OPEN: 'open' } },
+  ]),
+  risk: 'data_rewrite',
+  recorded: async () => {
+    expect(await query(`SELECT code, state FROM ${T('tickets_dm')} ORDER BY code`)).toEqual([
+      { code: 5, state: 'open' }, { code: 7, state: 'closed' },
+    ])
+  },
+})
+
+changeClass('one change that drops a column and retypes another on the same table: restored in one transaction, exactly', {
+  tables: ['kiosks'],
+  arrange: async () => {
+    await migrated('CREATE TABLE kiosks (label text NOT NULL, note text, level integer)')
+    await exec(`INSERT INTO ${T('kiosks')} (label, note, level) VALUES ('north', 'by the door', 3), ('south', NULL, 4)`)
+  },
+  act: async () => {
+    const { change } = await asPerson(() => withGovernedChange({ projectId, title: 'kiosks: drop note, widen level' }, async () => {
+      await keepColumnValues(projectId, schema, 'kiosks', 'note', 'dropped', `ALTER TABLE ${T('kiosks')} DROP COLUMN note`)
+      await keepColumnValues(projectId, schema, 'kiosks', 'level', 'retyped', `ALTER TABLE ${T('kiosks')} ALTER COLUMN level TYPE bigint`)
+    }))
+    return change!.id
+  },
+  risk: 'destructive',
+  restored: async () => {
+    expect(await query(`SELECT label, note, level FROM ${T('kiosks')} ORDER BY label`)).toEqual([
+      { label: 'north', note: 'by the door', level: 3 }, { label: 'south', note: null, level: 4 },
+    ])
+  },
+})
+
+// ── A table split ────────────────────────────────────────────────────────────
+
+describe('a table split, as the product makes one: each step its own change, restored newest first', () => {
+  let before: Moment
+  let created: string
+  let droppedStreet: string
+  let droppedCity: string
+
+  beforeAll(async () => {
+    await migrated('CREATE TABLE clients (name text NOT NULL, street text, city text)')
+    await exec(`INSERT INTO ${T('clients')} (name, street, city) VALUES ('ada', '1 Loop', 'London'), ('alan', '2 Bletchley', 'Milton Keynes'), ('grace', NULL, 'Arlington')`)
+    before = await moment(['clients'])
+    // 1. The new table, through apply_migration.
+    created = await migrated('CREATE TABLE client_addresses (client_id uuid, street text, city text)')
+    // 2. The rows copied into it. That is data written, not a schema change
+    //    (the app, or db_insert): apply_migration refuses DML.
+    await exec(`INSERT INTO ${T('client_addresses')} (client_id, street, city) SELECT id, street, city FROM ${T('clients')}`)
+    // 3. The moved columns dropped from the original, from the dashboard.
+    droppedStreet = ((await asPerson(() => dropWorkspaceColumn(projectId, { tableName: 'clients', columnName: 'street' }))) as any).change.id
+    droppedCity = ((await asPerson(() => dropWorkspaceColumn(projectId, { tableName: 'clients', columnName: 'city' }))) as any).change.id
+  }, 120_000)
+
+  it('is three governed changes, each recorded with what it did, the dropped values kept', async () => {
+    expect(await record(created)).toMatchObject({ status: 'healthy', risk: 'additive' })
+    for (const id of [droppedStreet, droppedCity]) {
+      const r = await record(id)
+      expect(r).toMatchObject({ status: 'healthy', risk: 'destructive' })
+      expect(((r.preserved as any).entries as any[])[0]).toMatchObject({ kind: 'column', table: 'clients', reason: 'dropped', keyColumns: ['id'] })
+    }
+    expect(await columnsOf('clients')).not.toContain('street')
+    expect(await columnsOf('clients')).not.toContain('city')
+    expect(await rowsOf('client_addresses')).toHaveLength(3)
+  })
+
+  it('an older step is not restored over a newer one on the same table', async () => {
+    const p = (await previewRecovery(projectId, droppedStreet))!
+    expect(p.safety).toBe('blocked')
+    expect(p.blockedBy.map((b) => b.id)).toContain(droppedCity)
+  })
+
+  it('restoring the drops, newest first, puts every moved value back on its row, lossless', async () => {
+    for (const id of [droppedCity, droppedStreet]) {
+      const p = (await previewRecovery(projectId, id))!
+      expect(p.safety).toBe('lossless')
+      expect(await restore(id)).toMatchObject({ ok: true, status: 'restored' })
+    }
+    await expectState(before, ['clients'])
+  })
+
+  it('restoring the new table waits for a person, because its rows were written after it, and keeps them', async () => {
+    const p = (await previewRecovery(projectId, created))!
+    expect(p.safety).toBe('needs_approval')
+    expect(p.acknowledgement).toEqual({ 'rows_set_aside:client_addresses:': 3 })
+    const out = await restore(created, p.acknowledgement)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect(await rowsOf('client_addresses')).toBeNull()
+    const rec = await record((out as Extract<typeof out, { ok: true }>).recoveryId)
+    const entry = ((rec.preserved as any).entries as any[]).find((e) => e.kind === 'table' && e.table === 'client_addresses')
+    expect((await query<{ n: number }>(`SELECT count(*)::int AS n FROM "${entry.vault}"."${entry.vaultTable}"`))[0].n).toBe(3)
+    // The original is exactly as it was before the split began.
+    await expectState(before, ['clients'])
+  })
+})
+
 // ── Writes since ─────────────────────────────────────────────────────────────
 
 describe('a restore that would set aside data written since needs approval, and runs with exactly what was measured', () => {
@@ -855,6 +1044,9 @@ describe('statements apply_migration refuses: nothing applied, nothing recorded'
     ['an enum column', "ALTER TABLE shelves ADD COLUMN mood mood", 'UNSUPPORTED_TYPE'],
     ['CREATE VIEW', 'CREATE VIEW pantry_items AS SELECT item FROM pantry', 'UNSUPPORTED_STATEMENT'],
     ['a refused statement after a valid one', 'CREATE TABLE never_made (x text);\nDROP TABLE shelves', 'DESTRUCTIVE_REFUSED'],
+    ['rows moved between tables (INSERT … SELECT)', 'INSERT INTO larder (item) SELECT item FROM pantry', 'DML_NOT_MIGRATION'],
+    ['rows deleted (DELETE)', 'DELETE FROM pantry WHERE qty IS NULL', 'DML_NOT_MIGRATION'],
+    ['rows rewritten (UPDATE)', "UPDATE pantry SET item = upper(item)", 'DML_NOT_MIGRATION'],
   ])('%s', async (_label, statement, code) => {
     const changes = await prisma.backendChange.count({ where: { projectId } })
     const before = await catalog()

@@ -373,6 +373,12 @@ export async function executeDataMigration(
         for (const stmt of plan.statements) {
           const n = await tx.$executeRawUnsafe(stmt.sql, ...stmt.params)
           if (stmt.sql.startsWith('UPDATE')) affectedRows = Number(n) || 0
+          // A PL/pgSQL trigger that already fired in this transaction (the
+          // updatedAt helper on every Backenly table) keeps returning rows of
+          // the table's old shape: an UPDATE after a column was added would
+          // drop the new column's values, and one after a retype would garble
+          // the retyped column. Re-plan after every change of shape.
+          if (stmt.sql.startsWith('ALTER TABLE')) await tx.$executeRawUnsafe('DISCARD PLANS')
         }
         if (op.op === 'cast_column') {
           const rows = await tx.$queryRawUnsafe<{ n: number }[]>(

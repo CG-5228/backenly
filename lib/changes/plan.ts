@@ -115,6 +115,11 @@ export interface PlanInput {
  *     free before the original is renamed back into it;
  *   - which rows still hold the change's values is recorded before any type is
  *     converted back, and the original values go back after it;
+ *   - no value is written to a table until every column of it has its final
+ *     shape: a PL/pgSQL trigger that fired earlier in the same transaction
+ *     (the updatedAt helper every Backenly table has) keeps returning rows of
+ *     the table's old shape, which drops what is written to a column added
+ *     after it fired and garbles a column retyped after it fired;
  *   - what the restore leaves in a column it converts or fills is recorded once
  *     every value is in place, so reapplying can tell it from later writes;
  *   - columns get their values before NOT NULL is asserted on them;
@@ -142,6 +147,7 @@ export const PHASE = {
   RESTORE_TABLES: 9,
   RESTORE_COLUMNS: 10,
   ALTER_COLUMNS: 11,
+  RESTORE_COLUMN_VALUES: 11.4,
   RESTORE_VALUES: 11.5,
   AFTER_IMAGES: 11.8,
   DROP_ADDED_FUNCTIONS: 11.9,
@@ -458,7 +464,7 @@ export function planRestore(input: PlanInput): RestorePlan {
       const kept = findColumnEntry(input.preserved, [fin, cur], [bc.name], 'dropped')
       if (kept && kept.keyColumns.length > 0) {
         const match = kept.keyColumns.map((kc) => `t.${q(kc)} = v.${q(kc)}`).join(' AND ')
-        add(PHASE.RESTORE_COLUMNS,
+        add(PHASE.RESTORE_COLUMN_VALUES,
           `UPDATE ${T(fin)} AS t SET ${q(bc.name)} = v.${q(kept.column)} FROM ${qualified(kept.vault, kept.vaultTable)} AS v WHERE ${match}`,
           `Put back the kept values of ${fin}.${bc.name}, row by row.`)
         plan.checks.push({
