@@ -148,7 +148,9 @@ async function notifyOwnerOfRequest(row: { id: string; projectId: string; tool: 
     projectName: project.name,
     approvalId: row.id,
     tool: row.tool,
-    target: row.target,
+    // The action only for a project kept in another region: the target can
+    // name a row or a file, and the request keeps it (lib/data-plane/residency.ts).
+    target: (await quotesKeptHere(row.projectId)) ? row.target : null,
     expiresAt: row.expiresAt,
   })
 }

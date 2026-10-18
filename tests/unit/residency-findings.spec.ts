@@ -14,7 +14,8 @@
  *     timeline events name the action only. Approval reads them back and
  *     replays them exactly, runs nothing when the region cannot be read, and
  *     records only their shape and the outcome's status;
- *   - its held actions are not investigated by the model.
+ *   - its held actions are not investigated by the model, and an approval
+ *     request's notice names the action only.
  * A home project's rows are unchanged, except that no approval records a held
  * action's arguments, in any region: the record keeps their shape, since the
  * arguments can carry a secret.
@@ -28,6 +29,7 @@ const mockEvents: any[] = []
 const mockFindings = new Map<string, any>()
 const mockAudits: any[] = []
 const mockCorrections: any[] = []
+const mockNotifications: any[] = []
 /** The order a held action's body and its finding were written in. */
 const mockWrites: string[] = []
 /** The regional databases' bodies, by kind and id. */
@@ -90,6 +92,13 @@ jest.mock('@/lib/db/prisma', () => {
         count: jest.fn(async () => 0),
       },
       correctionEvent: { create: jest.fn(async ({ data }: any) => { mockCorrections.push(data); return data }) },
+      agentApprovalRequest: { create: jest.fn(async ({ data }: any) => ({ id: 'approval-1', createdAt: new Date(), ...data })) },
+      platformNotification: {
+        findFirst: jest.fn(async () => null),
+        create: jest.fn(async ({ data }: any) => { mockNotifications.push(data); return data }),
+      },
+      notificationPreference: { findUnique: jest.fn(async () => null) },
+      user: { findUnique: jest.fn(async () => null) },
       backendPattern: { upsert: jest.fn(async () => ({})) },
     },
   }
@@ -176,8 +185,9 @@ jest.mock('@/lib/auth/route-protection', () => ({
 }))
 jest.mock('@/lib/edition/guard', () => ({ canWriteProject: jest.fn(async () => true) }))
 
-// The approval module's dispatcher.
+// The approval module's dispatcher and the owner's notice.
 jest.mock('@/lib/ai/brain/tools', () => ({ dispatchTool: jest.fn() }))
+jest.mock('@/lib/notifications/platform', () => ({ notifyApprovalRequested: jest.fn(async () => {}) }))
 
 // The investigator's model and its deterministic pass.
 jest.mock('@/lib/ai/llm', () => ({ AiError: class AiError extends Error {}, generate: jest.fn() }))
@@ -205,7 +215,8 @@ import { heldTargetStandIn, withHeldActions } from '@/lib/operational-memory/hel
 import { sealParams } from '@/lib/operational-memory/sealed-params'
 import { buildFixAction, getManualRemediationHint } from '@/lib/core/fix-actions'
 import { diagnoseEscalatedFindings } from '@/lib/autonomy/escalation-diagnosis'
-import { getParkedActionForProject } from '@/lib/mcp/approvals'
+import { createApprovalRequest, getParkedActionForProject } from '@/lib/mcp/approvals'
+import { notifyApprovalRequested } from '@/lib/notifications/platform'
 import { POST as approve } from '@/app/api/projects/[id]/health/approve/route'
 
 const ROW_ECHO = 'invalid input syntax for type uuid: "alice@example.com"'
@@ -562,5 +573,48 @@ describe('the investigator', () => {
     })
     await diagnoseEscalatedFindings(projectId)
     expect([...mockInvestigated].sort()).toEqual(investigated)
+  })
+})
+
+describe('an approval request\'s notice', () => {
+  const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)) }
+  const request = (projectId: string) =>
+    createApprovalRequest({
+      projectId,
+      userId: 'u-owner',
+      message: 'drop the customers table',
+      danger: { tool: 'drop_table', target: 'customers', rowCount: 12, reversible: false },
+      toolArgs: { table: 'customers' },
+    })
+
+  it.each([
+    ['p-home-notice', null, 'customers'],
+    ['p-use1-notice', 'us-east-1', null],
+  ])('names the target for a home project and only the action for a regional one (%s)', async (projectId, region, target) => {
+    mockRegions.set(projectId, region)
+    const notify = notifyApprovalRequested as jest.Mock
+    notify.mockClear()
+    await request(projectId)
+    await flush()
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0][1]).toMatchObject({ projectId, tool: 'drop_table', target })
+  })
+
+  it('says only the action when it has no target', async () => {
+    const { notifyApprovalRequested: real } = jest.requireActual('@/lib/notifications/platform')
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      mockNotifications.length = 0
+      const expiresAt = new Date('2026-10-19T12:00:00Z')
+      await real('u-owner', { projectId: 'p-use1-notice', projectName: 'Shop', approvalId: 'a1', tool: 'drop_table', target: null, expiresAt })
+      await real('u-owner', { projectId: 'p-home-notice', projectName: 'Shop', approvalId: 'a2', tool: 'drop_table', target: 'customers', expiresAt })
+    } finally {
+      log.mockRestore()
+    }
+    const [regional, home] = mockNotifications
+    expect(regional.body).toMatch(/^It asked to run drop_table\. Approve or reject it/)
+    expect(regional.metadata.target).toBeUndefined()
+    expect(home.body).toMatch(/^It asked to run drop_table on customers\. Approve or reject it/)
+    expect(home.metadata.target).toBe('customers')
   })
 })
