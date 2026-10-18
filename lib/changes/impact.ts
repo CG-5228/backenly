@@ -229,10 +229,18 @@ async function measureRewritten(
   const col = `t.${q(now.name)}`
   const keyed = entry && entry.keyColumns.length > 0 && entry.afterColumn
   // Rows that will NOT get their original value back: written or updated since.
-  const notRestored = keyed
-    ? `NOT EXISTS (SELECT 1 FROM ${qualified(entry!.vault, entry!.vaultTable)} a WHERE ${entry!.keyColumns
+  // One join on the key, not a lookup per row. This was a correlated NOT EXISTS
+  // inside FILTER, which PostgreSQL never turns into a join, so it scanned the
+  // whole (unindexed) vault once per row: a rewrite of 133,000 values on a
+  // 200,000-row table ran past the proof's two-minute limit. The vault holds one
+  // row per key, the key of a table with a primary key, so the join adds none.
+  const from = keyed
+    ? `${qualified(schema, table)} t LEFT JOIN ${qualified(entry!.vault, entry!.vaultTable)} a ON ${entry!.keyColumns
         .map((kc) => `a.${q(kc)} = t.${q(kc)}`)
-        .join(' AND ')} AND a.${q(entry!.afterColumn!)} IS NOT DISTINCT FROM ${col})`
+        .join(' AND ')}`
+    : `${qualified(schema, table)} t`
+  const notRestored = keyed
+    ? `NOT (a.${q(entry!.keyColumns[0])} IS NOT NULL AND a.${q(entry!.afterColumn!)} IS NOT DISTINCT FROM ${col})`
     : 'true'
   const lossy = typeChanged ? `${col} IS NOT NULL AND (${col}::${then.type})::${now.type} IS DISTINCT FROM ${col}` : 'false'
   let r: { since: string; lossy: string }
@@ -241,11 +249,17 @@ async function measureRewritten(
       await db.query<{ since: string; lossy: string }>(
         `SELECT count(*) FILTER (WHERE ${notRestored} AND ${col} IS NOT NULL)::bigint AS since,
                 count(*) FILTER (WHERE ${notRestored} AND ${lossy})::bigint AS lossy
-           FROM ${qualified(schema, table)} t`,
+           FROM ${from}`,
       )
     ).rows[0]
   } catch (err: any) {
-    blockers.push(`Some values in ${table}.${now.name} cannot be converted back to ${then.type} (${String(err?.message ?? err).split('\n')[0]}).`)
+    // Only a failed conversion (SQLSTATE class 22, data exception) means a value
+    // cannot be converted back. A timeout or a lost connection means it could not
+    // be checked, and used to be reported as a conversion failure.
+    const message = String(err?.message ?? err).split('\n')[0]
+    blockers.push(String(err?.code ?? '').startsWith('22')
+      ? `Some values in ${table}.${now.name} cannot be converted back to ${then.type} (${message}).`
+      : `What restoring would do to ${table}.${now.name} could not be checked (${message}).`)
     return
   }
   const since = Number(r.since)
