@@ -1256,6 +1256,11 @@ tests/integration/branch-merge-governed.spec.ts
 # workspace or another project. Real schemas, vaults and purges.
 tests/integration/change-restore-point-unavailable.spec.ts
 
+# The undo routes that worked outside the change ledger (graph-pointer undo and
+# restore, the archive and approved-fix rollbacks) answer 410 MOVED to the
+# project admin and 404 to anyone else, and change nothing.
+tests/integration/retired-undo-routes.spec.ts
+
 # The SDK's data routes (/database/insert, update, delete and query) bind each
 # value as its column's type: a uuid, timestamp, numeric, integer, boolean and
 # jsonb column are written and filtered through each route. What PostgreSQL

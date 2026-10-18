@@ -90,7 +90,7 @@ import { PROBE_REGISTRY } from '@/lib/autonomy/hypothesis/probes'
 import { executeMaintenanceAddStructure } from '@/lib/autonomy/maintenance/primitives/add-structure'
 import { dualWriteInstalled, installDualWrite, removeDualWrite } from '@/lib/autonomy/maintenance/primitives/dual-write'
 import { runBackfillBatch } from '@/lib/autonomy/maintenance/primitives/backfill'
-import { estimateDataMigration, executeDataMigration, rollbackDataMigration } from '@/lib/execution/data-migration'
+import { estimateDataMigration, executeDataMigration } from '@/lib/execution/data-migration'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -1467,7 +1467,9 @@ describe('typed data migrations run in the project’s region', () => {
     await run(regionalUrl, `DROP TABLE IF EXISTS ${statuses()} CASCADE`).catch(() => {})
   })
 
-  it('estimates, applies with its checkpoint, and rolls back, in the region', async () => {
+  // Undoing it is restoring its governed change, which the governed-change block
+  // below proves runs in the region; rollbackDataMigration is retired.
+  it('estimates and applies with its checkpoint, in the region', async () => {
     process.env[REGION_VARIABLE] = regionalUrl
 
     expect(await estimateDataMigration(regionalProject, normalize)).toEqual([
@@ -1481,9 +1483,6 @@ describe('typed data migrations run in the project’s region', () => {
     expect(await rowsIn(regionalUrl, `SELECT status FROM "${schemaOf(regionalProject)}"."${checkpoint}" ORDER BY id`)).toEqual([
       { status: 'Open' }, { status: 'open' }, { status: 'closed' },
     ])
-
-    expect(await rollbackDataMigration(regionalProject, 'statuses', checkpoint)).toEqual({ success: true })
-    expect(await values()).toEqual(['Open', 'open', 'closed'])
   })
 
   it('refuses without a connection to the region, and runs nothing anywhere else', async () => {
@@ -1491,7 +1490,6 @@ describe('typed data migrations run in the project’s region', () => {
     const refused = { code: 'REGION_NOT_CONFIGURED' }
     await expect(estimateDataMigration(regionalProject, normalize)).rejects.toMatchObject(refused)
     await expect(executeDataMigration(regionalProject, normalize)).rejects.toMatchObject(refused)
-    await expect(rollbackDataMigration(regionalProject, 'statuses', '_dm_backup_20261017000000_statuses')).rejects.toMatchObject(refused)
   })
 })
 

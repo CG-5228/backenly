@@ -552,8 +552,8 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
 }
 
 // ── Card header ───────────────────────────────────────────────────────────────
-// The ONE "Waiting on you" title — mirrors "Recent guardrail actions" and
-// "Restore points" below it (icon + 13px title + trailing mono meta).
+// The ONE "Waiting on you" title — mirrors "Recent guardrail actions" below it
+// (icon + 13px title + trailing mono meta).
 
 function PanelHeader({
   count,

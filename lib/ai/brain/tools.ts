@@ -3209,7 +3209,7 @@ export async function dispatchTool(
         lines.push('', `${driftPending} schema change(s) arrived over a direct DB connection — call adopt_external_schema to fold them into the contract, or review under Autonomy.`)
       }
       if (snapshot) {
-        lines.push('', `Latest restore point: v${snapshot.versionNum} (${snapshot.tableCount} tables, ${snapshot.createdAt.toISOString()}). Rollback is available from Autonomy → Restore points.`)
+        lines.push('', `Latest restore point: v${snapshot.versionNum} (${snapshot.tableCount} tables, ${snapshot.createdAt.toISOString()}). To restore the state before a change: Database → Changes, or ask with deploy { action: "revert_change", changeId } (a person approves it).`)
       }
       if (openRows.length === 0 && approvals.length === 0 && driftPending === 0) {
         // An empty queue is evidence only for the checks that ran. Say which

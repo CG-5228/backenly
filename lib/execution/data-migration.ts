@@ -12,7 +12,7 @@
  *   - Checkpoint first. Before mutating, the affected table is copied to
  *     "_dm_backup_{ts}_{table}" inside the SAME transaction as the migration,
  *     so a failed migration leaves no backup litter and a successful one is
- *     restorable via rollbackDataMigration().
+ *     restorable through its governed change (lib/changes/recovery.ts).
  *   - Atomic. All operations in a migration run inside one transaction —
  *     either the whole migration lands or none of it does.
  *   - Dry-run first-class. estimateDataMigration() reports affected-row counts
@@ -86,7 +86,7 @@ export interface DataMigrationEstimate {
 export interface DataMigrationResult {
   success: boolean
   applied: Array<{ op: string; table: string; affectedRows: number }>
-  /** Name of the in-schema backup table (restore with rollbackDataMigration). */
+  /** Name of the in-schema backup table: the pre-image a governed change keeps as its restore point. */
   backupTables: Record<string, string>
   error?: string
 }
@@ -423,38 +423,8 @@ function rewritesOf(ops: DataMigrationOp[]): Array<{ table: string; columns: str
   return [...by].map(([table, columns]) => ({ table, columns }))
 }
 
-/**
- * Restore a table from a migration checkpoint by swapping the backup into
- * place. LIMITATION (documented, not hidden): the checkpoint was created with
- * CREATE TABLE AS, which copies data but not constraints/indexes/defaults —
- * a rollback restores every row and column type exactly, but PK/FK/index
- * definitions must be re-applied (the observer's missing-FK/missing-index
- * detectors will flag and offer to fix them on the next scan).
- */
-export async function rollbackDataMigration(
-  projectId: string,
-  table: string,
-  backupTable: string,
-): Promise<{ success: boolean; error?: string }> {
-  const schemaName = `workspace_${projectId}`
-  const db = await workspaceRawClient(projectId)
-  try {
-    assertIdent(table, 'table')
-    if (!/^_dm_backup_\d{8,14}_[a-zA-Z_][a-zA-Z0-9_]*$/.test(backupTable)) {
-      throw new Error(`"${backupTable}" is not a data-migration backup table.`)
-    }
-    await db.$transaction(async (tx) => {
-      await tx.$executeRawUnsafe(
-        rlsSessionSql(),
-        ...rlsSessionParams({ userId: null, isServiceRole: true }),
-      )
-      await tx.$executeRawUnsafe(`DROP TABLE "${schemaName}"."${table}"`)
-      await tx.$executeRawUnsafe(
-        `ALTER TABLE "${schemaName}"."${backupTable}" RENAME TO "${table}"`,
-      )
-    }, { timeout: 60_000 })
-    return { success: true }
-  } catch (err: any) {
-    return { success: false, error: err?.message ?? String(err) }
-  }
-}
+// rollbackDataMigration, which dropped the live table and renamed the backup
+// into place outside the change ledger (and with it every row written since),
+// is retired. A data rewrite is undone by restoring the state before its
+// governed change, which puts back only rows nobody has changed since
+// (lib/changes/recovery.ts).

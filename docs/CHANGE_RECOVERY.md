@@ -238,3 +238,26 @@ from the console and requires the restore to come back verified.
 - A restore crossing a later change to the same table is refused, not merged.
 - A change interrupted by a crash is reconciled to `manual_intervention_required`
   with its footprint; a person decides.
+- A restore that today's rows would break (a dropped CHECK, UNIQUE, foreign or
+  primary key, with rows written since that it would refuse) is never offered:
+  its preview is `blocked`. Run anyway, it fails inside its own transaction and
+  nothing changes.
+
+## The other ways back, and why they stay
+
+Restoring the state before a change is the only schema undo. The routes that
+undid changes another way (moving the active-graph pointer, re-creating what a
+saved version named, replaying a snapshot's DDL, the archive restores) answer
+410 and point here (`lib/changes/retired.ts`). Two ways back remain, on
+purpose, outside the ledger:
+
+- **Project snapshots** (Database → Snapshots) restore the whole database from a
+  backup, a person's disaster-recovery step. A table it reshaped no longer
+  matches what a change left, so restoring that change is refused as a conflict,
+  as for any change made outside Backenly, rather than run over it.
+- **The repair loop's policy recovery** (`restore_policies`, declared in
+  `lib/authority/action-classes.ts`) puts a table's row-level-security policies
+  back when the repair's own verifier rejects its change, guarded against
+  overwriting a later change and written to the audit log. Moving it onto the
+  ledger needs a recovery mode for a change the ledger verified but a repair
+  rejected; until then it is the one recovery that runs beside it.
