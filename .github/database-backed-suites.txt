@@ -1274,3 +1274,10 @@ tests/integration/v1-database-typed-columns.spec.ts
 # nothing else, and drops it again when the home rows are refused. Rows,
 # schemas and both databases are the property, so it needs a real Postgres.
 tests/integration/project-creation-order.spec.ts
+
+# The SDK's create, get, list, count, update, delete and query builder return
+# the row and the results their documentation promises: all of them through the
+# Next data routes, and create, list and a multi-row insert through the
+# runtime's. Each server's insert answer is pinned. Real tables behind both
+# servers are the property, so it needs a real Postgres.
+tests/integration/sdk-data-routes.spec.ts

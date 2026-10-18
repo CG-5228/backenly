@@ -98,6 +98,14 @@ interface AgentApproval {
   expiresAt: string
   executedAt: string | null
   resultSummary: string | null
+  /**
+   * False when the request's exact call is kept in the project's region and
+   * could not be read: the card shows only stand-ins, so it cannot be approved.
+   * Absent from an older server, which kept every request on its row.
+   */
+  readable?: boolean
+  /** The request as this card shows it, sent back with an approval so only what was shown runs. */
+  shownDigest?: string | null
 }
 
 /** Per-row trust state machine — identical to the one AutonomyPanel used. */
@@ -361,14 +369,20 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
     }
   }
 
-  const decideAgentRequest = async (approvalId: string, decision: 'approve' | 'reject') => {
+  const decideAgentRequest = async (approvalId: string, decision: 'approve' | 'reject', shownDigest?: string | null) => {
     setRow(approvalId, { phase: decision === 'approve' ? 'applying' : 'dismissing' })
     try {
       const res = await fetch(`/api/projects/${projectId}/agent-approvals`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approvalId, decision }),
+        // An approval names the request as this card showed it, so the server
+        // runs only what the human read.
+        body: JSON.stringify({
+          approvalId,
+          decision,
+          ...(decision === 'approve' && shownDigest ? { shownDigest } : {}),
+        }),
       })
       const j = await res.json().catch(() => ({} as any))
 
@@ -402,6 +416,8 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
           ? 'The operation could not be executed. Try again in a moment.'
           : 'Could not reject. Try again.'),
       })
+      // The request changed under this card, or was decided elsewhere: show it as it is now.
+      if (res.status === 409) fetchReport(true)
     } catch {
       setRow(approvalId, { phase: 'error', message: 'Network error. Check your connection and try again.' })
     }
@@ -534,7 +550,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
               projectId={projectId}
               request={a}
               state={rowState[a.id] ?? { phase: 'idle' }}
-              onApprove={() => decideAgentRequest(a.id, 'approve')}
+              onApprove={() => decideAgentRequest(a.id, 'approve', a.shownDigest)}
               onReject={() => decideAgentRequest(a.id, 'reject')}
               onResetError={() => setRow(a.id, { phase: 'idle' })}
             />
@@ -602,15 +618,17 @@ function PrimaryAction({
   onClick,
   busy,
   busyLabel,
+  disabled,
   children,
 }: {
   onClick: () => void
   busy: boolean
   busyLabel: string
+  disabled?: boolean
   children: React.ReactNode
 }) {
   return (
-    <KitButton variant="primary" onClick={onClick} disabled={busy}>
+    <KitButton variant="primary" onClick={onClick} disabled={busy || disabled}>
       {busy ? <><Loader2 className="size-3.5 animate-spin" /> {busyLabel}</> : children}
     </KitButton>
   )
@@ -664,6 +682,9 @@ function AgentRequestRow({
   const [showFull, setShowFull] = useState(false)
   const long = a.message.length > 180
   const shown = long && !showFull ? a.message.slice(0, 180) + '…' : a.message
+  // A card that could only show stand-ins is not something a human read, so it
+  // cannot be approved. Rejecting it needs nothing from the region.
+  const unreadable = a.readable === false
   return (
     <li className="px-5 py-3.5">
       <div className="flex items-start gap-3">
@@ -705,6 +726,11 @@ function AgentRequestRow({
               </>
             )}
           </p>
+          {unreadable && (
+            <p className="mt-2 text-[12px] text-amber-200/80">
+              The exact call is kept in the project’s region and could not be read just now. Refresh to try again.
+            </p>
+          )}
           {state.phase === 'error' && (
             <p className="mt-2 text-[12px] text-rose-300/90">
               {state.message}{' '}
@@ -723,7 +749,7 @@ function AgentRequestRow({
                 {state.phase === 'dismissing' ? <Loader2 className="size-3 animate-spin" /> : <XCircle className="size-3.5" />}
                 Reject
               </GhostAction>
-              <PrimaryAction onClick={onApprove} busy={state.phase === 'applying'} busyLabel={restore ? 'Restoring…' : 'Running…'}>
+              <PrimaryAction onClick={onApprove} busy={state.phase === 'applying'} busyLabel={restore ? 'Restoring…' : 'Running…'} disabled={unreadable}>
                 <CheckCircle2 className="size-3.5" /> {restore ? 'Approve restore' : <>Approve &amp; run</>}
               </PrimaryAction>
             </>
