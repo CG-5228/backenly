@@ -63,7 +63,7 @@ import {
 } from './ledger'
 import { claimRecovery, recordEvent, recordTiming, releaseRecovery, RECOVERY_LEASE_MS, transition } from './lifecycle'
 import { ChangeInProgressError, readCatalogOn, withChangeLock } from './lock'
-import { qualified, quoteIdent as q, vaultSchemaName } from './names'
+import { createVaultStatements, qualified, vaultSchemaName } from './names'
 import { planRestore, verifyAgainstCheckpoint, type PlanConflict, type PlannedStep, type RestorePlan } from './plan'
 import { rollbackWindowDays, windowEndsAt } from './policy'
 import { IN_EFFECT, RECOVERY_OWED, type ChangePreservation, type ChangeStatus, type PreservedEntry, type TableChange } from './types'
@@ -260,7 +260,7 @@ async function runPlan(
     }
     const impact = await opts.measure()
     opts.gate(impact)
-    if (opts.vault) await client.query(`CREATE SCHEMA IF NOT EXISTS ${q(opts.vault)}`)
+    if (opts.vault) for (const sql of createVaultStatements(opts.vault)) await client.query(sql)
     for (index = 0; index < plan.steps.length; index++) {
       await client.query(plan.steps[index].sql)
     }

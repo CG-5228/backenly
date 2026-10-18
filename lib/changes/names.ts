@@ -13,7 +13,8 @@
  * restores carry it. It is never registered with the data plane and no API role
  * is granted USAGE on it, so nothing in it is reachable over REST or a
  * direct-access connection (`isChangeVaultSchema` is how the code that walks
- * every workspace schema tells it apart).
+ * every workspace schema tells it apart). The backup role alone may read it,
+ * so a deployment recovery bundle can dump it (`createVaultStatements`).
  */
 
 import { createHash } from 'crypto'
@@ -36,6 +37,36 @@ export function vaultSchemaName(projectId: string, seq: number): string {
 export function isVaultSchema(projectId: string, schema: string): boolean {
   assertValidProjectId(projectId)
   return isChangeVaultSchema(schema) && schema.startsWith(`workspace_${projectId}_r`)
+}
+
+/**
+ * The statements that create a vault, readable by the backup role.
+ *
+ * A deployment recovery bundle dumps every `workspace_*` schema as the backup
+ * role (lib/recovery/export.ts), which reads only what it was granted. Its
+ * installer (scripts/setup-backup-role.ts) grants the schemas that existed when
+ * it ran, and a vault is made later, by the change that needs it, so the next
+ * bundle failed "permission denied for schema workspace_<id>_r<seq>".
+ *
+ * USAGE on the vault, and SELECT on what this role creates in it. A table moved
+ * in keeps its own grants, so the vault is as readable as the schema it came
+ * from. The role is named as backenly_direct_sync_schema names it
+ * (scripts/setup-direct-access.sql), and an install without it gets no grant.
+ */
+export function createVaultStatements(vault: string): string[] {
+  if (!isChangeVaultSchema(vault)) throw new Error(`Not a change vault: ${vault}`)
+  const grant = (sql: string) => `EXECUTE format(${literal(sql)}, ${literal(vault)}, r);`
+  return [
+    `CREATE SCHEMA IF NOT EXISTS ${quoteIdent(vault)}`,
+    [
+      `DO $$ DECLARE r text := coalesce(nullif(current_setting('backenly.backup_role', true), ''), 'backenly_backup');`,
+      'BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN',
+      grant('GRANT USAGE ON SCHEMA %I TO %I'),
+      grant('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT ON TABLES TO %I'),
+      grant('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT ON SEQUENCES TO %I'),
+      'END IF; END $$',
+    ].join(' '),
+  ]
 }
 
 /**

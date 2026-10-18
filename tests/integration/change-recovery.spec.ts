@@ -21,6 +21,8 @@
  *   integrity     a tampered restore point or kept data is refused
  *   the record    status edges, write-once evidence and append-only events are
  *                 enforced by the database itself
+ *   backups       the backup role can read every vault, read only, so a
+ *                 deployment recovery bundle still dumps
  */
 
 jest.mock('@cloud/entitlements', () => {
@@ -53,6 +55,9 @@ import { installChangeLedgerGuard } from '../helpers/change-ledger-guard'
 let ownerId: string
 let projectId: string
 let schema: string
+
+const BACKUP = 'backenly_backup'
+let createdBackupRole = false
 
 const originalEdition = process.env.BACKENLY_EDITION
 const originalEngineMode = process.env.ENGINE_MODE
@@ -104,6 +109,16 @@ beforeAll(async () => {
   const project = await createProvisionedProject({ name: 'change-recovery', userId: ownerId })
   projectId = project.id
   schema = project.postgresSchema
+  // The backup role as scripts/setup-backup-role.ts leaves it: it reads the
+  // workspace and every table created there later. Not the vaults, which do
+  // not exist yet.
+  if ((await rows(`SELECT 1 FROM pg_roles WHERE rolname = '${BACKUP}'`)).length === 0) {
+    await ddl(`CREATE ROLE ${BACKUP} NOLOGIN BYPASSRLS`)
+    createdBackupRole = true
+  }
+  await ddl(`GRANT USAGE ON SCHEMA "${schema}" TO ${BACKUP}`)
+  await ddl(`ALTER DEFAULT PRIVILEGES IN SCHEMA "${schema}" GRANT SELECT ON TABLES TO ${BACKUP}`)
+  await ddl(`ALTER DEFAULT PRIVILEGES IN SCHEMA "${schema}" GRANT SELECT ON SEQUENCES TO ${BACKUP}`)
 }, 120_000)
 
 afterAll(async () => {
@@ -113,6 +128,10 @@ afterAll(async () => {
   // The guard allows deleting a project's changes only once the project is gone.
   if (projectId) await prisma.project.delete({ where: { id: projectId } }).catch(() => {})
   if (ownerId) await prisma.user.delete({ where: { id: ownerId } }).catch(() => {})
+  if (createdBackupRole) {
+    await ddl(`DROP OWNED BY ${BACKUP}`).catch(() => {})
+    await ddl(`DROP ROLE IF EXISTS ${BACKUP}`).catch(() => {})
+  }
   await closeChangeLockPool()
   process.env.BACKENLY_EDITION = originalEdition
   process.env.ENGINE_MODE = originalEngineMode
@@ -603,5 +622,33 @@ describe('the record is enforced by the database', () => {
     await expect(ddl(`UPDATE backend_change_events SET type = 'verified' WHERE "changeId" = '${id}'`)).rejects.toThrow(/append-only/)
     await expect(ddl(`DELETE FROM backend_change_events WHERE "changeId" = '${id}'`)).rejects.toThrow(/append-only/)
     expect(await events(id)).toEqual(['checkpointed', 'applied', 'verified'])
+  })
+})
+
+// ── Backups ──────────────────────────────────────────────────────────────────
+
+describe('the vaults and the backup role', () => {
+  // A deployment recovery bundle dumps every workspace_* schema as the backup
+  // role, so a vault it cannot read fails the whole bundle: the self-host
+  // qualification stopped at "permission denied for schema workspace_<id>_r2".
+  it('can read every vault the changes and restores above made, and write none', async () => {
+    const vaults = await rows<{ vault: string; usage: boolean; relations: number; unreadable: number; writable: number }>(`
+      SELECT n.nspname AS vault,
+             has_schema_privilege('${BACKUP}', n.oid, 'USAGE') AS usage,
+             count(c.oid)::int AS relations,
+             count(c.oid) FILTER (WHERE NOT has_table_privilege('${BACKUP}', c.oid, 'SELECT'))::int AS unreadable,
+             count(c.oid) FILTER (WHERE c.relkind IN ('r', 'p')
+               AND has_table_privilege('${BACKUP}', c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE'))::int AS writable
+        FROM pg_namespace n
+        LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'S')
+       WHERE n.nspname ~ '^workspace_${projectId}_r[0-9]+$'
+       GROUP BY n.nspname, n.oid
+       ORDER BY n.nspname`)
+    // A change's own vault and a restore's: the drop above and the restore that set rows aside.
+    expect(vaults.filter((v) => v.relations > 0).length).toBeGreaterThanOrEqual(2)
+    for (const v of vaults) {
+      expect({ vault: v.vault, usage: v.usage, unreadable: v.unreadable, writable: v.writable })
+        .toEqual({ vault: v.vault, usage: true, unreadable: 0, writable: 0 })
+    }
   })
 })

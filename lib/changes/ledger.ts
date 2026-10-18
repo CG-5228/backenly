@@ -49,7 +49,7 @@ import { resultDataFor } from './impact'
 import { checkpointHash } from './integrity'
 import { recordEvent, transition } from './lifecycle'
 import { readCatalogOn, withChangeLock } from './lock'
-import { quoteIdent, vaultSchemaName } from './names'
+import { createVaultStatements, vaultSchemaName } from './names'
 import { keptSteps, keptText, keptVerification, quotesKeptHere } from './residency'
 import { verifyChange, type ChangeVerification, type Expectation } from './verify'
 import type { ChangeKind, ChangePreservation, ChangeStatus, ChangeStep, PreservedEntry, RiskClass, TableChange } from './types'
@@ -96,9 +96,10 @@ export function currentChange(projectId: string): OpenChange | null {
 /** Create the change's vault on first use and return its name. */
 export async function ensureVault(change: OpenChange): Promise<string> {
   if (!change.vaultCreated) {
-    const sql = `CREATE SCHEMA IF NOT EXISTS ${quoteIdent(change.vault)}`
-    recordStatement(change, sql)
-    await change.client.query(sql)
+    for (const sql of createVaultStatements(change.vault)) {
+      recordStatement(change, sql)
+      await change.client.query(sql)
+    }
     change.vaultCreated = true
   }
   return change.vault
