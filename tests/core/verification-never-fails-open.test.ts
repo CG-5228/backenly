@@ -42,6 +42,8 @@ import { randomUUID } from 'crypto'
  * against a loop that never ran.
  */
 let verifierMode: 'real' | 'throws' | 'unresolved' = 'real'
+/** Whether the before-state capture the regression check compares with fails. */
+let baselineMode: 'real' | 'throws' = 'real'
 
 /**
  * A Proxy, not a spread.
@@ -76,6 +78,12 @@ jest.mock('@/lib/autonomy/desired-state', () => {
               }
             }
             return (load().evaluateFixOutcome as (...a: unknown[]) => unknown)(...args)
+          }
+        }
+        if (prop === 'captureCheckBaseline') {
+          return async (...args: unknown[]) => {
+            if (baselineMode === 'throws') throw new Error('baseline read failed')
+            return (load().captureCheckBaseline as (...a: unknown[]) => unknown)(...args)
           }
         }
         return load()[prop]
@@ -168,7 +176,19 @@ afterAll(async () => {
 
 beforeEach(() => {
   verifierMode = 'real'
+  baselineMode = 'real'
 })
+
+/** The HEALTH_AUTO_FIXED payloads for one seeded prefix. */
+async function autoFixedPayloads(prefix: string): Promise<Array<Record<string, any>>> {
+  const rows = await prisma.auditLog.findMany({
+    where: { projectId, action: 'HEALTH_AUTO_FIXED' },
+    select: { details: true },
+  })
+  return rows
+    .map(r => JSON.parse(r.details as string) as Record<string, any>)
+    .filter(d => typeof d.tableName === 'string' && d.tableName.startsWith(`${prefix}_`))
+}
 
 async function seedThreeUnindexedRelationships(prefix: string) {
   for (const t of [`${prefix}_a`, `${prefix}_b`, `${prefix}_c`]) {
@@ -330,7 +350,43 @@ describe('a probe that confirms the postcondition', () => {
     expect(res!.applied).toBeGreaterThan(0)
     expect(await auditCount('HEALTH_AUTO_FIXED')).toBeGreaterThan(0)
 
+    // The before-state was captured, so other guarantees were compared and
+    // the record may say so.
+    const fixed = await autoFixedPayloads('vok')
+    expect(fixed.length).toBeGreaterThan(0)
+    for (const d of fixed) expect(d.regressionCheck).toBe('ran')
+
     const report = await buildTrustReport(projectId, 30)
     expect(report.scoreboard.autonomousFixes).toBeGreaterThan(0)
+  }, 300_000)
+})
+
+// ── Only claim what was compared ─────────────────────────────────────────────
+
+describe('when the state before the fix cannot be captured', () => {
+  it('still repairs, and records that other guarantees were not compared', async () => {
+    await seedThreeUnindexedRelationships('vnobase')
+
+    baselineMode = 'throws'
+    const res = await runReconcilerLive(projectId)
+    expect(res).not.toBeNull()
+    expect(res!.applied).toBeGreaterThan(0)
+
+    // The target re-check still ran and confirmed closure. What could not be
+    // done is the comparison, and the record says exactly that.
+    const fixed = await autoFixedPayloads('vnobase')
+    expect(fixed.length).toBeGreaterThan(0)
+    for (const d of fixed) {
+      expect(d.verification).toBe('confirmed')
+      expect(d.regressionCheck).toBe('unavailable')
+    }
+
+    const finding = await prisma.healthFinding.findUnique({
+      where: { id: fixed[0].findingId as string },
+      select: { details: true },
+    })
+    const rb = (finding!.details as Record<string, any>).rollbackData
+    expect(rb.regressionCheck).toBe('unavailable')
+    expect(rb.baselineError).toMatch(/baseline read failed/)
   }, 300_000)
 })

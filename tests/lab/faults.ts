@@ -614,6 +614,51 @@ const catalogBlindness: LabFault = {
   },
 }
 
+// ── No deterministic repair: the AI arm's classes ───────────────────────────
+
+async function hasColumn(prisma: FaultContext['prisma'], schema: string, table: string, column: string): Promise<boolean> {
+  const rows = await prisma.$queryRawUnsafe<Array<{ n: number }>>(
+    `SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
+    schema, table, column,
+  )
+  return rows[0].n > 0
+}
+
+const missingRequestedColumn: LabFault = {
+  id: 'intent-drift-missing-column',
+  family: 'backend',
+  scenario: 'ecommerce',
+  description: 'A column the recorded intent asked for has been dropped from its table',
+  precondition: async ({ prisma, projectId, exec, schema }) => {
+    await exec(`ALTER TABLE "${schema}"."orders" ADD COLUMN IF NOT EXISTS "placed_at" timestamp`)
+    await prisma.schemaIntent.create({
+      data: { projectId, tableName: 'orders', columnName: 'placed_at', requestedType: 'timestamp', source: 'create_table' },
+    })
+  },
+  apply: async ({ exec, schema }) => {
+    await exec(`ALTER TABLE "${schema}"."orders" DROP COLUMN "placed_at"`)
+  },
+  verifyHealthy: async ({ prisma, schema }) =>
+    must(await hasColumn(prisma, schema, 'orders', 'placed_at'), 'orders.placed_at should exist before the fault'),
+  verifyBroken: async ({ prisma, schema }) =>
+    must(!(await hasColumn(prisma, schema, 'orders', 'placed_at')), 'orders.placed_at should be gone after the fault'),
+  verifyConverged: async ({ prisma, schema }) => hasColumn(prisma, schema, 'orders', 'placed_at'),
+  expected: {
+    detected: true,
+    actionClass: 'add_column',
+    shadowActionClass: 'add_column',
+    detectorInvariants: ['the_schema_is_what_was_asked_for'],
+    decision: 'PROPOSE_ONLY',
+    converges: false,
+    rationale:
+      'No deterministic repair exists by design: the column may have been dropped on purpose after ' +
+      'the intent was recorded. The right outcome is an AI-proposed ADD_COLUMN that a person approves ' +
+      '(the AI arm measures it); the loop on its own must neither repair it nor claim to. ' +
+      'The shadow Authority Decision has no add_column class registered and answers FREEZE; ' +
+      'that difference is a measured gap, not a wrong answer here.',
+  },
+}
+
 // ── Control: nothing is wrong ───────────────────────────────────────────────
 
 const healthy: LabFault = {
@@ -661,6 +706,7 @@ export const FAULTS: readonly LabFault[] = [
   schemaMoved,
   rlsRowBlindness,
   catalogBlindness,
+  missingRequestedColumn,
   healthy,
 ]
 

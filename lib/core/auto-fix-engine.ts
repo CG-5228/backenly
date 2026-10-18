@@ -31,7 +31,7 @@ import {
 } from '@/lib/execution/sql-recorder'
 import { classifyFix } from './fix-classifier'
 import { checkBreaker, auditBreakerTrip } from '@/lib/autonomy/circuit-breaker'
-import { evaluateFixOutcome, captureCheckBaseline } from '@/lib/autonomy/desired-state'
+import { evaluateFixOutcome, captureCheckBaseline, type FixOutcome } from '@/lib/autonomy/desired-state'
 import { FLAGS } from '@/lib/config/flags'
 import { withBuildLock } from '@/lib/ai/build-runtime/build-lock'
 import { normalizeFindingType } from './types'
@@ -129,8 +129,11 @@ async function capturePreFixState(
   projectId: string,
   baseType: FindingType,
   fixAction: Pick<AIAction, 'action' | 'params'>,
+  // An AI proposal knows its action touches the schema even when the finding
+  // type's deterministic repairs do not (intent_drift: the column it adds).
+  opts: { schemaTouching?: boolean } = {},
 ): Promise<{ preSnapshotId: string | null; preMetadata: PreFixMetadata | null; schemaTouching: boolean }> {
-  const schemaTouching = SCHEMA_TOUCHING.has(baseType)
+  const schemaTouching = opts.schemaTouching ?? SCHEMA_TOUCHING.has(baseType)
   const preSnapshot = schemaTouching
     ? await captureSchemaSnapshot(projectId, 'pre_migration').catch(() => null)
     : null
@@ -418,6 +421,8 @@ export async function executeApprovedFix(
   rollbackData?: Record<string, unknown>
   /** Whether the gap was re-probed after the fix and confirmed gone. */
   verification?: FixVerification
+  /** Whether other guarantees were compared before and after the fix. */
+  regressionCheck?: FixOutcome['regressionCheck']
 }> {
   const finding = await prisma.healthFinding.findUnique({ where: { id: findingId } })
   if (!finding) return { success: false, message: 'Finding not found.' }
@@ -530,7 +535,13 @@ export async function executeApprovedFix(
   const pre = await capturePreFixState(projectId, baseType, fixAction)
 
   // Baseline for the acceptance gate below (see the autonomous path for why).
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // A failed capture is kept rather than swallowed, so the record says
+  // collateral damage was not checked instead of implying nothing broke.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   // Retry on transient lock contention. A human clicked Approve — the right
   // behaviour is to WAIT for the lock, not bounce the wait back to the user.
@@ -624,6 +635,7 @@ export async function executeApprovedFix(
   // likely to be approving by hand — the auth pair, whose fix rewires sign-in for
   // every end-user of the project.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     // Same three-outcome rule as the autonomous path. The verifier throwing is
     // not the fix failing and is not the fix working, and a human who clicked
@@ -673,6 +685,7 @@ export async function executeApprovedFix(
       }
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history only — never the undo target.
@@ -699,6 +712,10 @@ export async function executeApprovedFix(
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError } : {}),
   }
 
   return {
@@ -707,6 +724,217 @@ export async function executeApprovedFix(
     snapshotId: pre.preSnapshotId ?? undefined,
     rollbackData,
     verification,
+    regressionCheck,
+  }
+}
+
+// ── Person-approved AI proposals ──────────────────────────────────────────────
+
+export interface ProposalExecution {
+  /** Whether anything was sent to the database. */
+  mutated: boolean
+  /** All three checks agreed: postcondition confirmed, re-check resolved, regression check ran clean. */
+  fixed: boolean
+  outcome: 'fixed' | 'not_started' | 'stale' | 'failed' | 'unverified'
+  message: string
+  /** Nothing ran only because another change held the lock: the same approval can be tried again. */
+  retryable?: boolean
+  postcondition?: 'confirmed' | 'refuted' | 'error'
+  recheck?: 'resolved' | 'unresolved' | 'unknown' | 'error'
+  regressionCheck?: FixOutcome['regressionCheck']
+  regressions?: string[]
+  /** Present whenever something ran: what Undo needs, and the audit record. */
+  rollbackData?: Record<string, unknown>
+}
+
+/**
+ * "Fixed" for an AI-proposed repair: the action's postcondition is confirmed
+ * in the catalog, the owning probe's re-check says resolved, and the regression
+ * check ran and found nothing broken. All three, or it is not fixed. A command
+ * succeeding, a model's reply, or silence never counts.
+ */
+export function isVerifiedRepair(checks: {
+  postcondition: 'confirmed' | 'refuted' | 'error'
+  recheck: 'resolved' | 'unresolved' | 'unknown' | 'error'
+  regressionCheck: FixOutcome['regressionCheck']
+  regressions: string[]
+}): boolean {
+  return (
+    checks.postcondition === 'confirmed' &&
+    checks.recheck === 'resolved' &&
+    checks.regressionCheck === 'ran' &&
+    checks.regressions.length === 0
+  )
+}
+
+/**
+ * Run a person-approved AI repair (lib/autonomy/ai-proposals.ts) through the
+ * same governed path as an approved deterministic fix, with stricter rules,
+ * because the repair came from a model rather than from the repair map:
+ *
+ *   - It does not start unless the starting state is established: the owning
+ *     probe must positively detect the gap right now, the check baseline must
+ *     be captured, and for a schema change the pre-change snapshot Undo
+ *     restores must exist. Any of those missing means nothing is changed.
+ *     There is no `.catch(() => null)` on this path.
+ *   - The touched catalog is re-read INSIDE the build lock, right before the
+ *     mutation; if it differs from what was approved, nothing runs.
+ *   - It is "fixed" only when the action's catalog postcondition is
+ *     confirmed AND the probe re-check says resolved AND the regression check
+ *     ran and found nothing broken. Anything else is reported as exactly what
+ *     it is, and a change that ran keeps its Undo record.
+ */
+export async function executeApprovedProposal(input: {
+  projectId: string
+  findingId: string
+  action: string
+  params: Record<string, unknown>
+  schemaTouching: boolean
+  expectedCatalogFingerprint: string
+  currentCatalogFingerprint: () => Promise<string>
+}): Promise<ProposalExecution> {
+  const { projectId, findingId, action, params } = input
+  const notStarted = (message: string): ProposalExecution => ({ mutated: false, fixed: false, outcome: 'not_started', message })
+
+  const finding = await prisma.healthFinding.findFirst({ where: { id: findingId, projectId } })
+  if (!finding) return notStarted('The finding no longer exists, so nothing was changed.')
+  const details = (finding.details ?? {}) as Record<string, unknown>
+  const baseType = (normalizeFindingType(finding.type, details)?.base ?? finding.type) as FindingType
+  const fixAction = { action: action as AIAction['action'], params }
+
+  const { recheckGap } = await import('@/lib/autonomy/desired-state')
+  const before = await recheckGap(projectId, finding.type, details).catch(() => 'error' as const)
+  if (before === 'resolved') return notStarted('The issue is no longer detected, so nothing was changed.')
+  if (before !== 'unresolved') {
+    return notStarted('Backenly cannot establish the starting state (the check for this issue could not run), so nothing was changed.')
+  }
+
+  let baseline: Awaited<ReturnType<typeof captureCheckBaseline>>
+  try {
+    baseline = await captureCheckBaseline(projectId)
+  } catch {
+    return notStarted('Backenly cannot establish the starting state (the before-check could not run), so nothing was changed.')
+  }
+
+  const pre = await capturePreFixState(projectId, baseType, fixAction, { schemaTouching: input.schemaTouching })
+  if (pre.schemaTouching && !pre.preSnapshotId) {
+    return notStarted('Backenly could not record the state Undo would restore, so nothing was changed.')
+  }
+
+  installSqlRecorder(prisma as any)
+  let captured
+  try {
+    captured = await withSqlCapture(() => withBuildLock(
+      projectId,
+      'modify',
+      async () => {
+        // The last moment before the mutation: the catalog the person approved.
+        if ((await input.currentCatalogFingerprint()) !== input.expectedCatalogFingerprint) {
+          return { stale: true as const }
+        }
+        return {
+          stale: false as const,
+          result: await executeAction(fixAction, projectId, undefined, 0, undefined, false),
+        }
+      },
+      // Human-approved: skip the autonomy cooldown/budget gate.
+      { skipCooldown: true },
+    ))
+  } catch (err) {
+    return { mutated: false, fixed: false, outcome: 'failed', message: `The change could not run: ${err instanceof Error ? err.message : String(err)}` }
+  }
+
+  const governed = captured.result
+  const statements = captured.statements
+  if (governed.error) {
+    return { ...notStarted('Another change is still in progress on this project, so nothing was changed. Approve again in a moment.'), retryable: true }
+  }
+  if (!governed.result) return notStarted('The change did not start, so nothing was changed.')
+  if (governed.result.stale) {
+    return { mutated: false, fixed: false, outcome: 'stale', message: 'The table changed after this was proposed, so nothing was changed. It needs a fresh proposal.' }
+  }
+
+  const result = governed.result.result
+  const rollbackData: Record<string, unknown> = {
+    fixAction,
+    fixResult: { message: result.message, data: result.data },
+    statements,
+    rollbackFormat: 2,
+    snapshotId: pre.preSnapshotId,
+    preMetadata: pre.preMetadata,
+    schemaTouching: pre.schemaTouching,
+    fixedAt: new Date().toISOString(),
+    source: 'ai_proposal',
+  }
+  if (!result.success) {
+    return {
+      mutated: statements.length > 0,
+      fixed: false,
+      outcome: 'failed',
+      message: `The change failed: ${result.error ?? result.message}`,
+      ...(statements.length > 0 ? { rollbackData } : {}),
+    }
+  }
+
+  const { verifyPostcondition } = await import('@/lib/autonomy/action-postconditions')
+  const postcondition = await verifyPostcondition(action, projectId, params)
+  // Same three-state rule as the other two acceptance call sites: a verifier
+  // that throws is neither the fix failing nor the fix working.
+  let verifierError: string | null = null
+  const evaluated = await evaluateFixOutcome(projectId, finding.type, details, baseline).catch((err: unknown) => {
+    verifierError = err instanceof Error ? err.message : String(err)
+    return null
+  })
+  if (verifierError !== null) {
+    Object.assign(rollbackData, { verification: 'verification_error', postcondition, verifierError })
+    return {
+      mutated: true,
+      fixed: false,
+      outcome: 'unverified',
+      rollbackData,
+      postcondition,
+      recheck: 'error',
+      regressionCheck: 'unavailable',
+      regressions: [],
+      message:
+        `The change ran, but the check that would confirm it could not complete (${verifierError}), ` +
+        'so it is not recorded as fixed. Backenly re-checks on its next pass.',
+    }
+  }
+  const recheck = evaluated?.recheck ?? 'error'
+  const regressionCheck = evaluated?.regressionCheck ?? 'unavailable'
+  const regressions = evaluated?.regressions ?? []
+  const fixed = isVerifiedRepair({ postcondition, recheck, regressionCheck, regressions })
+
+  const verification: FixVerification = fixed
+    ? 'confirmed'
+    : postcondition === 'error' || recheck === 'error'
+      ? 'verification_error'
+      : 'unverified'
+  Object.assign(rollbackData, { verification, regressionCheck, postcondition, recheck })
+
+  const checks = { postcondition, recheck, regressionCheck, regressions }
+  if (fixed) {
+    return {
+      mutated: true, fixed: true, outcome: 'fixed', rollbackData, ...checks,
+      message: 'Fixed and verified: the change is in the catalog, the issue is gone on re-check, and nothing else broke.',
+    }
+  }
+  if (regressions.length > 0) {
+    return {
+      mutated: true, fixed: false, outcome: 'failed', rollbackData, ...checks,
+      message: `The change closed the issue but broke ${regressions.length} check(s) that were passing before, so it is not recorded as fixed. Undo restores the state before it.`,
+    }
+  }
+  if (postcondition === 'refuted' || recheck === 'unresolved') {
+    return {
+      mutated: true, fixed: false, outcome: 'failed', rollbackData, ...checks,
+      message: 'The change ran but did not produce the intended state, so it is not recorded as fixed. The finding stays open.',
+    }
+  }
+  return {
+    mutated: true, fixed: false, outcome: 'unverified', rollbackData, ...checks,
+    message: 'The change ran, but it could not be fully checked, so it is not recorded as fixed. Backenly re-checks on its next pass.',
   }
 }
 
@@ -996,8 +1224,9 @@ export interface ChatResolveResult {
  * tool). Classification-aware, mirroring the autonomy safety contract:
  *
  *   auto        → apply immediately through the governed executor + verify
- *   approval    → only apply when the user has confirmed this turn; otherwise
- *                 return needs_confirmation with the risk so the brain can ask
+ *   approval    → only apply on a human's approval (`confirmed`, which only an
+ *                 approved Review Queue call sets); otherwise return
+ *                 needs_confirmation, naming the risk and where to approve it
  *   notify_only → return the manual-remediation guidance, never auto-act
  *
  * Reuses executeApprovedFix for the actual governed execution (advisory lock +
@@ -1029,9 +1258,28 @@ export async function resolveFindingFromChat(
 
   if (cls.decision === 'approval' && !opts.confirmed) {
     const risk = cls.riskNote ? ` (${cls.riskNote})` : ''
+    // No chat message can approve it, so put it where a person can, as the
+    // autonomy loop does: the Review Queue lists pending_approval findings only.
+    // Inviting a reply of "confirm" instead would reach nothing waiting and
+    // change nothing.
+    const queued = await prisma.healthFinding.updateMany({
+      where: { id: findingId, status: 'open' },
+      data: { status: 'pending_approval' },
+    })
+    if (queued.count > 0) {
+      await _writeAuditLog(projectId, 'HEALTH_FIX_AWAITING_APPROVAL', {
+        findingId,
+        findingType: type,
+        reason: cls.reason,
+        via: 'chat',
+      })
+    }
+    const waiting = queued.count > 0 || finding.status === 'pending_approval'
     return {
       outcome: 'needs_confirmation',
-      message: `${cls.reason}${risk} Confirm and I'll apply it.`,
+      message: waiting
+        ? `${cls.reason}${risk} This fix needs a person's approval, so it is waiting in the Review Queue on the Autonomy page, which shows exactly what it changes.`
+        : `${cls.reason}${risk} This fix needs a person's approval in the dashboard; a chat message cannot approve it.`,
       findingId,
       findingType: finding.type,
     }
@@ -1225,8 +1473,12 @@ async function _executeAutoFix(
   // can tell "this fix broke something" from "this was already broken". Without
   // a before-state there is nothing to compare against and a regression is
   // indistinguishable from a pre-existing failure, so the gate degrades to
-  // target-only verification rather than guessing.
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // target-only verification rather than guessing, and the record says so.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   let result
   installSqlRecorder(prisma as any)
@@ -1326,6 +1578,7 @@ async function _executeAutoFix(
   // A timeout does not prove the fix failed. It also does not prove it worked.
   // So the error case is its own state and is never success.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     let verifierError: string | null = null
     const outcome = await evaluateFixOutcome(projectId, type, details, baseline).catch(
@@ -1374,6 +1627,7 @@ async function _executeAutoFix(
         recovered ? `${outcome.reason} ${recovered}` : outcome.reason)
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history / diff surface only — NEVER the undo
@@ -1401,6 +1655,10 @@ async function _executeAutoFix(
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError } : {}),
   }
 
   await prisma.healthFinding.update({
@@ -1433,6 +1691,7 @@ async function _executeAutoFix(
     statements,
     // Read by the trust scoreboard: only 'confirmed' fixes count as verified.
     verification,
+    regressionCheck,
   })
 
   return { findingId, outcome: 'auto_fixed', message: result.message, rollbackData }

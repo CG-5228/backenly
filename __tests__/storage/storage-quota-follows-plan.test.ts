@@ -25,7 +25,7 @@ import type { UserEntitlements } from '@/lib/entitlements/types'
 let fileStorageMb: number | null = null
 jest.mock('@/lib/entitlements', () => ({
   ...jest.requireActual('@/lib/entitlements'),
-  getUserEntitlements: (): Promise<UserEntitlements> =>
+  getAccountEntitlements: (): Promise<UserEntitlements> =>
     Promise.resolve({ ...selfHostedEntitlements(), planName: 'TEST', maxFileStorageMb: fileStorageMb }),
 }))
 
@@ -143,6 +143,8 @@ describe('PUT /api/projects/[id]', () => {
 
     const request: any = {
       url: `http://localhost/api/projects/${projectId}`,
+      // The response names the project's API address, read from the request.
+      headers: new Headers(),
       json: async () => ({ name: 'renamed', storageUsed: 0, activeUsers: 99, apiRequests: 0 }),
     }
     const res = await updateProjectRoute(request, {})

@@ -8,8 +8,9 @@ export const dynamic = 'force-dynamic'
  *
  * POST /api/projects/[id]/agent-approvals
  *   Body: { approvalId: string, decision: 'approve' | 'reject' }
- *   Approving executes the parked operation immediately (brain replay with
- *   destructiveConfirmed=true) and returns the outcome.
+ *   Approving executes the parked operation immediately — the exact tool and
+ *   arguments recorded on the request, verbatim, with no model involved — and
+ *   returns the outcome. A request without an exact call is closed unrun.
  *
  * Auth: platform JWT + project ownership (withProjectAccess). Scoped agent
  * keys can create and poll requests over MCP but can never decide them —
@@ -18,6 +19,7 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectAccess } from '@/lib/auth/route-protection'
+import { canAdministerProject } from '@/lib/edition/guard'
 import { listApprovals, decideApproval } from '@/lib/mcp/approvals'
 
 export const GET = withProjectAccess(async (_req: NextRequest, { projectId }) => {
@@ -26,6 +28,17 @@ export const GET = withProjectAccess(async (_req: NextRequest, { projectId }) =>
 })
 
 export const POST = withProjectAccess(async (req: NextRequest, { user, projectId }) => {
+  // ADMIN: a request only parks here because its tool is destructive or
+  // executor-rated high risk, and approving one executes it immediately with
+  // the recorded arguments. Membership alone let an organization VIEWER be the
+  // "human approval" the whole safety model hinges on.
+  if (!(await canAdministerProject(user.userId, projectId))) {
+    return NextResponse.json(
+      { success: false, error: 'Project not found or access denied', code: 'PROJECT_ROLE_INSUFFICIENT' },
+      { status: 403 },
+    )
+  }
+
   let body: { approvalId?: string; decision?: string }
   try {
     body = await req.json()

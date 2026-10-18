@@ -1132,7 +1132,7 @@ State vocabulary: `full` · `degraded` · `absent` · **`backend-present-ui-abse
 | Realtime: channel policies | full | absent | — | gap |
 | **Logs explorer** | requires override | **backend-present-ui-absent** | `app/api/logs/route.ts`, 8 filters, **0 callers** | **ui-absent** |
 | Metrics / latency charts | needs Logflare | full, no extra service | `components/monitoring/MonitoringWorkbench.tsx` | **Backenly ahead** |
-| Advisors | security + performance | findings queue + auto-fix | `components/workspace/AdvisorBlock.tsx` | different shape |
+| Advisors | security + performance | findings queue + auto-fix | `components/workspace/WorkspaceHome.tsx`, `components/ReviewQueuePanel.tsx` | different shape |
 | **Backups / restore UI** | **cloud-only** | **backend-present-ui-absent** | `app/api/projects/[id]/backup/route.ts` GET/POST/PUT, **0 callers** | **cloud-only** since Part 7; restore still broken (Part 6) |
 | PITR | cloud-only | absent | — | — (parity) |
 | Branching | cloud-only | **cloud-only** (removed from self-host 2026-09-17, Part 7) | `lib/branches/engine.ts` | — (parity, by decision) |

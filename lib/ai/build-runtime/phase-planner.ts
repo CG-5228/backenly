@@ -26,16 +26,16 @@
  */
 
 import { z } from 'zod'
-import { getOpenAIClient, trackCompletionCost } from '../openai-service'
-import { withTimeout } from '../with-timeout'
 import { countReplans, recordAgentDecision } from './agent-decisions'
 import type { BuildJob, BuildNode, BuildPhase, NodeType } from './types'
+import { chat } from '@/lib/ai/llm/chat'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const PLANNER_MODEL = 'gpt-4o-mini'
-const PLANNER_TIMEOUT_MS = 15_000
-const PLANNER_TEMPERATURE = 0.2
+/** Reported as the model when the planner never got an answer. */
+const PLANNER_MODEL = 'not called'
+/** A build waits on the planner; past this it falls back to the static plan. */
+const PLANNER_TIMEOUT_MS = 30_000
 const MAX_REPLANS_PER_BUILD = 3
 const MAX_INSERT_NODES = 6
 const MAX_REMOVE_NODES = 4
@@ -164,38 +164,39 @@ export async function decideNextPhase(
   }
 
   let raw: string
+  let model = PLANNER_MODEL
   let promptTokens: number | undefined
   let completionTokens: number | undefined
 
+  // Cancelled, not just abandoned, at the deadline: a call left running past
+  // it would still be paid for.
+  const timeout = AbortSignal.timeout(PLANNER_TIMEOUT_MS)
   try {
-    const client = getOpenAIClient()
-    const completion = await withTimeout(
-      client.chat.completions.create({
-        model: PLANNER_MODEL,
-        temperature: PLANNER_TEMPERATURE,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: buildUserPrompt(job, observation) },
-        ],
-      }, { signal: options.signal }),
-      PLANNER_TIMEOUT_MS,
-      'phase-planner',
-    )
+    const completion = await chat({
+      purpose: 'build.plan',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: buildUserPrompt(job, observation) },
+      ],
+      json: true,
+      signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+      billing: { projectId: job.projectId },
+      label: 'phase-planner',
+    })
 
-    trackCompletionCost(completion, job.projectId, 'phase-planner')
-    promptTokens = completion.usage?.prompt_tokens
-    completionTokens = completion.usage?.completion_tokens
+    model = completion.result.model
+    promptTokens = completion.result.usage.promptTokens
+    completionTokens = completion.result.usage.outputTokens
 
-    raw = completion.choices[0]?.message?.content ?? ''
+    raw = completion.text ?? ''
     if (!raw) {
-      return fallback(startedAt, 'planner returned empty response', PLANNER_MODEL, promptTokens, completionTokens)
+      return fallback(startedAt, 'planner returned empty response', model, promptTokens, completionTokens)
     }
   } catch (err: any) {
-    const reason = err?.name === 'AbortError'
-      ? 'planner aborted'
-      : err?.message?.includes('timed out')
-        ? 'planner timed out'
+    const reason = timeout.aborted
+      ? 'planner timed out'
+      : options.signal?.aborted
+        ? 'planner aborted'
         : `planner call failed: ${err?.message ?? String(err)}`
     return fallback(startedAt, reason, PLANNER_MODEL)
   }
@@ -205,27 +206,27 @@ export async function decideNextPhase(
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return fallback(startedAt, 'planner returned invalid JSON', PLANNER_MODEL, promptTokens, completionTokens)
+    return fallback(startedAt, 'planner returned invalid JSON', model, promptTokens, completionTokens)
   }
 
   const result = PhaseDecisionSchema.safeParse(parsed)
   if (!result.success) {
     const issues = result.error.issues.slice(0, 3).map(i => `${i.path.join('.')}: ${i.message}`).join('; ')
-    return fallback(startedAt, `planner output failed schema validation: ${issues}`, PLANNER_MODEL, promptTokens, completionTokens)
+    return fallback(startedAt, `planner output failed schema validation: ${issues}`, model, promptTokens, completionTokens)
   }
 
   // ── Additional semantic guards ────────────────────────────────────────────
   // Even valid output is rejected when it conflicts with executor invariants.
   const semanticError = semanticGuard(result.data, job, observation)
   if (semanticError) {
-    return fallback(startedAt, `planner output rejected: ${semanticError}`, PLANNER_MODEL, promptTokens, completionTokens)
+    return fallback(startedAt, `planner output rejected: ${semanticError}`, model, promptTokens, completionTokens)
   }
 
   return {
     decision: result.data,
     fromAgent: true,
     telemetry: {
-      model: PLANNER_MODEL,
+      model,
       durationMs: Date.now() - startedAt,
       promptTokens,
       completionTokens,

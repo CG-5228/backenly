@@ -5,11 +5,11 @@
  * Analyzes auth, realtime, storage, API expansion, and performance implications.
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 import type { BackendStateGraph } from '@/lib/orchestration/backend-state-graph'
 import type { SemanticUnderstanding } from '@/lib/orchestration/semantic-understanding'
 
+import { chat } from '@/lib/ai/llm/chat'
 /**
  * Impact severity levels
  */
@@ -261,10 +261,8 @@ async function performAIAnalysis(
   existingGraph: BackendStateGraph,
   newEntities: string[]
 ): Promise<ImpactAnalysis> {
-  const openai = getOpenAIClient()
-  
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+  const response = await chat({
+    purpose: 'insight.explain',
     messages: [
       {
         role: 'system',
@@ -324,11 +322,12 @@ Return ONLY valid JSON.`
         content: 'Analyze infrastructure impact'
       }
     ],
-    temperature: 0.3,
-    max_tokens: 2000,
+    maxTokens: 2000,
+    json: true,
+    label: 'impact-analysis',
   })
   
-  const content = response.choices[0]?.message?.content
+  const content = response.text
   if (!content) {
     throw new Error('No response from AI')
   }

@@ -116,7 +116,7 @@ export default function UseCasesPage() {
           actions={
             <>
               <StartButton />
-              <ButtonLink href="/resources" variant="secondary">
+              <ButtonLink href="/docs" variant="secondary">
                 Read the docs
               </ButtonLink>
             </>

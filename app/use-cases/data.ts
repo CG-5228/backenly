@@ -77,7 +77,7 @@ const LIST: UseCaseData[] = [
       {
         label: 'Refuse',
         title: 'Destructive operations never execute over MCP',
-        body: 'They are absent from the advertised surface. A request to drop a table parks in the Review Queue with an approval id; the dashboard card shows the target and the live row count. Your agent polls check_approval, whose terminal statuses distinguish failed (nothing applied, safe to retry) from partial.',
+        body: 'They are absent from the advertised surface. A request to drop a table parks in the Review Queue with an approval id; the dashboard card shows the target and the live row count. Your agent polls check_approval; after a failed run it checks the current state before asking again, because a call that stops part-way can leave some of its work applied.',
       },
       {
         label: 'Type',

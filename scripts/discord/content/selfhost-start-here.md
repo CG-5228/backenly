@@ -17,7 +17,7 @@ That is the whole install. It generates the secrets, starts the Compose stack, c
 npm run dev     # dashboard :3000 · runtime :3001
 ```
 
-You need **Node 20+** and **Docker with Compose** on the host. Docker does not provide Node — the app, the scripts, and the CLI all run on the host. The installer needs one thing it can't generate for you: an `OPENAI_API_KEY` in `.env` for planning and the autonomy loop.
+You need **Node 20+** and **Docker with Compose** on the host. Docker does not provide Node — the app, the scripts, and the CLI all run on the host. The installer generates everything except one choice: an AI provider for the natural-language tools. Put `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in `.env`, or set `AI_PROVIDER=bedrock` with `BEDROCK_REGION`. The typed tools and the self-healing loop need no model.
 
 `npm run selfhost` is **safe to rerun**. It fills in what's missing and never rotates a secret that already exists, so a rerun can't sign out your sessions or break a running PostgREST.
 

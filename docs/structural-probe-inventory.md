@@ -42,7 +42,7 @@ finding, which is how a diagnostic engine becomes a fortune teller.
 | | |
 |---|---|
 | **Observation** | Number of RLS policies per table, their commands, and whether more than one applies to the same command on the same table. |
-| **Source** | `pg_policies`, already queried in `lib/ai/agents/security-agent.ts:62` and `lib/ai/behavioral-verifier.ts:816`. |
+| **Source** | `pg_policies`, already queried by the retired security agent and in `lib/ai/behavioral-verifier.ts:816`. |
 | **Coverage limits** | `security-agent.ts:67` carries the comment *"pg_policies may not be accessible — continue without RLS info"*. So absence of rows must be reported as **unknown**, never as "no policies". Materialised views and foreign tables have no policies and are not in scope. |
 | **Cost** | One indexed catalog read per project. Negligible. |
 | **Falsifies** | `policy_fragmentation` directly — one policy per command per table refutes it. Provides no information about the other three. |

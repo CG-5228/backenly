@@ -23,7 +23,7 @@ import { normalizeFindingType } from '../core/types'
  * autonomy-fix row. There are three writers in the codebase:
  *
  *   1. HEALTH_AUTO_FIXED        (auto-fix-engine)   → {findingType, ...}
- *   2. AGENT_AUTO_FIXED         (agent-orchestrator) → {title, category, location}
+ *   2. AGENT_AUTO_FIXED         (the retired agent orchestrator; history rows only) → {title, category, location}
  *   3. FIX_PLAN_AUTO_EXECUTED   (auto-fix-engine plan path) → {action, target, message}
  *
  * Every field is optional so the resolver below can pick whichever signal is

@@ -17,6 +17,11 @@
  *
  * Targets are marked in the shell with data-tour="…". A step whose target is
  * not on the page is dropped rather than pointed at empty space.
+ *
+ * A user whose coding agent is already connected is not told to connect it:
+ * the Connect stop is dropped and the tour ends on Done. The answer is the top
+ * bar's (lib/hooks/useAgentConnection.ts), read as it stands when the tour
+ * starts rather than asked for again.
  */
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
@@ -25,6 +30,7 @@ import { useParams, useRouter } from 'next/navigation'
 import { motion, useReducedMotion } from 'framer-motion'
 import { ArrowRight, X } from 'lucide-react'
 import { placeTooltip, type Placement, type Side } from '@/lib/tours/placement'
+import { readAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 const TOUR_ID = 'console'
 const LOCAL_KEY = 'backenly_tour_console'
@@ -110,6 +116,7 @@ export function ConsoleTour() {
   const projectId = params?.id as string | undefined
   const reduceMotion = useReducedMotion()
   const [steps, setSteps] = useState<Step[] | null>(null)
+  const [agentConnected, setAgentConnected] = useState(false)
   const [index, setIndex] = useState(0)
   const [rect, setRect] = useState<DOMRect | null>(null)
   const [cardHeight, setCardHeight] = useState(0)
@@ -134,8 +141,16 @@ export function ConsoleTour() {
         // Let the page settle so the first spotlight lands on a painted target.
         timer = setTimeout(() => {
           if (cancelled || window.innerWidth < MIN_WIDTH) return
-          const present = CONSOLE_TOUR.filter((s) => targetEl(s.target))
-          if (present.length > 0) setSteps(present)
+          // Still unknown here means the top bar has not heard back: keep the
+          // Connect stop, since a new user is who it is for.
+          const connected = !!projectId && readAgentConnection(projectId).status === 'connected'
+          const present = CONSOLE_TOUR.filter(
+            (s) => targetEl(s.target) && !(connected && s.target === 'connect-agent'),
+          )
+          if (present.length > 0) {
+            setAgentConnected(connected)
+            setSteps(present)
+          }
         }, START_DELAY_MS)
       })
       .catch(() => {
@@ -145,7 +160,7 @@ export function ConsoleTour() {
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [])
+  }, [projectId])
 
   const step = steps?.[index] ?? null
 
@@ -340,7 +355,7 @@ export function ConsoleTour() {
                 Back
               </button>
             )}
-            {last && projectId ? (
+            {last && projectId && !agentConnected ? (
               <button
                 type="button"
                 onClick={() => {

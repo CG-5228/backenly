@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { clientIpFromHeaders } from '@/lib/security/client-ip'
 import { authenticateApiKey } from '@/lib/middleware/apiKeyAuth'
 import { prisma } from '@/lib/db'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
+import { readEndUserBlocked } from '@/lib/services/end-user-blocked'
 import { createErrorResponse, ErrorCodes } from './errors'
 import { checkUsage, getUsageMessage } from '@/lib/scaling/usage-monitor'
 import { applySoftRateLimit } from '@/lib/scaling/usage-monitor'
@@ -14,8 +17,17 @@ import { PAUSED_CODE, PAUSED_MESSAGE, pausedDetails } from '@/lib/projects/servi
 import { touchProjectActivity } from '@/lib/projects/activity'
 import jwt from 'jsonwebtoken'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
+import {
+  SERVICE_ROLE_IN_BROWSER,
+  detectBrowserOrigin,
+  recordServiceRoleBrowserBlock,
+  serviceRoleRefusalMessage,
+} from '@/lib/security/service-role-exposure'
+import { MCP_KEY_HINT, MCP_KEY_IN_APP, isMcpCredential, mcpKeyRefusalMessage } from '@/lib/security/key-placement'
+import { endUserBearerToken } from '@/lib/security/end-user-bearer'
 
 import { INTERNAL_DOMAINS, isInternalOrigin } from '@/lib/security/internal-origin'
+import { answersFromCopy, authorizingProject } from '@/lib/auth-projection/read'
 
 // Re-exported for existing importers; canonical home is lib/security/internal-origin.ts
 // (framework-free so the Express runtime can share it).
@@ -36,7 +48,8 @@ export interface V1ApiContext {
   projectId: string
   correlationId: string
   /**
-   * End-user ID extracted from the project-scoped JWT in `X-User-Token`.
+   * End-user ID extracted from the project-scoped JWT in `X-User-Token`, or in
+   * `Authorization: Bearer` when that header is absent.
    * Used by database routes to set `app.current_user_id` before executing
    * workspace queries so PostgreSQL RLS policies are enforced.
    * null when the request is a service-role / server-to-server call.
@@ -117,7 +130,7 @@ export async function v1ApiMiddleware(
         kind: 'auth_failure',
         severity: 'info',
         projectId: params.projectId,
-        ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+        ip: clientIpFromHeaders(request),
         summary: `Auth failed (${fr?.kind ?? 'unknown'}) from ${origin ?? 'unknown origin'}`,
         detail: {
           kind: fr?.kind ?? 'unknown',
@@ -149,10 +162,12 @@ export async function v1ApiMiddleware(
     }
   }
 
-  // 2. Get full API key record to check keyType and capabilities
-  const apiKeyRecord = await prisma.apiKey.findUnique({
+  // 2. Get full API key record to check keyType and capabilities. Already read
+  // when it came through lib/auth-projection/read.ts, from the region's copy
+  // while it is fresh; read again at home otherwise, as before.
+  const apiKeyRecord = auth.record ?? (await prisma.apiKey.findUnique({
     where: { id: auth.apiKey.id },
-  })
+  }))
 
   if (!apiKeyRecord) {
     return {
@@ -174,7 +189,7 @@ export async function v1ApiMiddleware(
       severity: 'warn',
       userId: apiKeyRecord.userId,
       projectId: params.projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+      ip: clientIpFromHeaders(request),
       summary: `Rate limit hit on project ${params.projectId} (key ${apiKeyRecord.keyPrefix})`,
       detail: { apiKeyId: apiKeyRecord.id, path: request.nextUrl.pathname, limit: apiKeyRecord.rateLimit },
     }).catch(() => {})
@@ -209,10 +224,12 @@ export async function v1ApiMiddleware(
     }
   }
 
-  // 3. Verify project exists
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-  })
+  // 3. Verify project exists. In a region whose copy is enforced, its lock,
+  // pause, owner and signing secret come from the copy while it is fresh
+  // (lib/auth-projection/read.ts); everywhere else the row is read at home.
+  const fromCopy = answersFromCopy()
+  const homeRow = fromCopy ? null : await prisma.project.findUnique({ where: { id: projectId } })
+  const project = fromCopy ? await authorizingProject(projectId) : homeRow
 
   if (!project) {
     return {
@@ -238,8 +255,8 @@ export async function v1ApiMiddleware(
       kind: 'lockdown',
       severity: 'high',
       projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
-      summary: `Public request blocked — project "${project.name}" is locked down`,
+      ip: clientIpFromHeaders(request),
+      summary: `Public request blocked — project "${homeRow?.name ?? projectId}" is locked down`,
       detail: { path: request.nextUrl.pathname, method: request.method },
     }).catch(() => {})
     return {
@@ -337,7 +354,20 @@ export async function v1ApiMiddleware(
     // We'll verify project access via API key's projectId in step 6
   }
 
-  // 4. Only public keys can access /v1 routes
+  // 4. Only public keys can access /v1 routes. An MCP key is named first: the
+  // generic wording below ("Dashboard keys") describes a different credential
+  // and sent agents looking for one. lib/security/key-placement.ts.
+  if (isMcpCredential(apiKeyRecord)) {
+    return {
+      context: {} as V1ApiContext,
+      response: createErrorResponse(
+        MCP_KEY_IN_APP,
+        mcpKeyRefusalMessage(apiKeyRecord.name ?? null),
+        403,
+        { hint: MCP_KEY_HINT },
+      ),
+    }
+  }
   if (apiKeyRecord.keyType !== 'public') {
     return {
       context: {} as V1ApiContext,
@@ -370,7 +400,7 @@ export async function v1ApiMiddleware(
       severity: 'high',
       userId: apiKeyRecord.userId,
       projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+      ip: clientIpFromHeaders(request),
       summary: `API key scoped to ${apiKeyRecord.projectId} used against project ${projectId}`,
       detail: { apiKeyId: apiKeyRecord.id, keyProjectId: apiKeyRecord.projectId, requestedProjectId: projectId, path: request.nextUrl.pathname },
     }).catch(() => {})
@@ -384,6 +414,33 @@ export async function v1ApiMiddleware(
     }
   }
 
+  // 7. A service-role key never answers a browser.
+  //
+  // The Express runtime has refused this since the guard was written; the Next
+  // surfaces (storage, functions, stats, the rest) never did, so a service-role
+  // key in a frontend was refused on /db and served on /storage. recordedV1
+  // refuses it at the door, before authenticateApiKey above spends the key's
+  // rate limit; this is the same rule for a request the door let through because
+  // its lookup failed.
+  if (apiKeyRecord.serviceRole) {
+    const verdict = detectBrowserOrigin(Object.fromEntries(request.headers))
+    if (verdict.isBrowser) {
+      recordServiceRoleBrowserBlock({
+        projectId,
+        apiKeyId: apiKeyRecord.id,
+        keyName: apiKeyRecord.name ?? null,
+        keyPrefix: apiKeyRecord.keyPrefix ?? null,
+        verdict,
+        method: request.method,
+        path: request.nextUrl.pathname,
+      }).catch(() => {})
+      return {
+        context: {} as V1ApiContext,
+        response: createErrorResponse(SERVICE_ROLE_IN_BROWSER, serviceRoleRefusalMessage(apiKeyRecord.name ?? null), 403),
+      }
+    }
+  }
+
   // No plan quota on API requests: they are unlimited on every plan. The
   // owner's monthly count for the Usage page is kept by the request recorder
   // every v1 route is wrapped in (lib/traffic/request-recorder.ts).
@@ -392,11 +449,15 @@ export async function v1ApiMiddleware(
   // End-users receive a project-scoped JWT from /v1/{projectId}/auth/signin.
   // They must pass it as `X-User-Token: <jwt>` on every database request so
   // the server can set app.current_user_id before executing workspace queries.
+  // Without X-User-Token, a token in `Authorization: Bearer` is the user when it
+  // names a project, as on the runtime (lib/security/end-user-bearer.ts), and
+  // passes the same checks below; the key then came in x-api-key or the query.
   // Service-role keys (serviceRole = true) bypass this — they see all rows.
   let endUserId: string | null = null
   let endUserRole: string | null = null
   if (!apiKeyRecord.serviceRole) {
-    const userTokenHeader = request.headers.get('x-user-token')
+    const userTokenHeader =
+      request.headers.get('x-user-token') ?? endUserBearerToken(request.headers.get('authorization'))
     if (userTokenHeader) {
       const rawToken = userTokenHeader.startsWith('Bearer ')
         ? userTokenHeader.substring(7)
@@ -413,6 +474,12 @@ export async function v1ApiMiddleware(
       }
       // Accept only project-scoped tokens issued for THIS project
       if (payload?.projectId === projectId && payload.userId) {
+        // The blacklist and the users table are in the project's database, in
+        // its region. Resolved before the fail-open checks below, which accept
+        // a token whose status cannot be read: for a region this process cannot
+        // reach that would honour every revoked and blocked token, so the
+        // error fails the request instead.
+        const db = await workspaceRawClient(projectId)
         // Reject tokens that have been explicitly revoked via /auth/logout.
         // The blacklist table is created lazily — skip the check gracefully if
         // it does not yet exist (i.e. no user has ever logged out from this project).
@@ -420,13 +487,49 @@ export async function v1ApiMiddleware(
         if (payload.jti) {
           try {
             const schemaName = `workspace_${projectId}`
-            const rows = await prisma.$queryRawUnsafe<{ jti: string }[]>(
+            const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
               `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
               payload.jti
             )
             blacklisted = rows.length > 0
           } catch {
             // Table doesn't exist yet — treat as not blacklisted
+          }
+        }
+
+        // Blocking promises "existing JWT tokens stop working immediately" —
+        // true only if request time checks it. Before this, is_blocked was
+        // read at sign-in and refresh alone, so a blocked user's live token
+        // kept serving data for up to seven days. Read as the service role:
+        // the users table is row-level secured against the app role
+        // (lib/services/end-user-blocked.ts). A missing table or column means
+        // nobody was ever blocked; other failures fail open, loudly, like the
+        // revocation check above.
+        let blocked = false
+        if (!blacklisted) {
+          try {
+            blocked = await readEndUserBlocked(db, `workspace_${projectId}`, String(payload.userId))
+          } catch (err: any) {
+            const text = String(err?.message ?? err)
+            const absent =
+              err?.code === '42P01' || err?.code === '42703' || text.includes('42P01') || text.includes('42703')
+            if (!absent) {
+              console.error(
+                `[V1Middleware] is_blocked check FAILED OPEN for project ${projectId}: ${text}. ` +
+                `A blocked user's token would have been accepted.`
+              )
+            }
+          }
+        }
+
+        if (blocked) {
+          return {
+            context: {} as V1ApiContext,
+            response: createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              'This account has been blocked by the project owner.',
+              403
+            ),
           }
         }
 
@@ -453,13 +556,19 @@ export async function v1ApiMiddleware(
   // ── Founder Analytics: detect external usage (non-blocking) ───────────────
   const userId = apiKeyRecord.userId
   if (userId) {
-    // Any API key usage = frontend connected
-    if (!project.isFrontendConnected) {
-      markFrontendConnected(projectId, userId)
-    }
-    // Requests from an external domain = real external users
-    if (!project.hasExternalUsers && isExternalOrigin(request)) {
-      markExternalUsage(projectId, userId)
+    if (homeRow) {
+      // Any API key usage = frontend connected
+      if (!homeRow.isFrontendConnected) {
+        markFrontendConnected(projectId, userId)
+      }
+      // Requests from an external domain = real external users
+      if (!homeRow.hasExternalUsers && isExternalOrigin(request)) {
+        markExternalUsage(projectId, userId)
+      }
+    } else {
+      // The region's copy holds no milestones: they are settled at home, off
+      // the request path, once per process for each project.
+      void noteMilestonesAtHome(projectId, userId, isExternalOrigin(request))
     }
     // Track API call
     recordUsageMetrics(userId, projectId, { apiCalls: 1 })
@@ -484,6 +593,34 @@ export async function v1ApiMiddleware(
         serviceRole: apiKeyRecord.serviceRole,
       },
     },
+  }
+}
+
+// Projects this process has seen past each milestone, so a request from the
+// region's copy asks home about them once, not on every request. Bounded: a
+// cleared set only means one more lookup.
+const MILESTONE_MEMORY = 10_000
+const frontendConnected = new Set<string>()
+const externalUsers = new Set<string>()
+
+async function noteMilestonesAtHome(projectId: string, userId: string, external: boolean): Promise<void> {
+  if (frontendConnected.has(projectId) && (!external || externalUsers.has(projectId))) return
+  try {
+    const row = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { isFrontendConnected: true, hasExternalUsers: true },
+    })
+    if (!row) return
+    if (frontendConnected.size >= MILESTONE_MEMORY) frontendConnected.clear()
+    if (externalUsers.size >= MILESTONE_MEMORY) externalUsers.clear()
+    if (!row.isFrontendConnected) markFrontendConnected(projectId, userId)
+    frontendConnected.add(projectId)
+    if (external) {
+      if (!row.hasExternalUsers) markExternalUsage(projectId, userId)
+      externalUsers.add(projectId)
+    }
+  } catch {
+    // Bookkeeping only; the next request tries again.
   }
 }
 

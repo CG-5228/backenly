@@ -74,7 +74,7 @@ claude mcp add backenly -- npx -y @backenly/mcp-server \
   --project <projectId> --key mcp_live_...
 ```
 
-**Cursor** (`.cursor/mcp.json`), **Cline** (`cline_mcp_settings.json`), **Claude Desktop** — same server block:
+**Cursor** (`~/.cursor/mcp.json`, not the project's), **Cline** (`cline_mcp_settings.json`), **Claude Desktop** — same server block:
 
 ```json
 {
@@ -100,6 +100,10 @@ npx @backenly/mcp-server init
 ```
 
 Open a new conversation in your host. Backenly appears as a tool surface.
+
+The `mcp_live_` key is for your agent only. Backenly's runtime API refuses it,
+so it never goes in app code or an app's environment: the app gets its own key
+from `connect { action: "create_api_key" }`, or Settings → API keys.
 
 ## How it works
 
@@ -137,7 +141,7 @@ What this package serves (tools, instructions, resources, result shapes) is what
 - **Per-key rate limit** — sliding-window using `ApiKey.rateLimit` / `rateLimitWindow`. 429 includes `Retry-After` + `X-RateLimit-*` headers.
 - **Audit log** — every mutation through MCP writes an `AuditLog` row on your project timeline.
 - **Local config** is written with `0600` permissions (user-only readable).
-- **Revoke any key** anytime from your project's Connect → Agents page.
+- **Revoke any key, or disconnect an agent you signed in from the browser,** anytime from your project's Connect → Agents page.
 
 ## Environment
 

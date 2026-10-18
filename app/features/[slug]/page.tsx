@@ -212,7 +212,7 @@ export default async function FeatureSlugPage(props: { params: Promise<{ slug: s
           lede="One free project, no card. Connect your agent over MCP and read the verification evidence yourself."
         >
           <StartButton />
-          <ButtonLink href="/resources/connect-your-coding-agent" variant="secondary">
+          <ButtonLink href="/docs/connect" variant="secondary">
             Connect your agent
           </ButtonLink>
         </HorizonClose>

@@ -9,11 +9,15 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectValidation } from '@/lib/middleware/projectValidation'
+import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
 import { prisma } from '@/lib/db/prisma'
 import { sanitizeDiagnostic } from '@/lib/errors/diagnostic-sanitize'
 import { resolvePendingActionMemory } from '@/lib/operational-memory/ledger'
 import { summariseFinding } from '@/lib/core/finding-summaries'
 import { getLastLoopTickAt } from '@/lib/autonomy/loop-tick'
+import { countRepairs, recentlyResolved } from '@/lib/autonomy/resolution'
+import { loadSensorState } from '@/lib/autonomy/sensor-state'
+import { countPendingAgentApprovals } from '@/lib/mcp/pending-approvals'
 
 /**
  * How many findings the summary payload carries. A preview, not the truth —
@@ -26,7 +30,32 @@ import { getLastLoopTickAt } from '@/lib/autonomy/loop-tick'
  */
 const FINDINGS_PREVIEW_LIMIT = 50
 
+/**
+ * How far back `recentlyResolved` reaches. The dashboard animates a repair the
+ * moment it sees one, and it polls every few seconds while anything is open, so
+ * a short window is enough; it remembers what it already showed.
+ */
+const RESOLVED_WINDOW_MS = 10 * 60 * 1000
+
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+
 // ─── GET ──────────────────────────────────────────────────────────────────────
+
+
+/**
+ * A finding as it may be SERVED. Pending-action findings carry the parked
+ * call's executor params in `details`; the display copy is redacted at write
+ * since the sealed-params split, and this covers the legacy rows that stored
+ * them raw. The sealed copy is for the approval replay, not for clients.
+ */
+function withServableDetails<T extends { details: unknown }>(row: T): T {
+  const det = row.details as Record<string, unknown> | null
+  if (!det || typeof det !== 'object' || !('executorParams' in det)) return row
+  return {
+    ...row,
+    details: { ...det, executorParams: redactSecretParams(det.executorParams), executorParamsSealed: undefined },
+  }
+}
 
 export async function GET(request: NextRequest, props: { params: Promise<{ id: string }> }) {
   const params = await props.params
@@ -86,7 +115,7 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
             details: true,
             detectedAt: true,
           },
-        }),
+        }).then(rows => rows.map(withServableDetails)),
         prisma.platformNotification.findMany({
           where: {
             metadata: { path: ['projectId'], equals: projectId },
@@ -106,7 +135,7 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
     }
 
     // Default: health summary for the dashboard widget
-    const [findings, recentAutoFixes, lastScan, project, lastLoopTick] = await Promise.all([
+    const [findings, repairs, resolved, sensors, lastScan, project, lastLoopTick, agentApprovals] = await Promise.all([
       prisma.healthFinding.findMany({
         where: { projectId, status: { in: ['open', 'pending_approval'] } },
         orderBy: [{ severity: 'asc' }, { detectedAt: 'desc' }],
@@ -118,15 +147,15 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
           status: true,
           detectedAt: true,
         },
-      }),
-      // Count auto-fixes in the last 7 days
-      prisma.correctionEvent.count({
-        where: {
-          projectId,
-          correctionType: 'AI_SELF_CORRECT',
-          createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
-        },
-      }),
+      }).then(rows => rows.map(withServableDetails)),
+      // Repairs in the last 7 days, split by whether a re-check confirmed them.
+      // Only the confirmed ones may be called fixed.
+      countRepairs(projectId, new Date(Date.now() - WEEK_MS)),
+      // How each recently closed finding closed — the only basis a surface has
+      // for saying something was fixed (lib/autonomy/resolution.ts).
+      recentlyResolved(projectId, new Date(Date.now() - RESOLVED_WINDOW_MS)),
+      // Which checks the loop's last pass could actually run.
+      loadSensorState(projectId),
       // Fallback for projects whose last scan predates the lastObservedAt column
       prisma.healthFinding.findFirst({
         where: { projectId },
@@ -141,6 +170,10 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
       // lastObservedAt below — see lib/autonomy/loop-tick.ts for why conflating
       // the daily observer with the per-minute reconciler is the bug this fixes.
       getLastLoopTickAt(projectId),
+      // The other queue that waits on the owner: calls their coding agent
+      // parked for approval. Not findings, so not in `findings` or
+      // `needsAttention`, and counted where every surface can read it.
+      countPendingAgentApprovals(projectId).catch(() => 0),
     ])
 
     const critical = findings.filter(f => f.severity === 'critical')
@@ -169,8 +202,17 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
         // loop has not run for this project inside the lookback — surface that,
         // never substitute lastCheckedAt for it.
         lastReconciledAt: lastLoopTick ? lastLoopTick.toISOString() : null,
-        autoFixedThisWeek: recentAutoFixes,
+        // Repairs a re-check confirmed. Repairs that ran but could not be
+        // confirmed are counted separately and must never be shown as fixes.
+        autoFixedThisWeek: repairs.verified,
+        unverifiedRepairsThisWeek: repairs.unverified,
         needsAttention: needsAction.length,
+        // Agent requests parked for approval, waiting in the Review Queue on
+        // the Autonomy page. Kept apart from needsAttention, which counts held
+        // FINDINGS (actionableTotal - needsAttention is the open findings).
+        // The Overview and the top bar read both; they read only the findings
+        // before, so a parked deploy or drop was invisible there (OV-1, AUT-08).
+        agentApprovalsPending: agentApprovals,
         criticalCount: critical.length,
         warningCount: warnings.length,
         // Uncapped count of everything still needing attention. `findings` below
@@ -183,6 +225,13 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
         // Callers must count with this field and render with the array.
         actionableTotal: findings.length,
         findings: findings.slice(0, FINDINGS_PREVIEW_LIMIT),
+        // How findings that recently left the queue left it. A surface that
+        // says "fixed" reads `closedBy` here; it never infers a fix from a
+        // finding disappearing between two polls.
+        recentlyResolved: resolved,
+        // What the loop's last pass could check. A surface may say "no issues"
+        // only for checks that ran; errored or disabled checks are blind.
+        sensors,
         // Categorical summary for the dashboard widget rows
         summary: buildHealthSummary(findings),
       },
@@ -210,19 +259,15 @@ export async function PATCH(request: NextRequest, props: { params: Promise<{ id:
     }
 
     // Return a fresh health summary after the scan
-    const [findings, recentAutoFixes, project, lastLoopTick] = await Promise.all([
+    const [findings, repairs, resolved, sensors, project, lastLoopTick] = await Promise.all([
       prisma.healthFinding.findMany({
         where: { projectId, status: { in: ['open', 'pending_approval'] } },
         orderBy: [{ severity: 'asc' }, { detectedAt: 'desc' }],
         select: { id: true, type: true, severity: true, details: true, status: true, detectedAt: true },
-      }),
-      prisma.correctionEvent.count({
-        where: {
-          projectId,
-          correctionType: 'AI_SELF_CORRECT',
-          createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
-        },
-      }),
+      }).then(rows => rows.map(withServableDetails)),
+      countRepairs(projectId, new Date(Date.now() - WEEK_MS)),
+      recentlyResolved(projectId, new Date(Date.now() - RESOLVED_WINDOW_MS)),
+      loadSensorState(projectId),
       // The observer we just ran stamped this — read it back rather than approximating
       prisma.project.findUnique({
         where: { id: projectId },
@@ -239,23 +284,30 @@ export async function PATCH(request: NextRequest, props: { params: Promise<{ id:
         scannedAt: new Date().toISOString(),
         lastCheckedAt: project?.lastObservedAt ?? new Date().toISOString(),
         lastReconciledAt: lastLoopTick ? lastLoopTick.toISOString() : null,
-        autoFixedThisWeek: recentAutoFixes,
+        autoFixedThisWeek: repairs.verified,
+        unverifiedRepairsThisWeek: repairs.unverified,
         criticalCount: findings.filter(f => f.severity === 'critical').length,
         warningCount: findings.filter(f => f.severity === 'warning').length,
         needsAttention: findings.filter(f => f.status === 'pending_approval').length,
         // Same contract as GET: count with this, render with the array.
         actionableTotal: findings.length,
         findings: findings.slice(0, FINDINGS_PREVIEW_LIMIT),
+        recentlyResolved: resolved,
+        sensors,
         summary: buildHealthSummary(findings),
       },
     })
   })
 }
 
-// ─── POST /dismiss | /approve ─────────────────────────────────────────────────
-// Body: { findingId: string, action?: 'dismiss' | 'approve' }
-// action='approve' marks the finding as auto_fixed and records a CorrectionEvent
-// so the health widget and audit log stay consistent.
+// ─── POST /dismiss ────────────────────────────────────────────────────────────
+// Body: { findingId: string, action?: 'dismiss' }
+//
+// Approving a fix is POST /health/approve, which runs the repair and records it
+// as fixed only when a re-check confirms it. This route used to accept
+// action='approve' too and mark the finding fixed without running anything;
+// that is refused now, so the only way a finding becomes "fixed" is through a
+// repair that actually ran.
 
 export async function POST(request: NextRequest, props: { params: Promise<{ id: string }> }) {
   const params = await props.params
@@ -268,6 +320,17 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
       return NextResponse.json({ error: 'findingId required' }, { status: 400 })
     }
 
+    if (action !== 'dismiss') {
+      return NextResponse.json(
+        {
+          error:
+            'This route only dismisses findings. To apply a fix, use POST /health/approve, ' +
+            'which runs the repair and records it as fixed only when a re-check confirms it.',
+        },
+        { status: 400 },
+      )
+    }
+
     const finding = await prisma.healthFinding.findFirst({
       where: { id: findingId, projectId },
       select: { id: true, type: true, severity: true, details: true },
@@ -277,48 +340,26 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
       return NextResponse.json({ error: 'Finding not found' }, { status: 404 })
     }
 
-    if (action === 'approve') {
-      // Human approved the suggested fix — mark as resolved and log it
-      await prisma.$transaction([
-        prisma.healthFinding.update({
-          where: { id: findingId },
-          data: { status: 'auto_fixed', autoFixed: true },
-        }),
-        prisma.correctionEvent.create({
-          data: {
-            projectId,
-            correctionType: 'HUMAN_APPROVED',
-            correctionDetail: {
-              findingId,
-              findingType: finding.type,
-              approvedAt: new Date().toISOString(),
-              details: finding.details,
-            },
-            originalActionType: finding.type,
-            errorClassification: finding.severity,
-          },
-        }),
-      ])
-    } else {
-      await prisma.healthFinding.update({
-        where: { id: findingId },
-        data: { status: 'dismissed' },
-      })
-    }
+    const details = (finding.details ?? {}) as Record<string, unknown>
+    await prisma.healthFinding.update({
+      where: { id: findingId },
+      // The time is recorded so the closure can be told apart from a repair
+      // (lib/autonomy/resolution.ts) and placed on a timeline.
+      data: { status: 'dismissed', details: { ...details, dismissedAt: new Date().toISOString() } as any },
+    })
 
     // Keep the Memory timeline in step with the Review-Queue decision so a
     // change the user acted on never lingers as "proposed" in the ledger.
     await resolvePendingActionMemory({
       projectId,
       finding,
-      decision: action === 'approve' ? 'approved' : 'dismissed',
+      decision: 'dismissed',
     })
 
     // Tier-B diagnosis precision receipt: if this finding carried an autonomous
-    // diagnosis (escalation-diagnosis.ts), record whether the human accepted the
-    // recommended fix (approve) or rejected it (dismiss). This is the measurable
-    // "is our 3am reasoning actually good?" signal — the number the funding pitch
-    // needs, and it can only be captured at decision time. Fire-and-forget.
+    // diagnosis (escalation-diagnosis.ts), record that the human dismissed it.
+    // The accepted side is recorded where a fix is actually approved
+    // (/health/approve). Fire-and-forget.
     const diagnosis = ((finding.details ?? {}) as Record<string, unknown>).diagnosis as
       | { confidence?: string; model?: string }
       | undefined
@@ -331,7 +372,7 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
           details: JSON.stringify({
             findingId,
             findingType: finding.type,
-            outcome: action === 'approve' ? 'accepted' : 'rejected',
+            outcome: 'rejected',
             confidence: diagnosis.confidence ?? null,
             model: diagnosis.model ?? null,
             at: new Date().toISOString(),
@@ -342,7 +383,7 @@ export async function POST(request: NextRequest, props: { params: Promise<{ id: 
     }
 
     return NextResponse.json({ success: true })
-  })
+  }, { floor: 'write' })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
+import type { DesiredStateReport } from './desired-state'
 
 const PREF_TYPE = 'probe_liveness'
 
@@ -197,14 +198,12 @@ export async function loadProbeLiveness(projectId: string): Promise<Map<string, 
 }
 
 /**
- * Evaluate sensor health for a project by running the real desired-state diff.
- * Probes that fired have their liveness recorded, so the first genuine firing
- * promotes a probe from `unverified` to `clean` permanently.
+ * One run per invariant in a desired-state report. Every invariant is listed in
+ * `report.invariants`, including the ones that errored or were not run, so
+ * this is the complete set; `errors` and `disabled` say which of them could
+ * not report.
  */
-export async function checkSensorHealth(projectId: string): Promise<SensorHealthReport> {
-  const { computeDesiredStateDiff } = await import('./desired-state')
-  const report = await computeDesiredStateDiff(projectId)
-
+export function probeRunsFrom(report: DesiredStateReport): ProbeRun[] {
   // `errors` entries are formatted "[invariantId] message".
   const errorById = new Map<string, string>()
   for (const line of report.errors ?? []) {
@@ -212,15 +211,31 @@ export async function checkSensorHealth(projectId: string): Promise<SensorHealth
     if (m) errorById.set(m[1], m[2])
   }
 
-  const disabledById = new Map(report.disabled.map((d) => [d.id, d.remediation]))
+  // An invariant switched off by configuration names no capability, so it
+  // carries no remediation. It still did not run, and is reported as such
+  // rather than as a probe whose silence is merely unproven.
+  const disabledById = new Map(
+    (report.disabled ?? []).map((d) => [d.id, d.remediation || 'not enabled on this install']),
+  )
 
-  const runs: ProbeRun[] = report.invariants.map((inv) => ({
+  return report.invariants.map((inv) => ({
     id: inv.id,
     title: inv.title,
     findingCount: inv.gaps.length,
     ...(errorById.has(inv.id) ? { error: errorById.get(inv.id) } : {}),
     ...(disabledById.has(inv.id) ? { disabledReason: disabledById.get(inv.id) } : {}),
   }))
+}
+
+/**
+ * Evaluate sensor health for a project by running the real desired-state diff.
+ * Probes that fired have their liveness recorded, so the first genuine firing
+ * promotes a probe from `unverified` to `clean` permanently.
+ */
+export async function checkSensorHealth(projectId: string): Promise<SensorHealthReport> {
+  const { computeDesiredStateDiff } = await import('./desired-state')
+  const report = await computeDesiredStateDiff(projectId)
+  const runs = probeRunsFrom(report)
 
   const lastFired = await loadProbeLiveness(projectId)
   for (const run of runs) {

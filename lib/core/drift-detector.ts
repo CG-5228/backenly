@@ -21,6 +21,7 @@ import { prisma } from '@/lib/db/prisma'
 import { queryWorkspaceSchema, executeInWorkspaceSchema } from '@/lib/services/workspaceDatabase'
 import { listSchemaSnapshots, getSchemaSnapshot } from '@/lib/services/workspace-schema-snapshot'
 import { isReservedWorkspaceTable, notReservedTableSql } from '@/lib/security/workspace-schema'
+import { isRegionError } from '@/lib/data-plane/regional'
 import type { RawFinding } from './types'
 
 // ─── 3.1 Schema Drift ────────────────────────────────────────────────────────
@@ -51,9 +52,13 @@ import type { RawFinding } from './types'
  * could not look must not report nothing found". Copying it would let the two
  * drift, and the copy that quietly returned [] is exactly the bug this exists
  * to prevent.
+ *
+ * A region error (this process has no connection to the project's region) is
+ * rethrown unchanged, so callers can still tell it apart from a failed query.
  */
 export function probeQueryFailed(probe: string): (err: unknown) => never {
   return (err) => {
+    if (isRegionError(err)) throw err
     throw new Error(
       `[${probe}] catalog query failed: ${err instanceof Error ? err.message : String(err)}`,
     )
@@ -273,8 +278,17 @@ export async function detectShadowMutations(
 }
 
 /**
- * FK-pattern columns (*_id, not primary key) that have no index.
+ * Reference columns (not primary key) that no index leads with.
  * Missing indexes on FK columns cause full-table scans on joins — performance risk.
+ *
+ * A column is a reference when it carries a FOREIGN KEY constraint, whatever it
+ * is called, or when it is named `<something>_id`. The constraint half is read
+ * from the catalog: a foreign key on `author` or `parent` is as much a join
+ * column as one on `author_id`, and a name-only rule never saw it.
+ *
+ * An index covers a column only when the column LEADS it, read from pg_index.
+ * Matching the name inside `indexdef` missed a composite index that starts with
+ * the column, so a covered column was reported unindexed.
  */
 export async function detectMissingFkIndexes(
   projectId: string,
@@ -284,18 +298,37 @@ export async function detectMissingFkIndexes(
   const rows = await queryWorkspaceSchema(
     projectId,
     `
-    SELECT c.table_name, c.column_name
-    FROM information_schema.columns c
-    WHERE c.table_schema = $1
-      AND c.column_name LIKE '%_id'
-      AND c.column_name <> 'id'
-      AND ${notReservedTableSql('c.table_name')}
+    WITH candidates AS (
+      -- Named like a reference. The underscore is escaped: unescaped, "_" in
+      -- LIKE matches any one character, so "paid" and "uuid" qualified.
+      SELECT c.table_name::text AS table_name, c.column_name::text AS column_name, false AS has_fk
+      FROM information_schema.columns c
+      WHERE c.table_schema = $1
+        AND c.column_name LIKE '%\\_id' ESCAPE '\\'
+      UNION ALL
+      -- Declared references, whatever the column is called.
+      SELECT cl.relname::text, a.attname::text, true
+      FROM pg_constraint con
+      JOIN pg_class cl     ON cl.oid = con.conrelid
+      JOIN pg_namespace n  ON n.oid = cl.relnamespace
+      JOIN pg_attribute a  ON a.attrelid = cl.oid AND a.attnum = con.conkey[1]
+      WHERE con.contype = 'f'
+        AND n.nspname = $1
+        AND array_length(con.conkey, 1) = 1
+    )
+    SELECT k.table_name, k.column_name, bool_or(k.has_fk) AS has_fk
+    FROM candidates k
+    WHERE k.column_name <> 'id'
+      AND ${notReservedTableSql('k.table_name')}
       AND NOT EXISTS (
         SELECT 1
-        FROM pg_indexes pi
-        WHERE pi.schemaname = $1
-          AND pi.tablename  = c.table_name
-          AND pi.indexdef   ILIKE '%(' || c.column_name || ')%'
+        FROM pg_index i
+        JOIN pg_class t     ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+        WHERE n.nspname = $1
+          AND t.relname = k.table_name
+          AND a.attname = k.column_name
       )
       AND NOT EXISTS (
         SELECT 1
@@ -305,15 +338,16 @@ export async function detectMissingFkIndexes(
           AND tc.table_schema   = kcu.table_schema
         WHERE tc.constraint_type = 'PRIMARY KEY'
           AND tc.table_schema    = $1
-          AND tc.table_name      = c.table_name
-          AND kcu.column_name    = c.column_name
+          AND tc.table_name      = k.table_name
+          AND kcu.column_name    = k.column_name
       )
-    ORDER BY c.table_name, c.column_name
+    GROUP BY k.table_name, k.column_name
+    ORDER BY k.table_name, k.column_name
     `,
     schema,
   ).catch(probeQueryFailed('detectMissingFkIndexes'))
 
-  const hits: Array<{ table_name: string; column_name: string }> =
+  const hits: Array<{ table_name: string; column_name: string; has_fk: boolean }> =
     rows?.rows ?? rows ?? []
 
   return hits.map((r) => ({
@@ -323,7 +357,11 @@ export async function detectMissingFkIndexes(
       tableName: r.table_name,
       columnName: r.column_name,
       schemaName: schema,
-      reason: `Column "${r.column_name}" is a likely FK column but has no index — joins will scan the full table`,
+      // What made it a reference column: a declared constraint, or only its name.
+      basis: r.has_fk ? 'foreign_key' : 'name',
+      reason: r.has_fk
+        ? `Column "${r.column_name}" has a foreign key but no index — joins will scan the full table`
+        : `Column "${r.column_name}" is a likely FK column but has no index — joins will scan the full table`,
     },
     autoFixable: true,
     fix: async () => {

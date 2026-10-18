@@ -41,6 +41,7 @@ import {
 } from '@/lib/postgrest/translate'
 import { checkExposure, operationFor, tableHasSoftDelete } from '@/lib/postgrest/exposure'
 import { ensureSchemaRegistered } from '@/lib/postgrest/registration'
+import { projectPostgrest, workspaceRawClient } from '@/lib/data-plane/regional'
 
 export interface PostgrestCallerContext {
   projectId: string
@@ -77,13 +78,16 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const rlsCache = new Map<string, { value: boolean; expires: number }>()
 const RLS_CACHE_TTL_MS = 30_000
 
-async function tableHasRls(schema: string, table: string): Promise<boolean> {
+async function tableHasRls(projectId: string, schema: string, table: string): Promise<boolean> {
   const key = `${schema}.${table}`
   const hit = rlsCache.get(key)
   if (hit && hit.expires > Date.now()) return hit.value
   try {
-    const { prisma } = await import('@/lib/db/prisma')
-    const rows = await prisma.$queryRawUnsafe<Array<{ enabled: boolean }>>(
+    // The project's database, in its region. Inside the try on purpose: this
+    // only words a warning on a response PostgREST already served, and must
+    // never turn it into an error.
+    const db = await workspaceRawClient(projectId)
+    const rows = await db.$queryRawUnsafe<Array<{ enabled: boolean }>>(
       `SELECT c.relrowsecurity AS enabled
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
@@ -110,6 +114,27 @@ async function tableHasRls(schema: string, table: string): Promise<boolean> {
 function isInvalidSchemaError(parsed: unknown): boolean {
   const b = (parsed ?? {}) as Record<string, unknown>
   return b.code === 'PGRST106'
+}
+
+function isMissingTableError(parsed: unknown): boolean {
+  const b = (parsed ?? {}) as Record<string, unknown>
+  return b.code === 'PGRST205'
+}
+
+const SCHEMA_CACHE_RETRY_DELAY_MS = 1_000
+
+async function tableExists(projectId: string, schema: string, table: string): Promise<boolean> {
+  // The catalog of the project's database, in its region.
+  const db = await workspaceRawClient(projectId)
+  const rows = await db.$queryRawUnsafe<Array<{ present: boolean }>>(
+    `SELECT EXISTS (
+       SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+     ) AS present`,
+    schema,
+    table,
+  )
+  return rows[0]?.present === true
 }
 
 /**
@@ -144,9 +169,12 @@ export async function handleViaPostgrest(
   const operation = operationFor(req.method, recordId !== undefined)
   if (!operation) return false
 
-  const baseUrl = process.env.POSTGREST_URL
-  const secret = process.env.POSTGREST_JWT_SECRET
-  if (!baseUrl || !secret) return false
+  // The PostgREST serving the project's region. Without one, the request
+  // falls through to the legacy handler, which also runs in the project's
+  // region; it is never sent to another region's PostgREST.
+  const postgrest = await projectPostgrest(ctx.projectId)
+  if (!postgrest) return false
+  const { url: baseUrl, jwtSecret: secret } = postgrest
 
   // One id for this request, echoed to the caller and printed in our own logs,
   // so "it failed at 14:03" becomes a single lookup instead of a search across
@@ -227,7 +255,7 @@ export async function handleViaPostgrest(
     mintedTiming = decodeTokenTiming(token)
 
     if (operation === 'list' || operation === 'get') {
-      const hasSoftDelete = await tableHasSoftDelete(schema, table)
+      const hasSoftDelete = await tableHasSoftDelete(ctx.projectId, schema, table)
       const translated = translateReadQuery({
         query: req.query as Record<string, string | string[] | undefined>,
         hasSoftDelete,
@@ -244,7 +272,7 @@ export async function handleViaPostgrest(
       // the validated record id only — never from caller-supplied filters, so a
       // crafted query string cannot widen a single-row update into a table-wide
       // one. RLS still applies on top of this.
-      const hasSoftDelete = await tableHasSoftDelete(schema, table)
+      const hasSoftDelete = await tableHasSoftDelete(ctx.projectId, schema, table)
       const translated = translateReadQuery({
         query: {},
         hasSoftDelete,
@@ -309,6 +337,37 @@ export async function handleViaPostgrest(
     }
   }
 
+  // PGRST205 also means a genuinely missing table. Check the catalog before
+  // waiting for the DDL-triggered cache reload; the first request was not run.
+  let staleCache = false
+  let catalogUnavailable = false
+  if (!upstream.ok && isMissingTableError(parsed)) {
+    try {
+      staleCache = await tableExists(ctx.projectId, schema, table)
+    } catch (err) {
+      catalogUnavailable = true
+      console.error('[postgrest] Could not check table after PGRST205:', err)
+    }
+    if (staleCache) {
+      await new Promise(resolve => setTimeout(resolve, SCHEMA_CACHE_RETRY_DELAY_MS))
+      try {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
+        try {
+          const replayed = await fetch(url, { method: req.method, headers, body, signal: controller.signal })
+          const replayedText = await replayed.text()
+          upstream = replayed
+          text = replayedText
+          try { parsed = JSON.parse(text) } catch { parsed = null }
+        } finally {
+          clearTimeout(timer)
+        }
+      } catch (err) {
+        console.error('[postgrest] Replay after PGRST205 failed:', err)
+      }
+    }
+  }
+
   // ── PGRST106 self-heal ──────────────────────────────────────────────────────
   //
   // "Invalid schema: workspace_<id>" means PostgREST was never told this
@@ -362,13 +421,25 @@ export async function handleViaPostgrest(
   }
 
   if (!upstream.ok) {
+    if (catalogUnavailable) {
+      return answer(503, {
+        error: 'The data plane could not confirm this table. Retry shortly.',
+        code: 'DATA_PLANE_UNAVAILABLE',
+      })
+    }
+    if (staleCache && isMissingTableError(parsed)) {
+      return answer(503, {
+        error: 'The table exists, but the data plane has not loaded it yet. Retry shortly.',
+        code: 'DATA_PLANE_UNAVAILABLE',
+      }, { upstreamCode: 'PGRST205' })
+    }
     // PostgREST's own message can name roles, policies and constraint bodies.
     // The full text goes to the log; the caller gets the sanitised mapping.
     console.error(`[postgrest] upstream ${upstream.status} for ${table}:`, text.slice(0, 500))
     const mapped = toApiError(upstream.status, parsed)
     // The upstream CODE is passed through to the classifier (not to the caller):
-    // PGRST106 and PGRST205 are platform faults that look like the developer's
-    // missing table, and telling them apart is the entire point of this header.
+    // PGRST106 is a platform fault. PGRST205 is only one when the catalog
+    // confirms the table exists; genuine misses must keep their 404 diagnosis.
     const upstreamCode =
       parsed && typeof parsed === 'object' && typeof (parsed as any).code === 'string'
         ? (parsed as any).code
@@ -393,7 +464,9 @@ export async function handleViaPostgrest(
         /* never let a diagnostic change what the caller receives */
       }
     }
-    return answer(mapped.status, mapped.body as unknown as Record<string, unknown>, { upstreamCode })
+    return answer(mapped.status, mapped.body as unknown as Record<string, unknown>, {
+      upstreamCode: upstreamCode === 'PGRST205' ? null : upstreamCode,
+    })
   }
 
   const rows = Array.isArray(parsed) ? parsed : parsed == null ? [] : [parsed]
@@ -410,7 +483,7 @@ export async function handleViaPostgrest(
       ) as unknown as Record<string, unknown>
       return answer(200, envelope, {
         rowCount: rows.length,
-        tableHasRls: await tableHasRls(schema, table),
+        tableHasRls: await tableHasRls(ctx.projectId, schema, table),
       })
     }
 

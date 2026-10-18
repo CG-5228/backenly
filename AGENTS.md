@@ -13,7 +13,7 @@ them left the other still naming a production host.
 
 **Backenly** (live at https://backenly.com) is an **autonomous backend platform** that turns product descriptions into running backend infrastructure. It plans the backend, applies the infrastructure, verifies the runtime, and keeps every change reviewable and reversible. Developers describe their backend in natural language and Backenly automatically creates database tables, REST APIs, auth systems, storage, and more — no manual backend code required. (Category note: Backenly is **not** an "AI BaaS." It does not just generate resources — it manages backend change safely.)
 
-**Tech Stack:** Next.js 14, React 18, Express.js, PostgreSQL (Prisma), MongoDB (optional), OpenAI API, Stripe payments (Cloud), TailwindCSS, TypeScript throughout.
+**Tech Stack:** Next.js 14, React 18, Express.js, PostgreSQL (Prisma), MongoDB (optional), Claude on Amazon Bedrock or the Claude API (OpenAI also supported) through one AI gateway, Stripe payments (Cloud), TailwindCSS, TypeScript throughout.
 
 **GitHub Repo:** https://github.com/backenly/backenly
 
@@ -143,6 +143,15 @@ All AI logic lives in `lib/ai/`. The engine is the brain loop in
 `lib/ai/brain/agent.ts`, reached over MCP via `app/api/mcp/route.ts`. There is
 no in-product chat door; agents (Claude Code, Cursor, Codex) are the client.
 
+Every model call goes through the AI gateway in `lib/ai/llm`: `generate`, or
+`chat` for a caller that holds a message list. A call names its purpose, and the
+purpose's route sets the model, thinking, effort, output ceiling and timeout
+(`lib/ai/llm/config.ts`). Before a call is sent, its worst case is reserved
+against the monthly spend limits (`lib/ai/llm/spend.ts`), and a customer-paid
+call is also held against the account's AI credits
+(`lib/entitlements/credit-holds.ts`). Product code reaches a model only through
+the gateway; it never constructs a provider client of its own.
+
 ### Two-Brain Architecture
 
 | Brain | File | Role |
@@ -155,7 +164,7 @@ no in-product chat door; agents (Claude Code, Cursor, Codex) are the client.
 | File | Purpose |
 |------|---------|
 | `lib/ai/execution-engine.ts` | Orchestrates plan execution with MAX_STEPS + checkpointing |
-| `lib/ai/brain/pending-destructive.ts` | Gates destructive operations behind user confirmation |
+| `lib/mcp/approvals.ts` | Queues a call that needs approval with its exact arguments; a person's approval runs that call verbatim |
 | `lib/ai/brain/tools.ts` | Tool vocabulary; `DESTRUCTIVE_TOOLS` marks what needs confirming |
 
 ### 9-Phase Orchestration System
@@ -231,6 +240,7 @@ Key Prisma models (68 total):
 | `PermissionPolicy` | Row-level security policies |
 | `Subscription` | Billing (Stripe ids on the row; `PaddleSubscription` is a retired, retained table) |
 | `AuditLog` | Compliance audit trail |
+| `SupportTicket` + `SupportMessage` | Support cases (Cloud): AI first response + team correspondence thread (`lib/support/`) |
 | `StorageBucket` + `StorageFile` | File storage |
 | `AgentMemory` | AI agent context/memory |
 | `ProjectPreference` | Learned user preferences |
@@ -307,9 +317,15 @@ JWT_SECRET=                       # Platform session signing
 JWT_EXPIRES_IN=7d
 JWT_REFRESH_EXPIRES_IN=30d
 
-# AI
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+# AI (lib/ai/llm/config.ts)
+AI_PROVIDER=bedrock|anthropic|openai  # Unset: ANTHROPIC_API_KEY, then OPENAI_API_KEY. Bedrock is never inferred
+BEDROCK_REGION=                       # With bedrock; credentials come from the AWS provider chain (ECS task role)
+AI_MODEL=                             # Overrides the provider default; AI_MODEL_<PURPOSE> overrides one purpose
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=                       # The OpenAI provider, and embeddings for vector search
+OPENAI_MODEL=                         # OpenAI only, with OPENAI_MODEL_FAST; AI_MODEL takes precedence
+AI_TOTAL_MONTHLY_HARD_LIMIT_USD=      # Optional monthly cap on every AI call
+AI_PLATFORM_MONTHLY_BUDGET_USD=       # Optional monthly cap on AI the deployment pays for itself (autonomy)
 
 # App
 NODE_ENV=development|production
@@ -324,6 +340,7 @@ STORAGE_S3_BUCKET=
 
 # Email
 SMTP_HOST=  SMTP_PORT=  SMTP_USER=  SMTP_PASS=  SMTP_FROM=
+SUPPORT_NOTIFY_EMAIL=             # Optional: operator inbox emailed when support cases are filed (Cloud)
 
 # OAuth
 GOOGLE_CLIENT_ID=  GOOGLE_CLIENT_SECRET=  GOOGLE_REDIRECT_URI=
@@ -458,8 +475,9 @@ public-tree credential/host hygiene checks.
 1. Add the action type + its `case` handler in `lib/ai/minimal-executor.ts`
 2. Expose it to the brain as a tool in `lib/ai/brain/tools.ts`
 3. Add to executor vocabulary comments above
-4. If destructive, add it to `DESTRUCTIVE_TOOLS` in `lib/ai/brain/tools.ts` so
-   `lib/ai/brain/pending-destructive.ts` gates it behind confirmation
+4. If destructive, add it to `DESTRUCTIVE_TOOLS` in `lib/ai/brain/tools.ts`, so
+   the brain stops the call and queues it with its exact arguments
+   (`lib/mcp/approvals.ts`); it runs only when a person approves that call
 
 ### Adding a New End-User Runtime Route
 

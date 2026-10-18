@@ -13,13 +13,17 @@ export const maxDuration = 30
  * enable_vector_search tool ran. The embedding itself is stripped from the
  * response — it's 1536 floats, the client never wants it.
  *
+ * Only rows whose embedding column is filled are searched. Nothing fills it
+ * when a row is written yet, so an empty result says how many rows have none
+ * rather than looking like "no match".
+ *
  * Auth: same modern v1 middleware path as table CRUD, including project match,
  * publish gating, quota checks, and end-user context for RLS. */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { v1ApiMiddleware } from '@/lib/api/v1/middleware'
 import { prisma } from '@/lib/db'
-import { embedText, formatVectorLiteral } from '@/lib/ai/embeddings'
+import { embeddingAvailability, embedText, formatVectorLiteral, vectorConfigMismatch } from '@/lib/ai/embeddings'
 import { getWorkspaceDatabaseNames } from '@/lib/services/databaseProvisioning'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
@@ -84,6 +88,21 @@ async function handleGET(
       ? vs.embeddingColumn
       : 'embedding'
 
+    const available = embeddingAvailability()
+    if ('reason' in available) {
+      return NextResponse.json(
+        { error: available.reason, code: 'EMBEDDINGS_UNAVAILABLE' },
+        { status: 503 },
+      )
+    }
+    const mismatch = vectorConfigMismatch(vs)
+    if (mismatch) {
+      return NextResponse.json(
+        { error: mismatch, code: 'EMBEDDING_MODEL_MISMATCH' },
+        { status: 409 },
+      )
+    }
+
     // ── Embed the query ────────────────────────────────────────────────────
     let queryVec: number[]
     try {
@@ -118,6 +137,7 @@ async function handleGET(
     let rows: Array<Record<string, unknown>>
     try {
       rows = await executeWithUserContext<Record<string, unknown>>(
+        params.projectId,
         middleware.context.endUserId ?? '',
         middleware.context.apiKey.serviceRole,
         sql,
@@ -149,6 +169,25 @@ async function handleGET(
       return out
     })
 
+    // An empty result on a table whose rows have no vectors is not "no match".
+    let hint: string | undefined
+    if (data.length === 0) {
+      const counted = await executeWithUserContext<{ n: number }>(
+        params.projectId,
+        middleware.context.endUserId ?? '',
+        middleware.context.apiKey.serviceRole,
+        `SELECT count(*)::int AS n FROM "${postgresSchema}"."${params.tableName}" WHERE "${embeddingColumn}" IS NULL`,
+        [],
+        middleware.context.endUserRole ?? 'user'
+      ).catch(() => null)
+      const unembedded = counted?.[0]?.n ?? 0
+      if (unembedded > 0) {
+        hint =
+          `${unembedded} row(s) you can read have no "${embeddingColumn}" value, so they are not searched. ` +
+          'Backenly does not compute it when rows are written yet; write it with the row.'
+      }
+    }
+
     return NextResponse.json({
       data,
       meta: {
@@ -158,6 +197,7 @@ async function handleGET(
         model: vs.model ?? 'text-embedding-3-small',
         sourceColumns: vs.sourceColumns ?? [],
         indexKind: vs.indexKind ?? 'hnsw',
+        ...(hint ? { hint } : {}),
       },
     })
   } catch (err: any) {

@@ -15,6 +15,7 @@
 import type { BuildNode, NodeStatus, BlockedReason } from './types'
 import type { ExecutionResult } from '../minimal-executor'
 
+import { chat } from '@/lib/ai/llm/chat'
 export interface NodeExecutionResult {
   nodeId: string
   status: NodeStatus
@@ -672,10 +673,6 @@ async function generateColumnsWithLLM(
   if (_columnCache.has(cacheKey)) return _columnCache.get(cacheKey)!
 
   try {
-    const { getOpenAIClient } = await import('../openai-service')
-    const { getModel } = await import('../model-router')
-    const openai = getOpenAIClient()
-
     // Inject semantic enrichment (state machine, business rules) when available
     // so the LLM generates the right status column with correct enum values,
     // reservation fields for credit wallets, etc.
@@ -683,8 +680,8 @@ async function generateColumnsWithLLM(
       ? `\n\nSEMANTIC CONTEXT — use this to pick the right columns:\n${semanticEnrichment.slice(0, 1000)}`
       : ''
 
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -709,13 +706,12 @@ Rules:
           content: `Table name: ${tableName}\nApp description: ${originalPrompt.slice(0, 300)}`,
         },
       ],
-      temperature: 0,
-      max_tokens: 400,
-      // json_object requires an object — wrap array in { columns: [...] }
-      response_format: { type: 'json_object' },
+      maxTokens: 400,
+      json: true,
+      label: 'node-executor-columns',
     })
 
-    const raw = JSON.parse(response.choices[0].message.content || '{"columns":[]}')
+    const raw = JSON.parse(response.text || '{"columns":[]}')
     const cols: Array<{ name: string; type: string }> = Array.isArray(raw)
       ? raw
       : (raw.columns ?? raw.fields ?? raw.schema ?? [])
@@ -1008,9 +1004,11 @@ async function executePermissionsNode(
     // as failures. Count policies actually present in the workspace schema.
     let actualApplied = successCount
     try {
-      const { prisma: rlsPrisma } = await import('@/lib/db')
+      // The catalog of the project's database, in its region.
+      const { workspaceRawClient } = await import('@/lib/data-plane/regional')
+      const db = await workspaceRawClient(projectId)
       const schemaName = `workspace_${projectId}`
-      const policyRows = await rlsPrisma.$queryRawUnsafe<Array<{ tablename: string }>>(
+      const policyRows = await db.$queryRawUnsafe<Array<{ tablename: string }>>(
         `SELECT DISTINCT tablename FROM pg_policies
          WHERE schemaname = $1 AND policyname LIKE '%own_rows%'`,
         schemaName
@@ -1068,9 +1066,17 @@ async function executeStorageNode(
     return {
       nodeId: node.id,
       status: 'verified',
-      detail: `Created storage bucket \`${bucketName}\``,
+      detail: (result.data as { existed?: boolean } | undefined)?.existed
+        ? `Bucket \`${bucketName}\` already exists`
+        : `Created storage bucket \`${bucketName}\``,
       artifacts: result.artifacts,
     }
+  }
+
+  // An existing bucket with the OTHER visibility is not this node done: the
+  // build asked for public (or private) storage and did not get it.
+  if (result.error === 'BUCKET_VISIBILITY_MISMATCH') {
+    return { nodeId: node.id, status: 'failed', failureReason: result.message }
   }
 
   if (result.message?.toLowerCase().includes('already exists')) {

@@ -150,6 +150,12 @@ model Project {
   pauseWarnedAt           DateTime? // When the pause warning was DELIVERED. Cleared by real activity. No delivered warning, no pause.
   lastActivityAt          DateTime? // Real use only (runtime traffic, MCP calls, dashboard writes). Never stamped by autonomy, cron or backups.
   pausePolicySince        DateTime? // When the inactivity policy first applied to this project, so a paid-to-Free downgrade gets a full window.
+  // The Backenly Cloud region holding this project's data (lib/regions.ts).
+  // Null is the home region: every project created before a second region
+  // opens, and every self-hosted project. Recorded at creation and never
+  // changed. lib/data-plane/regional.ts opens every connection to the
+  // project's data in this region and never falls back to another.
+  region                  String?
   // Protected production: a coding agent may change this project's schema only
   // on a preview branch, and production only through a branch merge a human
   // approved. Dashboard changes, autonomy fixes and row writes are not gated.
@@ -177,6 +183,7 @@ model Project {
   deployConfirmations     DeployConfirmation[]
   aiConfiguration         AiConfiguration?
   aiUsage                 AiUsage[]
+  aiFixProposals          AiFixProposal[]
   anomalies               Anomaly[]
   apiKeys                 ApiKey[]
   apiRequestLogs          ApiRequestLog[]
@@ -198,6 +205,7 @@ model Project {
   roles                   Role[]
   securityIssues          SecurityIssue[]
   securityScans           SecurityScan[]
+  supportTickets          SupportTicket[]
   storageBuckets          StorageBucket[]
   storageFiles            StorageFile[]
   multipartUploads        MultipartUpload[]
@@ -884,9 +892,11 @@ model ApiKey {
   //   "runtime" (default) — /api/v1/{projectId}/* runtime data API (SDK clients).
   //                         Cannot reach brain tools or any /api/mcp/* surface.
   //   "mcp"               — issued from the MCP setup page. Can call /api/mcp/*
-  //                         (brain chat + direct tool dispatch + runtime data).
-  //                         These can create/alter/drop tables — never embed
-  //                         them in a public client.
+  //                         only (brain chat, direct tool dispatch and the db_*
+  //                         row tools). These can create/alter/drop tables. The
+  //                         runtime API (/api/v1, /api/v2) refuses them from
+  //                         anywhere with MCP_KEY_IN_APP, so one is never an
+  //                         app's key (lib/security/key-placement.ts).
   // A leaked SDK key cannot drop tables; a leaked MCP key can. Splitting the
   // scope keeps that blast radius explicit and auditable.
   scope           String            @default("runtime")
@@ -1278,6 +1288,77 @@ model AiUsage {
   @@map("ai_usage")
 }
 
+/// Model spend for one month (UTC) against one of the deployment's limits:
+/// scope 'total' counts every call, 'platform' the calls Backenly pays for
+/// itself. Reserved before a call, settled after it (lib/ai/llm/spend.ts), so
+/// concurrent calls cannot overshoot a limit between check and charge.
+model AiSpendPeriod {
+  month       String // YYYY-MM, UTC
+  scope       String // total | platform
+  reservedUsd Decimal  @default(0) @db.Decimal(14, 6)
+  settledUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  /// Calls whose result was lost after they were sent, booked at their full
+  /// reservation because a lost answer is not proof nothing ran.
+  unknownUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@id([month, scope])
+  @@map("ai_spend_periods")
+}
+
+/// A repair an AI investigation proposed for one finding, bound to the exact
+/// evidence, parameters and catalog state it was proposed against. It runs only
+/// when a person approves that exact version (lib/autonomy/ai-proposals.ts),
+/// and only once: approval claims it with a conditional update.
+model AiFixProposal {
+  id                  String    @id @default(uuid())
+  projectId           String
+  findingId           String
+  /// pending | executing | executed | failed | rejected | stale | expired
+  status              String    @default("pending")
+  action              String
+  params              Json
+  /// Binds project, finding, evidence, action, params, the touched catalog,
+  /// the rollback contract and the verifier version. Approval must present it.
+  proposalVersion     String
+  evidenceFingerprint String
+  catalogFingerprint  String
+  model               String
+  rationale           String    @db.Text
+  expiresAt           DateTime
+  /// Set by the one approval that claimed it.
+  executionId         String?
+  decidedBy           String?
+  decidedAt           DateTime?
+  outcome             Json?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  project             Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([findingId])
+  @@map("ai_fix_proposals")
+}
+
+/// One call's reservation. A call that never settles (the process died) is
+/// still accounted for: past `expiresAt` it is booked as unknown usage.
+model AiSpendHold {
+  id         String    @id @default(uuid())
+  month      String
+  scopes     String[]
+  purpose    String
+  model      String
+  amountUsd  Decimal   @db.Decimal(14, 6)
+  status     String    @default("reserved") // reserved | settled | released | unknown
+  chargedUsd Decimal?  @db.Decimal(14, 6)
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  settledAt  DateTime?
+
+  @@index([status, expiresAt])
+  @@map("ai_spend_holds")
+}
+
 // Billing-specific usage tracking (user-scoped, monthly)
 // `date` is stored as YYYY-MM for monthly reset
 model UserAiUsage {
@@ -1298,6 +1379,72 @@ model UserAiUsage {
   @@index([userId])
   @@index([date])
   @@map("user_ai_usage")
+}
+
+// The same monthly counters, kept per BILLING ACCOUNT rather than per user.
+//
+// A plan's allowances (AI credits, function runs, the API request count the
+// Usage page shows) belong to whoever pays for them: an organization on
+// Backenly Cloud, the owning account where there are no organizations. Keyed
+// by a plain string like the usage ledger (usage_daily), not a foreign key, so
+// one table serves both. UserAiUsage above is the per-user history these
+// counters were kept in before organizations were billed on their own; nothing
+// writes it any more.
+model AccountAiUsage {
+  id                    String   @id @default(uuid())
+  billingAccountId      String
+  date                  String // YYYY-MM
+  intentCount           Int      @default(0) // AI build actions this month (committed)
+  reservedCount         Int      @default(0) // AI build actions reserved but not yet committed
+  tokenCount            Int      @default(0)
+  apiRequestCount       BigInt   @default(0) // API requests this month
+  aiFunctionInvocations Int      @default(0) // AI Function invocations this month
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([billingAccountId, date])
+  @@index([date])
+  @@map("account_ai_usage")
+}
+
+/// One customer-paid model call's hold on its account's AI credits
+/// (lib/entitlements/credit-holds.ts): reserved before it is sent, used at what
+/// it consumed until its turn is charged, then charged or released. Counts
+/// against the cap only while reserved or used and unexpired.
+model AiCreditHold {
+  id               String    @id @default(uuid())
+  billingAccountId String
+  /// YYYY-MM, matching account_ai_usage.date.
+  month            String
+  /// Worst case, in effective tokens.
+  tokens           Int
+  /// What the call actually used, once it ran.
+  usedTokens       Int?
+  /// reserved | used | charged | released
+  status           String    @default("reserved")
+  /// Taken inside a turn that will be charged; a call outside one is released when it settles.
+  turnScoped       Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  settledAt        DateTime?
+
+  @@index([billingAccountId, month, status])
+  @@map("ai_credit_holds")
+}
+
+// A billing account's two credit balances, bonus and purchased, and the last
+// month whose consumption has been reconciled into them. Formerly columns on
+// User (bonusCredits, purchasedCredits, bonusReconciledThrough), which now
+// only hold the history this table started from.
+model AccountCredits {
+  billingAccountId       String   @id
+  bonusCredits           Int      @default(0)
+  purchasedCredits       Int      @default(0)
+  bonusReconciledThrough String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@map("account_credits")
 }
 
 // Monthly Active Users — one row per (project, end-user, calendar month).
@@ -1323,18 +1470,21 @@ model ProjectActiveUser {
 // Status transitions: reserved → committed (on success) or refunded (on failure/timeout).
 // Stale reservations (status=reserved past expiresAt) are cleaned up by the nightly cron.
 model CreditReservation {
-  id          String    @id @default(uuid())
-  userId      String
-  date        String // YYYY-MM — must match the UserAiUsage row it debits
-  amount      Int       @default(1)
-  jobId       String    @unique // opaque caller-supplied job identifier
-  status      String    @default("reserved") // reserved | committed | refunded
-  createdAt   DateTime  @default(now())
-  expiresAt   DateTime // stale reservations auto-refunded after this time
-  committedAt DateTime?
-  refundedAt  DateTime?
+  id               String    @id @default(uuid())
+  userId           String
+  // The billing account whose AccountAiUsage row this reservation debits.
+  billingAccountId String?
+  date             String // YYYY-MM — must match the usage row it debits
+  amount           Int       @default(1)
+  jobId            String    @unique // opaque caller-supplied job identifier
+  status           String    @default("reserved") // reserved | committed | refunded
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime // stale reservations auto-refunded after this time
+  committedAt      DateTime?
+  refundedAt       DateTime?
 
   @@index([userId, date])
+  @@index([billingAccountId, date])
   @@index([jobId])
   @@index([status, expiresAt])
   @@map("credit_reservations")
@@ -1345,28 +1495,33 @@ model CreditReservation {
 // grants (referral, promo, signup bonus) and purchases as positive amounts, and
 // month-rollover burns (credits consumed beyond the plan allowance) as
 // negatives. The Billing "Credit activity" tab reads from here;
-// `User.bonusCredits` and `User.purchasedCredits` are the running balances.
+// AccountCredits holds the running balances.
 model CreditLedgerEntry {
-  id           String   @id @default(uuid())
-  userId       String
+  id               String   @id @default(uuid())
+  // Who the movement concerns: the account owner, or the user a grant was for.
+  userId           String
+  // The billing account whose balance moved. Null only on a row written by a
+  // release from before balances were kept per billing account.
+  billingAccountId String?
   // Signed credits: +grant, -burn. Summed over one balance's reasons, equals
   // that balance's net movement.
-  amount       Int
+  amount           Int
   // That balance immediately AFTER this entry (for a clean history UI).
-  balanceAfter Int
+  balanceAfter     Int
   // Bonus: 'referral_signup' | 'referral_paid' | 'promo' | 'admin_grant' |
   //        'monthly_bonus_burn' | 'signup_bonus'
   // Purchased: 'purchase' | 'monthly_purchased_burn'
-  reason       String
+  reason           String
   // Free-form human note shown in the history row.
-  description  String?
+  description      String?
   // Optional link to the originating record (ReferralGrant id, promo code, …).
-  referenceId  String?
-  createdAt    DateTime @default(now())
+  referenceId      String?
+  createdAt        DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
+  @@index([billingAccountId, createdAt])
   @@map("credit_ledger_entries")
 }
 
@@ -1376,17 +1531,21 @@ model CreditLedgerEntry {
 // so a webhook delivered twice can never credit an account twice. Written only
 // by the Cloud overlay; Stripe stays the payment authority.
 model AiCreditPurchase {
-  id              String   @id @default(uuid())
-  userId          String
-  stripeSessionId String   @unique
-  credits         Int
-  amountCents     Int
-  currency        String
-  createdAt       DateTime @default(now())
+  id               String   @id @default(uuid())
+  // Who paid.
+  userId           String
+  // The billing account the credits were added to.
+  billingAccountId String?
+  stripeSessionId  String   @unique
+  credits          Int
+  amountCents      Int
+  currency         String
+  createdAt        DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
+  @@index([billingAccountId, createdAt])
   @@map("ai_credit_purchases")
 }
 
@@ -1877,19 +2036,19 @@ model PaddleSubscription {
 // on name or schemaName made re-creating "staging" after a merge fail after the
 // new schema had already been created and registered.
 model WorkspaceBranch {
-  id           String                      @id @default(uuid())
+  id           String                     @id @default(uuid())
   projectId    String
   name         String // slug, e.g. "add-payments"
   schemaName   String // workspace_{projectId}_br_{name}
-  status       String                      @default("active") // active | merged | discarded
+  status       String                     @default("active") // active | merged | discarded
   createdBy    String
-  createdAt    DateTime                    @default(now())
+  createdAt    DateTime                   @default(now())
   mergedAt     DateTime?
   discardedAt  DateTime?
   // Main's schema when the branch was cut: what a merge compares against to
   // tell a change made on the branch from one made on main since.
   baseSnapshot Json?
-  project      Project                     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project      Project                    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   apiKeys      ApiKey[]
   migrations   WorkspaceBranchMigration[]
 
@@ -2322,7 +2481,7 @@ model WebhookLog {
   id           String                @id @default(uuid())
   webhookId    String
   eventType    String
-  payload      Json // The event payload sent
+  payload      Json? // The event payload sent. NULL for a project outside the home region: it is kept in that region (lib/data-plane/regional-bodies.ts)
   signature    String // HMAC signature used
   status       WebhookDeliveryStatus @default(PENDING)
   statusCode   Int? // HTTP response status
@@ -2574,6 +2733,7 @@ model AiFunction {
   name          String // Auto-generated short name
   description   String // User's natural language description
   generatedCode String    @db.Text // AI-generated JS function body
+  codeOrigin    String    @default("generated") // generated (Backenly model — self-heal may rewrite) | agent (deploy_code — never model-rewritten)
   triggerType   String // on_signup | on_db_insert | on_db_update | on_db_delete | manual | cron
   triggerTable  String? // Table name for db triggers; for cron jobs stores the cron expression (e.g. "0 9 * * *")
   status        String    @default("active") // active | inactive | error
@@ -3010,7 +3170,7 @@ model TriggerDeliveryLog {
   projectId    String
   eventType    String // 'insert' | 'update' | 'delete'
   table        String // Source table that fired the event
-  payload      Json // Full event payload that was sent
+  payload      Json? // Full event payload that was sent. NULL for a project outside the home region: it is kept in that region (lib/data-plane/regional-bodies.ts)
   status       TriggerDeliveryStatus
   attemptCount Int                   @default(1)
   statusCode   Int? // HTTP response status (null if network error)
@@ -3519,20 +3679,65 @@ model UnsupportedRequest {
 
 // In-app support inbox. User submits via Settings → "Contact support" form.
 // Founder reads from admin Feedback tab. No email round-trip required.
+// A support case (Backenly Cloud). `message` is the opening description and
+// renders as the thread's first entry; replies live in SupportMessage. The AI
+// first response is platform-paid (purpose `support.answer`) and never spends
+// the customer's plan credits. Routes refuse off Cloud: on a self-hosted
+// install there is nobody behind the ticket box, so the surface must not exist.
 model SupportTicket {
-  id        String   @id @default(uuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  subject   String
-  message   String
-  status    String   @default("open") // open | resolved | dismissed
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(uuid())
+  // Human reference ("Case #1042"). The only autoincrement in the schema, on
+  // purpose: people quote case numbers in email and chat, and a uuid cannot be
+  // read aloud.
+  caseNumber Int      @unique @default(autoincrement())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Optional: the project the case is about. SetNull so deleting a project
+  // keeps the correspondence.
+  projectId  String?
+  project    Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  subject    String
+  message    String
+  category   String   @default("other") // database | api | auth | storage | functions | realtime | deploy | agent | billing | account | security | other
+  severity   String   @default("normal") // low | normal | high | urgent — high/urgent need a paid plan (lib/support/constants.ts)
+  status     String   @default("open") // open | waiting_on_customer | resolved | closed (legacy "dismissed" rows were migrated to closed)
+  // What the AI first responder did: none (not attempted yet) | replied |
+  // unavailable (no provider configured) | failed (provider errored). Honesty
+  // field — the admin queue must know which tickets got no instant answer.
+  aiState    String   @default("none")
+  // Thread ordering and queue triage without joining messages.
+  lastMessageAt     DateTime  @default(now())
+  lastMessageBy     String    @default("user") // user | ai | staff
+  firstStaffReplyAt DateTime?
+  resolvedAt        DateTime?
+  resolvedBy        String? // user | staff
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  messages   SupportMessage[]
 
   @@index([userId])
   @@index([status])
   @@index([createdAt])
+  @@index([lastMessageAt])
+  @@index([projectId])
   @@map("support_tickets")
+}
+
+// One correspondence entry on a support case, in the AWS Support sense: the
+// customer, the AI first responder and the team write into one thread.
+model SupportMessage {
+  id           String        @id @default(uuid())
+  ticketId     String
+  ticket       SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author       String // user | ai | staff
+  // The platform user who wrote it: the customer for `user`, the responding
+  // founder/operator for `staff`, null for `ai`.
+  authorUserId String?
+  body         String
+  createdAt    DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
 }
 
 // Founder's roadmap, written by users. Submitted via Settings → "Feature requests" form.
@@ -3696,6 +3901,51 @@ model SchemaDriftEvent {
   @@index([projectId, status])
   @@index([capturedAt])
   @@map("schema_drift_events")
+}
+
+// ─── Authorization projection ───────────────────────────────────────────────
+//
+// A request to a project kept outside the home region is authorized from rows
+// here: the project's lock, pause and signing secret, its keys, and the
+// branches they are bound to. Each region keeps a copy of those rows for its
+// own projects (scripts/sql/auth-projection.sql), delivered from here by
+// lib/auth-projection/deliver.ts. The triggers that fill
+// auth_projection_changes are in the migration that created it
+// (20261017120000_auth_projection): Prisma does not model triggers.
+
+// One changed row of a regional project, waiting for its region: which row,
+// never what it holds. The delivery reads the row's state when it delivers.
+model AuthProjectionChange {
+  id          BigInt    @id @default(autoincrement())
+  region      String
+  projectId   String
+  // project | api_key | branch
+  entity      String
+  entityId    String
+  createdAt   DateTime  @default(now())
+  deliveredAt DateTime?
+
+  @@index([region, deliveredAt, id])
+  @@index([deliveredAt])
+  @@map("auth_projection_changes")
+}
+
+// Where delivery to each region stands. The region keeps the same epoch and
+// round beside its copy; when the two differ, one side was restored or a
+// delivery committed in only one of them, and the region's copy is delivered
+// afresh.
+model AuthProjectionRegion {
+  region      String    @id
+  epoch       String
+  round       BigInt    @default(0)
+  // Every change committed here before this time is in the region's copy.
+  watermarkAt DateTime?
+  deliveredAt DateTime?
+  resyncedAt  DateTime  @default(now())
+  lastError   String?
+  lastErrorAt DateTime?
+
+  @@map("auth_projection_regions")
 }
 
 // ─── MCP OAuth ───────────────────────────────────────────────────────────────

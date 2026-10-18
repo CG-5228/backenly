@@ -25,8 +25,8 @@
  * "could you tell me a bit more?" clarification.
  */
 
-import { getOpenAIClient, trackCompletionCost } from '../openai-service'
-import { getModel } from '../model-router'
+import { AiError, generate } from '../llm'
+import { conversationFor } from './model'
 import { classifierPrompt } from './prompts'
 import type { ConversationTurn } from './memory'
 
@@ -48,6 +48,8 @@ export interface Classification {
 }
 
 export interface ClassifierContext {
+  /** The project the turn is for: its usage log records the call. */
+  projectId?: string
   message: string
   recentHistory?: ConversationTurn[]
   /** True when there's an active Proposal waiting for "apply". */
@@ -73,52 +75,67 @@ const VALID_INTENTS: readonly BrainIntent[] = [
   'APPLY_PROPOSAL', 'CONFIRM', 'UNCLEAR',
 ]
 
-export async function classify(ctx: ClassifierContext): Promise<Classification> {
-  const openai = getOpenAIClient()
+/**
+ * The classification's shape, as structured output: the intent is one of the
+ * known values and every field is present, so a reply can only fail to parse
+ * by being cut off.
+ */
+const CLASSIFICATION_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['intent', 'confidence', 'reasoning'],
+  properties: {
+    intent: { type: 'string', enum: [...VALID_INTENTS] },
+    confidence: { type: 'number' },
+    reasoning: { type: 'string' },
+  },
+}
 
-  const sys = classifierPrompt()
+/**
+ * Classify one message.
+ *
+ * Throws the gateway's AiError when the provider could not answer: no model is
+ * configured, it is out of quota, rate-limited, or timed out. Every later step
+ * of the turn needs the same provider, so the caller stops and says why. This
+ * used to come back as UNCLEAR, which made the turn ask the user a clarifying
+ * question about a perfectly clear message. Only an answer that arrived but
+ * cannot be read falls back to UNCLEAR.
+ */
+export async function classify(ctx: ClassifierContext): Promise<Classification> {
   const contextLines: string[] = []
   if (ctx.hasPendingPlan) contextLines.push('CONTEXT: a plan was proposed in the previous AI turn and is awaiting user confirmation.')
   if (ctx.hasPendingProposal) contextLines.push('CONTEXT: a Proposal (recommendation list) is active and may be applied.')
   if (ctx.isFreshProject) contextLines.push('CONTEXT: this project is brand new — nothing has been built yet, and the user most likely just arrived from the "describe your backend" box. If this message describes an app, a product, or what its users can do, it is a BUILD request — not a QUESTION and not UNCLEAR.')
 
-  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-    { role: 'system', content: sys },
-  ]
-  if (contextLines.length) messages.push({ role: 'system', content: contextLines.join('\n') })
-  for (const turn of (ctx.recentHistory ?? []).slice(-4)) {
-    messages.push({
-      role: turn.role,
-      content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content,
-    })
-  }
-  messages.push({ role: 'user', content: ctx.message })
+  const recent = (ctx.recentHistory ?? []).slice(-4).map((turn) => ({
+    role: turn.role,
+    content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content,
+  }))
 
-  let raw: string
+  let parsed: { intent?: string; confidence?: number; reasoning?: string } | null
   try {
-    const completion = await openai.chat.completions.create({
-      model: getModel('classify'),
-      messages,
-      temperature: 0,
-      max_tokens: 120,
-      response_format: { type: 'json_object' },
+    const reply = await generate({
+      purpose: 'brain.classify',
+      system: classifierPrompt(),
+      ...(contextLines.length ? { context: contextLines.join('\n') } : {}),
+      messages: conversationFor(recent, ctx.message),
+      jsonSchema: CLASSIFICATION_SCHEMA,
+      maxTokens: 400,
+      billing: { projectId: ctx.projectId },
+      label: 'brain-classify',
     })
-    raw = completion.choices[0]?.message?.content?.trim() ?? ''
+    parsed = reply.json && typeof reply.json === 'object' ? (reply.json as typeof parsed) : null
   } catch (err) {
-    console.error('[BrainClassifier] LLM call failed:', err)
-    return {
-      intent: 'UNCLEAR',
-      confidence: 0,
-      reasoning: 'classifier call failed — defaulting to UNCLEAR (asks user)',
-    }
+    if (err instanceof AiError && err.kind !== 'output_invalid') throw err
+    console.error('[BrainClassifier] classification could not be read:', err)
+    parsed = null
   }
 
-  const parsed = safeParse(raw)
   if (!parsed) {
     return {
       intent: 'UNCLEAR',
       confidence: 0,
-      reasoning: 'classifier returned unparseable JSON — defaulting to UNCLEAR',
+      reasoning: 'classifier answer could not be read — defaulting to UNCLEAR',
     }
   }
 
@@ -150,21 +167,6 @@ export async function classify(ctx: ClassifierContext): Promise<Classification> 
   }
 
   return { intent, confidence, reasoning }
-}
-
-function safeParse(raw: string): { intent?: string; confidence?: number; reasoning?: string } | null {
-  if (!raw) return null
-  try {
-    const obj = JSON.parse(raw)
-    if (obj && typeof obj === 'object') return obj
-  } catch {
-    // Attempt to recover from prose-wrapped JSON
-    const m = raw.match(/\{[\s\S]*\}/)
-    if (m) {
-      try { return JSON.parse(m[0]) } catch { /* fall through */ }
-    }
-  }
-  return null
 }
 
 /** Convenience: should this intent go to the answerer path (no tools)? */

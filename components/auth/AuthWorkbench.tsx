@@ -27,6 +27,7 @@ import {
   AgentPrompt, CommandBar, CopyField, EmptyState, IconButton, INPUT_BASE, KIT, KitTab, KitTabs, Spinner, Tag,
 } from '@/components/inspector/kit'
 import { FOCUS_INSET } from '@/components/console/tokens'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 interface EndUser {
   id: string
@@ -47,6 +48,7 @@ export function AuthWorkbench({ projectId }: { projectId: string }) {
     return requested === 'users' || requested === 'email' ? requested : 'config'
   })
   const [users, setUsers] = useState<EndUser[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
 
   const fetchUsers = useCallback(async () => {
@@ -56,9 +58,26 @@ export function AuthWorkbench({ projectId }: { projectId: string }) {
       const token = typeof window !== 'undefined' ? localStorage.getItem('auth-token') : null
       const headers: HeadersInit = { 'Content-Type': 'application/json', 'X-Project-Id': projectId }
       if (token) headers['Authorization'] = `Bearer ${token}`
-      const res = await fetch('/api/auth/users', { headers })
-      const data = await res.json()
-      setUsers(data.users || [])
+      // Page through the route's cap (it serves at most 200 per page). The
+      // old single uncapped call stored one 50-row page, so a 320-user
+      // project read "50 users" and users 51+ were unreachable — search
+      // filters the loaded array. Bounded so a huge project cannot hang the
+      // tab; the header is ALWAYS the server's total.
+      const all: any[] = []
+      let page = 1
+      let serverTotal = 0
+      const MAX_PAGES = 25 // 5,000 rows
+      for (;;) {
+        const res = await fetch(`/api/auth/users?limit=200&page=${page}`, { headers })
+        const data = await res.json()
+        all.push(...(data.users || []))
+        serverTotal = data.pagination?.total ?? all.length
+        const totalPages = data.pagination?.totalPages ?? 1
+        if (page >= totalPages || page >= MAX_PAGES || (data.users || []).length === 0) break
+        page++
+      }
+      setUsers(all)
+      setTotal(serverTotal)
     } catch (err) {
       console.error('Error fetching users:', err)
     } finally {
@@ -74,7 +93,7 @@ export function AuthWorkbench({ projectId }: { projectId: string }) {
         title="Auth & Users"
         context={
           <span className="tabular-nums">
-            {loading ? 'Loading users…' : `${users.length.toLocaleString()} ${users.length === 1 ? 'user' : 'users'}`}
+            {loading ? 'Loading users…' : `${total.toLocaleString()} ${total === 1 ? 'user' : 'users'}`}
           </span>
         }
       />
@@ -84,7 +103,7 @@ export function AuthWorkbench({ projectId }: { projectId: string }) {
           <SlidersHorizontal />
           Configuration
         </KitTab>
-        <KitTab active={tab === 'users'} onClick={() => setTab('users')} count={users.length > 0 ? users.length : undefined}>
+        <KitTab active={tab === 'users'} onClick={() => setTab('users')} count={total > 0 ? total : undefined}>
           <Users />
           Users
         </KitTab>
@@ -132,6 +151,7 @@ function UsersGrid({
   onRefresh: () => void
 }) {
   const router = useRouter()
+  const agent = useAgentConnection(projectId)
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -198,13 +218,15 @@ function UsersGrid({
                   !query ? (
                     <div className="flex w-full flex-col items-center gap-4">
                       <AgentPrompt prompt="Add email and password sign-up and sign-in to the app, with password reset." />
-                      <button
-                        type="button"
-                        onClick={() => router.push(`/app/projects/${projectId}/connect`)}
-                        className="text-[13px] font-medium text-zinc-300 underline decoration-white/20 underline-offset-4 transition-colors hover:text-zinc-50 hover:decoration-white/50"
-                      >
-                        Connect your agent
-                      </button>
+                      {agent.needsConnect && (
+                        <button
+                          type="button"
+                          onClick={() => router.push(`/app/projects/${projectId}/connect`)}
+                          className="text-[13px] font-medium text-zinc-300 underline decoration-white/20 underline-offset-4 transition-colors hover:text-zinc-50 hover:decoration-white/50"
+                        >
+                          Connect your agent
+                        </button>
+                      )}
                     </div>
                   ) : undefined
                 }

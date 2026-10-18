@@ -15,6 +15,8 @@
  * The point of this interface is that there is exactly ONE authority.
  */
 
+import type { CloudRegionId } from '@/lib/regions'
+
 /** Which edition is running. Resolved once, in lib/edition/index.ts. */
 export type Edition = 'single-tenant' | 'cloud'
 
@@ -213,6 +215,8 @@ export interface ProjectListEntry {
   updatedAt: Date
   /** Set while the project is paused for inactivity (Backenly Cloud only). */
   pausedAt: Date | null
+  /** The Backenly Cloud region holding the project's data. Null is the home region. */
+  region: string | null
   _count: { tables: number; workspaces: number }
 }
 
@@ -225,7 +229,37 @@ export interface ProjectCreateInput {
   apiUrlProd?: string | null
   /** The authenticated account creating it. */
   userId: string
+  /**
+   * The organization to create it in, on an edition that has organizations.
+   * Omitted: the creator's own. Where there are no organizations it is ignored.
+   */
+  organizationId?: string | null
+  /**
+   * The region its data lives in (lib/regions.ts), already checked by the
+   * caller (checkRequestedRegion). Omitted: the home region.
+   */
+  region?: CloudRegionId | null
 }
+
+export interface ProjectListOptions {
+  /**
+   * Only the projects of this organization. Ignored where there are no
+   * organizations: single-tenant has one project and no org layer.
+   */
+  organizationId?: string | null
+}
+
+/**
+ * Who a new project would belong to, or why this caller cannot create one.
+ *
+ * `ownerId` is the account the project is owned by and counted against. It is
+ * not always the caller: a project created inside a team belongs to the team's
+ * owner, so it is that owner's project allowance it spends, and a member who
+ * later leaves the team does not leave with it.
+ */
+export type ProjectCreationAccount =
+  | { ok: true; ownerId: string; organizationId: string | null }
+  | { ok: false; status: number; code: string; error: string }
 
 export interface ProjectCreateResult {
   /** The created project, loaded in the shape the route serialises. */
@@ -267,7 +301,14 @@ export interface ProjectLifecycle {
    * self-host install never runs a fleet-shaped query to answer a question with
    * exactly one answer.
    */
-  list(userId: string): Promise<ProjectListEntry[]>
+  list(userId: string, options?: ProjectListOptions): Promise<ProjectListEntry[]>
+
+  /**
+   * Who a project created by `userId` (in `organizationId`, if given) would
+   * belong to. Asked BEFORE quotas are checked, because the quota is the
+   * owner's. Refuses a caller who may not create projects there.
+   */
+  creationAccount(userId: string, organizationId?: string | null): Promise<ProjectCreationAccount>
 
   /**
    * Create a project and everything that makes it usable.

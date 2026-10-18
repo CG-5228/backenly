@@ -19,6 +19,7 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectAccess } from '@/lib/auth/route-protection'
+import { canWriteProject } from '@/lib/edition/guard'
 import { prisma } from '@/lib/db/prisma'
 import { executeApprovedFix, revertAutoFix } from '@/lib/core/auto-fix-engine'
 import { resolvePendingActionMemory } from '@/lib/operational-memory/ledger'
@@ -26,6 +27,15 @@ import { resolvePendingActionMemory } from '@/lib/operational-memory/ledger'
 // ── POST — approve and execute ────────────────────────────────────────────────
 
 export const POST = withProjectAccess(async (req: NextRequest, { user, project, projectId }) => {
+  // DEVELOPER: approving a finding executes its repair against the live
+  // backend, the same floor the proposals approve route already enforces.
+  if (!(await canWriteProject(user.userId, projectId))) {
+    return NextResponse.json(
+      { success: false, error: 'Project not found or access denied', code: 'PROJECT_ROLE_INSUFFICIENT' },
+      { status: 403 },
+    )
+  }
+
   let body: { findingId?: string }
   try {
     body = await req.json()
@@ -85,6 +95,31 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
       timestamp: new Date(),
     },
   })
+
+  // Diagnosis precision receipt: when this finding carried an autonomous
+  // diagnosis (escalation-diagnosis.ts), approving its fix is the "accepted"
+  // outcome. The "rejected" side is recorded on dismissal (POST /health).
+  const diagnosis = ((finding.details ?? {}) as Record<string, unknown>).diagnosis as
+    | { confidence?: string; model?: string }
+    | undefined
+  if (diagnosis) {
+    prisma.auditLog.create({
+      data: {
+        projectId,
+        action: 'AUTONOMY_DIAGNOSIS_OUTCOME',
+        type: 'autonomy',
+        details: JSON.stringify({
+          findingId,
+          findingType: finding.type,
+          outcome: 'accepted',
+          confidence: diagnosis.confidence ?? null,
+          model: diagnosis.model ?? null,
+          at: new Date().toISOString(),
+        }),
+        timestamp: new Date(),
+      },
+    }).catch(() => {})
+  }
 
   // Execute the fix (bypasses the classification gate — user already approved)
   const result = await executeApprovedFix(findingId, projectId)
@@ -157,6 +192,8 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
         statements: (result.rollbackData as Record<string, unknown> | undefined)?.statements ?? [],
         // Drives the ledger copy: only 'confirmed' may claim re-verification.
         verification: result.verification ?? 'unverified',
+        // Only 'ran' may claim nothing else broke.
+        regressionCheck: result.regressionCheck ?? 'unavailable',
       }),
       timestamp: new Date(),
     },
@@ -198,6 +235,14 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
 // ── DELETE — rollback an auto-fixed finding ───────────────────────────────────
 
 export const DELETE = withProjectAccess(async (req: NextRequest, { user, projectId }) => {
+  // DEVELOPER: reverting an applied fix changes the live backend too.
+  if (!(await canWriteProject(user.userId, projectId))) {
+    return NextResponse.json(
+      { success: false, error: 'Project not found or access denied', code: 'PROJECT_ROLE_INSUFFICIENT' },
+      { status: 403 },
+    )
+  }
+
   const { searchParams } = new URL(req.url)
   const findingId = searchParams.get('findingId')
   const confirmed = searchParams.get('confirm') === 'true'

@@ -97,7 +97,6 @@ describe('normalizeFindingType — real production dynamic types', () => {
     ['missing_api_cart_items', 'missing_api_definition', 'cart_items'],
     ['missing_api_orders', 'missing_api_definition', 'orders'],
     ['n_plus_one_risk_product_categories', 'missing_fk_index', 'product_categories'],
-    ['auth_gap_auth', 'broken_auth', 'auth'],
     ['unbounded_pagination_api', 'missing_rate_limit', 'api'],
     ['schema_drift', 'shadow_mutation', undefined],
     ['arch_migration_add_composite_indexes_on_high_traffic_qu', 'shadow_mutation', undefined],
@@ -121,6 +120,19 @@ describe('normalizeFindingType — real production dynamic types', () => {
     }
     expect(deadEnds).toEqual([])
   })
+
+  // Retired with the agent orchestrator (docs/autonomy-orchestrator-parity.md).
+  // Each of these was aliased to a repair other than the one the finding
+  // described, so approving it ran the wrong change. They keep a hint and lose
+  // the repair.
+  test.each(['auth_gap_auth', 'orphaned_fk_orders', 'missing_realtime_triggers_realtime'])(
+    '%s from the retired orchestrator offers no repair, only a hint',
+    (raw) => {
+      expect(normalizeFindingType(raw, null)).toBeNull()
+      expect(buildFixAction(raw, {})).toBeNull()
+      expect(getManualRemediationHint(raw)).toBeTruthy()
+    },
+  )
 
   // Updated 2026-07-30. schema_drift normalizes to shadow_mutation, which became
   // auto-safe on 2026-07-18: FIX_API re-syncs the API layer to the schema that

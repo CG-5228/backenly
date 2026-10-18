@@ -5,57 +5,109 @@
  *
  * Replaced the drawn, clickable dashboard (components/landing/HeroConsole,
  * deleted 2026-09-26, last present at f997755) on an explicit product
- * decision. The film tells the whole pitch in 32 seconds, which one screen of
- * dashboard could not: an agent builds the backend over MCP, a destructive
- * request parks for a human, and at 03:12 with nobody online the loop finds a
- * dropped index, puts it back, proves it, and leaves an undoable receipt.
+ * decision. Since v4 the film is the narrated launch film; since v5 it is
+ * that film without its title and closing cards, 63 seconds of one chain: an
+ * MCP key is pasted into Claude Code, the agent builds an online store's
+ * backend through Backenly, it is published and takes orders, the console's
+ * sections are shown one by one, and at 03:12 with nobody online Backenly
+ * fixes what is safe and holds a riskier change for approval.
  *
  * THE STALENESS TRADE, taken knowingly. AutonomyFilm and the console were both
  * drawn rather than filmed because a recording of our own dashboard shipped on
  * this page once and was pulled when the product moved underneath it. That
  * risk is real here too. The contract that manages it:
  *
- *   - The film is versioned in its file names (`-v3`). A re-render ships under
- *     a NEW name (`-v4`), never over the old one: next.config.js serves
+ *   - The film is versioned in its file names (`-v5`). A re-render ships under
+ *     a NEW name (`-v6`), never over the old one: next.config.js serves
  *     /media/* as immutable, so a file replaced in place would stay stale in
  *     every browser that has already cached it for up to a year.
  *   - Re-render when anything the film shows changes shape: the shell's top
- *     bar and sidebar, the Overview (agent panel, self-healing loop, journal),
- *     the Auth and Functions pages, or the MCP tool names in the terminal.
+ *     bar and sidebar, the Connect page, the MCP tool names in the terminal,
+ *     Deploy, the Database, Auth, Storage, Realtime and Monitoring pages, or
+ *     the Overview's self-healing loop and review queue.
  *   - After a re-render, re-pick OPEN_AT and the poster frame (below).
  *
- * Files, all cut from the one 1920x1110 master:
+ * NO TITLE OR CLOSING CARD. The launch film opens on a title card (the
+ * logo, the wordmark and "The autonomous backend platform, built for your
+ * coding agents") and closes on two more ("Your coding agent builds it.
+ * Backenly keeps it running." and the wordmark with a try-it-free button).
+ * Here they only repeated the headline right above the film and the page's
+ * own call to action, so v5 is cut down to the product: launch-film seconds
+ * 6.10 to 69.55. Both cuts fall in pauses in the narration, after its
+ * opening line ends (6.05) and before its closing one begins (69.70), so no
+ * word is clipped, and both fall where the cards are fully out of frame (the
+ * title has left by 5.9; the closing line appears at 70.0). The film fades up
+ * from black over its first 0.35s and back to black over its last 0.6s, so
+ * the loop still passes through black rather than cutting hard from the
+ * closing shot to the opening one.
  *
- *   hero-film-v3.webm         desktop, VP9 two-pass CRF 36, 60fps, cues at the
- *                             front, ~2.6 MB. Same picture as the master at a
- *                             quarter less weight, and the only cut a Chromium
- *                             built without H.264 can play.
- *   hero-film-v3.mp4          the master itself, byte for byte (H.264 High
- *                             5.1, 60fps, ~3.5 MB, moov atom already at the
- *                             front). Everything that cannot take the WebM.
- *   hero-film-v3-1280.mp4     phones: H.264 High 4.0, 1280x740, 30fps, CRF 26,
- *                             ~1.3 MB. Every phone decodes H.264 in hardware.
- *   hero-film-v3-poster.webp  the frame at OPEN_AT
+ * Files:
+ *
+ *   hero-film-v5.mp4          desktop, H.264 High 5.1 CRF 24 (veryslow) + AAC
+ *                             128k, 60fps, moov atom at the front, ~10.2 MB.
+ *   hero-film-v5-1280.mp4     phones: H.264 High 4.0, 1280x720, 30fps, CRF 26
+ *                             + AAC 96k, ~5.2 MB. Every phone decodes H.264
+ *                             in hardware.
+ *   hero-film-v5-poster.webp  the frame at OPEN_AT, ~48 KB
+ *
+ * The master (1920x1080 60fps, H.264 + AAC, 69.6 MB) is not in this
+ * repository, so v5 was cut from v4.1, the shipped CRF 28 desktop cut: one
+ * more generation, paid for with a lower CRF (SSIM 0.998 against v4.1).
+ * Recutting from the master at the same times would save that generation.
+ *
+ * COLOUR IS TAGGED. The launch film was encoded the way ffmpeg encodes by
+ * default: RGB to YUV through the BT.601 matrix, with no colour description
+ * in the stream. An untagged HD stream leaves the matrix to each browser's
+ * guess, and the guesses differ: Chromium decodes it as BT.601, which is
+ * right, while players that assume BT.709 for HD (Safari among them) turn the
+ * violet greyer and the magenta dusty, and the film no longer matches its own
+ * poster. v4.1 wrote the description into v4 without re-encoding; v5 is
+ * encoded with it: primaries and transfer BT.709, matrix BT.601 (smpte170m),
+ * limited range, in the stream and in an MP4 `colr` box. Any re-render must
+ * keep explicit tags (`-colorspace`, `-color_primaries`, `-color_trc`,
+ * `-color_range`); check with ffprobe that `color_space` is not `unknown`.
+ *
+ * The master's backdrop carries a fine animated grain (it keeps the violet
+ * gradient from banding), and grain is what the bitrate pays for here. It is
+ * kept rather than denoised: denoising would change the approved look and
+ * bring the banding back.
+ *
+ * No WebM this time, on measurement. v3 led with a VP9 cut because it was a
+ * quarter lighter at the same picture. On this film it is not: VP9 two-pass
+ * CRF 42 came out at 11.4 MB against v4's 10.5 MB MP4, and was worse on
+ * the camera moves (SSIM against the master, every frame: mean 0.990 with
+ * 387 frames under 0.97, against the MP4's 0.994 with none). Every current
+ * browser plays H.264 + AAC; one that cannot rests on the poster.
+ *
+ * Both cuts carry a keyframe at 0 and at OPEN_AT (the phone cut at its
+ * nearest 30fps frame), so both places the film starts from decode without a
+ * run-up.
  *
  * The `codecs` in each source's type are read from the files themselves (the
  * avcC box for H.264). Re-read them after a re-render: a browser trusts the
  * string, and one that claims a level the file exceeds skips a source it could
  * have played, or picks one it cannot.
  *
- * OPENS ON THE OUTCOME, for the reason AutonomyFilm opens on its last beat.
- * The master starts and ends on the same empty "Connect your coding agent"
- * Overview (it is cut to loop), so a poster taken from frame 0 would greet
- * every visitor with an idle, empty product, which is exactly why the
- * console's idle panels were cut on 2026-09-18. For about half a second before
- * that final cross-fade the film shows the fully populated Overview instead:
- * review waiting, loop running, 100% verified. The poster is that frame, and
- * the first play seeks there, so the film opens on the result, cross-fades into
- * the empty backend on its own cut, and then shows how it got built. There is
- * no jump from poster to picture because they are the same frame.
+ * OPENS ON THE COMMAND, NOT ON BLACK. The film fades up from black, and a
+ * poster taken from frame 0 would greet every visitor with an empty box. The
+ * poster is the Connect page once the camera has settled on it, with the one
+ * command an agent needs in frame, and the first play seeks there, so there
+ * is no jump from poster to picture: they are the same frame.
  *
- * Reduced motion gets that same frame as a still and never autoplays; the
- * button plays it on request. Playback also stops while the frame is off
- * screen, and a visitor's own pause is never overridden by scrolling back.
+ * SOUND IS OPT-IN. The film is narrated, and it always starts muted: browsers
+ * refuse an unmuted autoplay anyway, and a page that talks before it is asked
+ * to is the wrong first impression. The speaker button is the way in. Turning
+ * sound on starts the film again from the top, because the narration is one
+ * argument and arriving mid-sentence wastes it; muting and unmuting again
+ * later carries on where it is. With sound on the film plays through once
+ * rather than looping, so the narration never starts over by itself, and at
+ * the end it goes back to the silent loop from the opening command instead
+ * of resting on the closing black frame.
+ *
+ * Reduced motion gets the opening command as a still and never autoplays;
+ * either button plays it on request. Playback also stops while the frame is
+ * off screen, sound or not, and a visitor's own pause is never overridden by
+ * scrolling back.
  *
  * Hydration: nothing here renders differently on the client's first pass.
  * There is deliberately no `autoPlay` attribute. It would start the film
@@ -63,15 +115,15 @@
  * in an effect anyway, where the poster and first picture are identical.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { type RefObject, useEffect, useRef, useState } from 'react'
 import { useInView } from 'framer-motion'
-import { Pause, Play } from 'lucide-react'
+import { Pause, Play, Volume2, VolumeX } from 'lucide-react'
 import { useSettledReducedMotion } from '@/lib/hooks/useSettledReducedMotion'
 
 const FILM = {
-  poster: '/media/hero-film-v3-poster.webp',
+  poster: '/media/hero-film-v5-poster.webp',
   width: 1920,
-  height: 1110,
+  height: 1080,
 } as const
 
 /**
@@ -82,20 +134,145 @@ const FILM = {
  */
 const SOURCES = [
   {
-    src: '/media/hero-film-v3-1280.mp4',
-    type: 'video/mp4; codecs="avc1.640028"',
+    src: '/media/hero-film-v5-1280.mp4',
+    type: 'video/mp4; codecs="avc1.640028, mp4a.40.2"',
     media: '(max-width: 767px)',
   },
-  { src: '/media/hero-film-v3.webm', type: 'video/webm; codecs="vp9"' },
-  { src: '/media/hero-film-v3.mp4', type: 'video/mp4; codecs="avc1.640033"' },
+  { src: '/media/hero-film-v5.mp4', type: 'video/mp4; codecs="avc1.640033, mp4a.40.2"' },
 ] as const satisfies readonly { src: string; type: string; media?: string }[]
 
 /**
- * Seconds into the film where the populated Overview is fully on screen and
- * before the loop cross-fade starts (30.9s to 31.35s in v3). Measured by
- * frame difference, not by eye. The poster is the frame at this time.
+ * Seconds into the film where the camera has settled on the Connect page
+ * (from 0.75s in v5) and before the cursor copies the command. Measured by
+ * frame difference, not by eye, and on both cuts' frame grids (frame 48 at
+ * 60fps, 24 at 30fps). The poster is the frame at this time.
  */
-const OPEN_AT = 31.03
+const OPEN_AT = 0.8
+
+/**
+ * NO FRAME. The film is already staged: a violet backdrop with the console
+ * window floating on it. Wrapping that in a border (or a bezel, or a lit top
+ * edge) made a box inside a box inside a box. Instead the picture itself
+ * fades out at its edges, shorter at the sides and top, longer at the bottom,
+ * so the violet stage reads as light on the page, and when the camera is in
+ * close the console runs straight into the page. Phones get shorter fades.
+ * The mask is on the video alone; the controls stay crisp.
+ */
+const MASK =
+  'linear-gradient(to right, transparent, #000 var(--fx), #000 calc(100% - var(--fx)), transparent), ' +
+  'linear-gradient(to bottom, transparent, #000 var(--fx), #000 calc(100% - var(--fb)), transparent)'
+const FEATHER = {
+  maskImage: MASK,
+  WebkitMaskImage: MASK,
+  maskComposite: 'intersect',
+  WebkitMaskComposite: 'source-in',
+} as const
+/** The fade widths, shorter on a phone, whose picture is too small to give much away. */
+const FEATHER_SIZE = '[--fx:7%] [--fb:16%] md:[--fx:9%] md:[--fb:26%]'
+
+/**
+ * AMBIENT LIGHT. The film's own colour spills onto the page around it, the
+ * way a screen lights the wall behind it. A fixed violet glow could not do
+ * this: the film is violet at the top left, blue at the right and magenta at
+ * the bottom left, and nearly black whenever the camera is in close on the
+ * console, so any one colour was wrong for most of it and sat as a coloured
+ * haze around a dark picture.
+ *
+ * Each frame is drawn into a 32x18 canvas lying exactly under the video,
+ * and a CSS blur spreads it out past the film's edges. Aligned, every colour
+ * glows out from where it sits in the picture; a canvas scaled up past the
+ * film instead shifted its light (a bright title showed as a smudge above
+ * the film). The blur runs on the compositor over a tiny canvas, and the
+ * canvas is redrawn at most 30 times a second and never while the film is
+ * paused. Each new frame is mixed into the last rather than replacing it,
+ * so the backdrop's grain never flickers in the light and cuts arrive as a
+ * quick fade. Until the film has a frame of its own, the glow comes from the
+ * poster, which is the same picture.
+ */
+const AMBIENT = { width: 32, height: 18 } as const
+
+/** How much of each new frame mixes into the glow. */
+const AMBIENT_BLEND = 0.3
+
+/** The fastest the glow is redrawn. Light this soft needs no more. */
+const AMBIENT_INTERVAL_MS = 1000 / 30
+
+/** Draws the ambient light; returns whether it has anything to show yet. */
+function useAmbientLight(
+  videoRef: RefObject<HTMLVideoElement | null>,
+  canvasRef: RefObject<HTMLCanvasElement | null>
+) {
+  const [lit, setLit] = useState(false)
+
+  useEffect(() => {
+    const video = videoRef.current
+    const ctx = canvasRef.current?.getContext('2d')
+    if (!video || !ctx) return
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+
+    let cancelled = false
+    let painted = false
+    function paint(source: CanvasImageSource, blend: number) {
+      ctx.globalAlpha = painted ? blend : 1
+      ctx.drawImage(source, 0, 0, AMBIENT.width, AMBIENT.height)
+      if (!painted) {
+        painted = true
+        setLit(true)
+      }
+    }
+
+    const poster = new Image()
+    poster.src = FILM.poster
+    poster
+      .decode()
+      .then(() => {
+        if (!cancelled && !painted) paint(poster, 1)
+      })
+      .catch(() => {})
+
+    // requestVideoFrameCallback runs once per frame the film actually shows,
+    // and not at all while it is paused. Where it is missing, animation
+    // frames stand in, only while the film plays.
+    const perFrame = typeof video.requestVideoFrameCallback === 'function'
+    let handle = 0
+    let last = -Infinity
+
+    function onFrame(now: number) {
+      if (
+        now - last >= AMBIENT_INTERVAL_MS &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+      ) {
+        last = now
+        paint(video, AMBIENT_BLEND)
+      }
+      next()
+    }
+    function next() {
+      if (cancelled) return
+      if (perFrame) handle = video.requestVideoFrameCallback(onFrame)
+      else if (!video.paused) handle = requestAnimationFrame(onFrame)
+    }
+    function onPlay() {
+      cancelAnimationFrame(handle)
+      next()
+    }
+
+    if (perFrame) next()
+    else video.addEventListener('play', onPlay)
+
+    return () => {
+      cancelled = true
+      if (perFrame) video.cancelVideoFrameCallback(handle)
+      else {
+        cancelAnimationFrame(handle)
+        video.removeEventListener('play', onPlay)
+      }
+    }
+  }, [videoRef, canvasRef])
+
+  return lit
+}
 
 /**
  * `auto` follows the reduced-motion preference; `play` and `pause` are the
@@ -104,14 +281,16 @@ const OPEN_AT = 31.03
 type Intent = 'auto' | 'play' | 'pause'
 
 /**
- * Starts (or resumes) the film. The first call also seeks to OPEN_AT; `opened`
- * remembers that it has, so a later resume continues where the film was.
+ * Starts (or resumes) the film, muted unless the visitor turned sound on. The
+ * first call also seeks to OPEN_AT; `opened` remembers that it has, so a later
+ * resume continues where the film was.
  */
-function play(video: HTMLVideoElement, opened: { current: boolean }) {
+function play(video: HTMLVideoElement, opened: { current: boolean }, sound: boolean) {
   // Autoplay policy reads the `muted` PROPERTY at play() time, and React has a
   // long history of owning that property separately from the server-rendered
-  // attribute. Assert it here so the browser never sees an unmuted play.
-  video.muted = true
+  // attribute. Assert it here so the browser never sees an unmuted play the
+  // visitor did not ask for.
+  video.muted = !sound
 
   if (!opened.current) {
     opened.current = true
@@ -135,19 +314,25 @@ export function HeroFilm() {
   const frameRef = useRef<HTMLElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const openedRef = useRef(false)
+  // Whether the next time sound comes on should start the film from the top:
+  // true until it has, and true again once a narrated play-through ends.
+  const fromTopRef = useRef(true)
   const reduced = useSettledReducedMotion()
   const inView = useInView(frameRef, { amount: 0.2 })
   const [intent, setIntent] = useState<Intent>('auto')
+  const [sound, setSound] = useState(false)
   const [playing, setPlaying] = useState(false)
+  const ambientRef = useRef<HTMLCanvasElement>(null)
+  const lit = useAmbientLight(videoRef, ambientRef)
 
   const shouldPlay = inView && (intent === 'play' || (intent === 'auto' && !reduced))
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
-    if (shouldPlay) play(video, openedRef)
+    if (shouldPlay) play(video, openedRef, sound)
     else video.pause()
-  }, [shouldPlay])
+  }, [shouldPlay, sound])
 
   function toggle() {
     const video = videoRef.current
@@ -157,25 +342,66 @@ export function HeroFilm() {
     // can only be recovered by a play() made inside the click itself.
     if (video.paused) {
       setIntent('play')
-      play(video, openedRef)
+      play(video, openedRef, sound)
     } else {
       setIntent('pause')
       video.pause()
     }
   }
 
+  function toggleSound() {
+    const video = videoRef.current
+    if (!video) return
+
+    if (sound) {
+      video.muted = true
+      setSound(false)
+      return
+    }
+
+    if (fromTopRef.current) {
+      fromTopRef.current = false
+      // Claim the first-play seek too, so play() does not move a film that
+      // has never played yet back to OPEN_AT.
+      openedRef.current = true
+      video.currentTime = 0
+    }
+    setSound(true)
+    setIntent('play')
+    // Unmuted playback is only allowed from inside the click.
+    play(video, openedRef, true)
+  }
+
+  /** A narrated play-through has ended: back to the silent loop. */
+  function finish() {
+    const video = videoRef.current
+    if (!video) return
+    fromTopRef.current = true
+    video.muted = true
+    video.currentTime = OPEN_AT
+    setSound(false)
+    // The effect restarts the loop unless motion is reduced, in which case
+    // the film rests on the command it opened on.
+    setIntent('auto')
+  }
+
   return (
     <figure ref={frameRef} className="group relative isolate">
-      {/* The light the frame sits in. Static and filter-free: a radial
-          gradient already has soft edges, and a `blur()` this large would
-          re-raster under the hero's entrance transform. */}
-      <div
+      {/* The film's own light on the page; see AMBIENT LIGHT. The blur
+          carries it past the film on every side, so the feathered edges fade
+          into the colour they carry, not into black. */}
+      <canvas
+        ref={ambientRef}
         aria-hidden
-        className="pointer-events-none absolute -inset-x-[6%] -top-[12%] -z-10 h-[70%] bg-[radial-gradient(50%_55%_at_50%_45%,rgba(139,92,246,0.14),transparent)]"
+        width={AMBIENT.width}
+        height={AMBIENT.height}
+        className={`pointer-events-none absolute inset-0 -z-10 h-full w-full scale-[1.04] blur-[40px] transition-opacity duration-1000 motion-reduce:transition-none md:blur-[72px] ${
+          lit ? 'opacity-80' : 'opacity-0'
+        }`}
       />
 
       <div
-        className="relative overflow-hidden rounded-xl border border-white/[0.10] bg-[#101116]"
+        className="relative"
         // The box is sized before a byte of video arrives, so the page below
         // never shifts when the poster lands.
         style={{ aspectRatio: `${FILM.width} / ${FILM.height}` }}
@@ -186,14 +412,17 @@ export function HeroFilm() {
           height={FILM.height}
           poster={FILM.poster}
           muted
-          loop
+          // With sound on the film plays through once; see SOUND IS OPT-IN.
+          loop={!sound}
           playsInline
           preload="metadata"
           disablePictureInPicture
           disableRemotePlayback
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
-          className="absolute inset-0 h-full w-full object-cover"
+          onEnded={finish}
+          className={`absolute inset-0 h-full w-full object-cover ${FEATHER_SIZE}`}
+          style={FEATHER}
         >
           {SOURCES.map((source) => (
             <source
@@ -205,47 +434,62 @@ export function HeroFilm() {
           ))}
         </video>
 
-        {/* Catches light along the top edge, the way the hero's own top rule
-            does. */}
-        <span
-          aria-hidden
-          className="pointer-events-none absolute inset-x-0 top-0 h-px bg-[linear-gradient(to_right,transparent,rgba(255,255,255,0.18),transparent)]"
-        />
-
-        {/* WCAG 2.2.2: moving content that starts on its own and runs past
-            five seconds needs a way to stop it. Bottom right, because the
-            film's own captions sit bottom left. While the film plays the
-            button only shows on hover or keyboard focus, because in the build
-            scenes that corner is the terminal's footer. Touch screens have no
-            hover, so they always see it, and a paused film always shows the
-            way to resume it. */}
-        <button
-          type="button"
-          onClick={toggle}
-          aria-label={playing ? 'Pause the product film' : 'Play the product film'}
-          className={`absolute bottom-2 right-2 flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.10] bg-black/70 text-zinc-300 backdrop-blur-sm transition duration-200 hover:border-white/25 hover:text-white focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 group-hover:opacity-100 md:bottom-4 md:right-4 md:h-9 md:w-9 ${
-            playing ? 'opacity-0 [@media(hover:none)]:opacity-100' : 'opacity-100'
-          }`}
-        >
-          {playing ? (
-            <Pause aria-hidden className="h-3.5 w-3.5" />
-          ) : (
-            <Play aria-hidden className="h-3.5 w-3.5 translate-x-px" />
-          )}
-        </button>
+        {/* Bottom right, where a player's controls are looked for. The sound
+            button is always shown, because a visitor cannot otherwise know
+            the film has a voice. WCAG 2.2.2: moving content that starts on
+            its own and runs past five seconds needs a way to stop it, so the
+            pause button sits beside it; while the film plays that one only
+            shows on hover or keyboard focus. Touch screens have no hover, so
+            they always see it, and a paused film always shows the way to
+            resume it. */}
+        <div className="absolute bottom-2 right-2 flex gap-1.5 md:bottom-4 md:right-4 md:gap-2">
+          <button
+            type="button"
+            onClick={toggle}
+            aria-label={playing ? 'Pause the product film' : 'Play the product film'}
+            className={`flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.10] bg-black/70 text-zinc-300 backdrop-blur-sm transition duration-200 hover:border-white/25 hover:text-white focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 group-hover:opacity-100 md:h-9 md:w-9 ${
+              playing ? 'opacity-0 [@media(hover:none)]:opacity-100' : 'opacity-100'
+            }`}
+          >
+            {playing ? (
+              <Pause aria-hidden className="h-3.5 w-3.5" />
+            ) : (
+              <Play aria-hidden className="h-3.5 w-3.5 translate-x-px" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={toggleSound}
+            aria-label={sound ? 'Turn the film’s sound off' : 'Turn the film’s sound on'}
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.10] bg-black/70 text-zinc-300 backdrop-blur-sm transition duration-200 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 md:h-9 md:w-9"
+          >
+            {sound ? (
+              <Volume2 aria-hidden className="h-3.5 w-3.5" />
+            ) : (
+              <VolumeX aria-hidden className="h-3.5 w-3.5" />
+            )}
+          </button>
+        </div>
       </div>
 
-      {/* The film has no audio; everything it says is on screen. This is the
-          same story for anyone who cannot see it. */}
+      {/* The same story for anyone who cannot see or hear it: what is on
+          screen, then the narration word for word. */}
       <figcaption className="sr-only">
-        A 32-second film of the Backenly dashboard. A coding agent builds the
-        backend for a project over MCP: tables, email sign-in, row-level
-        security, a private storage bucket, and a function. It then asks to drop
-        a table, and that destructive change is held for a human to approve. At
-        3:12 AM, with nobody online, an index is dropped in production.
-        Backenly’s self-healing loop detects it, adds the index back,
-        re-checks it, and records an undoable change, while a riskier fix waits
-        for review.
+        A 63-second narrated film of Backenly. On screen, an MCP key is created
+        in Backenly and pasted into Claude Code, which builds the backend for
+        UrbanCart, an online store, and publishes it. Orders arrive, and the
+        console shows its Database, Auth, Storage, Realtime and Monitoring
+        pages. At 3:12 AM a request slows down; Backenly adds a missing index
+        on its own, while a foreign-key fix waits until a person approves it.
+        The narration: Copy one command. Paste it into your coding agent, and
+        it’s connected. Ask for the backend you need. It builds through
+        Backenly, and every change is verified. Publish it. And it’s live. Then
+        the first orders come in. Each one lands in your database. With Auth,
+        every customer signs in. Product photos load from Storage. Realtime
+        streams every order. And Monitoring sees every request. And when
+        something breaks while you’re away, Backenly finds it, fixes what’s
+        safe, and proves the fix worked. Anything risky waits for you. Fixed,
+        verified, and reversible.
       </figcaption>
     </figure>
   )

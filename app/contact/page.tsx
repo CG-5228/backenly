@@ -159,7 +159,7 @@ export default function ContactPage() {
           lede="One free project, no credit card. Connect your agent and try it on a real backend."
         >
           <StartButton />
-          <ButtonLink href="/resources" variant="secondary">
+          <ButtonLink href="/docs" variant="secondary">
             Read the docs
           </ButtonLink>
         </HorizonClose>

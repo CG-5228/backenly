@@ -21,8 +21,8 @@
  *        so "account", "identity", "member" are understood as synonyms for domain signals.
  */
 
-import { getOpenAIClient } from './openai-service'
-import { getModel } from './model-router'
+import { chat } from '@/lib/ai/llm/chat'
+
 
 // ─── Table Purpose ────────────────────────────────────────────────────────────
 
@@ -564,9 +564,8 @@ export async function analyzeTablePurpose(
 
   // LLM fallback for ambiguous table names
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -600,12 +599,12 @@ Respond ONLY with valid JSON:
           content: `Table: ${tableName}\nColumns: ${columnNames.join(', ')}`,
         },
       ],
-      temperature: 0.1,
-      max_tokens: 150,
-      response_format: { type: 'json_object' },
+      maxTokens: 150,
+      json: true,
+      label: 'table-purpose',
     })
 
-    const raw = response.choices[0].message.content || '{}'
+    const raw = response.text || '{}'
     const parsed = JSON.parse(raw)
     const validPurposes: TablePurpose[] = [
       'financial', 'job-queue', 'auth', 'content', 'analytics', 'communication',
@@ -670,9 +669,8 @@ export async function extractWorkflowsFromPrompt(prompt: string): Promise<Workfl
   if (!hasWorkflowSignals) return []
 
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('plan'),
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -743,12 +741,12 @@ If no clear multi-step workflows exist in the prompt, return: { "workflows": [] 
         },
         { role: 'user', content: prompt },
       ],
-      temperature: 0.2,
-      max_tokens: 3000,
-      response_format: { type: 'json_object' },
+      maxTokens: 3000,
+      json: true,
+      label: 'workflows',
     })
 
-    const raw = response.choices[0].message.content || '{}'
+    const raw = response.text || '{}'
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed.workflows) ? parsed.workflows : []
   } catch {
@@ -771,9 +769,8 @@ export async function extractBusinessRulesFromPrompt(prompt: string): Promise<Bu
   if (!hasRuleSignals) return []
 
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('plan'),
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -815,12 +812,12 @@ If no clear rules exist, return: { "rules": [] }`,
         },
         { role: 'user', content: prompt },
       ],
-      temperature: 0.2,
-      max_tokens: 2500,
-      response_format: { type: 'json_object' },
+      maxTokens: 2500,
+      json: true,
+      label: 'business-rules',
     })
 
-    const raw = response.choices[0].message.content || '{}'
+    const raw = response.text || '{}'
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed.rules) ? parsed.rules : []
   } catch {
@@ -841,9 +838,8 @@ If no clear rules exist, return: { "rules": [] }`,
  */
 export async function classifyDomainSemantically(prompt: string): Promise<DomainClassification> {
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -886,12 +882,12 @@ Respond ONLY with valid JSON:
           content: `Classify the domain of this app description: "${prompt}"`,
         },
       ],
-      temperature: 0.1,
-      max_tokens: 300,
-      response_format: { type: 'json_object' },
+      maxTokens: 300,
+      json: true,
+      label: 'domain-classify',
     })
 
-    const raw = response.choices[0].message.content || '{}'
+    const raw = response.text || '{}'
     const parsed = JSON.parse(raw)
 
     const validDomains: ExtendedDomain[] = [

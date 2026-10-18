@@ -1,6 +1,7 @@
 export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
+import { confirmPropagation } from '@/lib/auth-projection/confirm'
 import { prisma } from '@/lib/db/postgres'
 import { requireAuth } from '@/lib/auth/middleware'
 import { apiKeyRateCeilingViolation } from '@/lib/quota/kernel'
@@ -127,8 +128,12 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
     const updated = await prisma.apiKey.findUnique({
       where: { id: params.id },
     })
+    // A key narrowed or expired here keeps its old reach in its project's
+    // region until the region has the change (lib/auth-projection/confirm.ts).
+    const propagation = await confirmPropagation({ entity: 'api_key', entityId: params.id })
 
     return NextResponse.json({
+      propagation,
       apiKey: {
         id: updated!.id,
         name: updated!.name,
@@ -169,11 +174,35 @@ export async function DELETE(request: NextRequest, props: { params: Promise<{ id
   try {
     const auth = await requireAuth(request)
 
+    // Revocation is held to PROJECT authority, not to bare row ownership.
+    // The old own-row filter meant an org ADMIN could not revoke a leaked
+    // agent key (owned by the project owner), while an EX-member kept revoke
+    // power over rows they created. A project key is revocable by a project
+    // ADMIN, or by its creator while they still have access to the project;
+    // a personal key (no project) stays own-row.
+    const row = await prisma.apiKey.findUnique({
+      where: { id: params.id },
+      select: { id: true, userId: true, projectId: true },
+    })
+    if (!row) {
+      return NextResponse.json({ error: 'API key not found' }, { status: 404 })
+    }
+    let allowed = false
+    if (row.projectId) {
+      const { canAccessProject, canAdministerProject } = await import('@/lib/edition/guard')
+      allowed =
+        (await canAdministerProject(auth.userId, row.projectId)) ||
+        (row.userId === auth.userId && (await canAccessProject(auth.userId, row.projectId)))
+    } else {
+      allowed = row.userId === auth.userId
+    }
+    if (!allowed) {
+      // The same answer a missing key gives: no existence oracle.
+      return NextResponse.json({ error: 'API key not found' }, { status: 404 })
+    }
+
     const result = await prisma.apiKey.deleteMany({
-      where: {
-        id: params.id,
-        userId: auth.userId,
-      },
+      where: { id: params.id },
     })
 
     if (result.count === 0) {
@@ -183,7 +212,10 @@ export async function DELETE(request: NextRequest, props: { params: Promise<{ id
       )
     }
 
-    return NextResponse.json({ message: 'API key deleted successfully' })
+    // Revoked only once its project's region has the revocation too
+    // (lib/auth-projection/confirm.ts); `pending` says it is still in flight.
+    const propagation = await confirmPropagation({ entity: 'api_key', entityId: params.id })
+    return NextResponse.json({ message: 'API key deleted successfully', propagation })
   } catch (error) {
     console.error('Delete API key error:', error)
     return NextResponse.json(

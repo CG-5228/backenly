@@ -72,6 +72,10 @@ export function buildNotificationEmail(
       return buildSystemEmail(title, body, metadata)
     case 'health_alert':
       return buildHealthAlertEmail(title, body, metadata)
+    case 'support_update':
+      return buildSupportUpdateEmail(title, body, metadata)
+    case 'approval_requested':
+      return buildApprovalRequestedEmail(title, body, metadata)
     default:
       return buildGenericEmail(title, body)
   }
@@ -257,6 +261,45 @@ function buildHealthAlertEmail(
     ${button('Open Autonomy', escapeHtml(actionUrl))}
   `)
   return { subject: `${title} — Backenly`, html }
+}
+
+/**
+ * The agent asked for something that waits on a person. Says which call, on
+ * what, and that it expires, and links straight to the Review Queue. Everything
+ * interpolated is escaped: the target is whatever the agent named.
+ */
+function buildApprovalRequestedEmail(
+  title: string,
+  body: string,
+  metadata: Record<string, any> = {},
+): NotificationEmailContent {
+  const actionUrl = typeof metadata.actionUrl === 'string' ? metadata.actionUrl : APP_URL + '/app'
+  const html = shell(`
+    <h1 style="font-size:22px;font-weight:800;margin:0 0 8px;color:#ffffff;">${escapeHtml(title)}</h1>
+    <p style="color:#9ca3af;margin:0 0 20px;font-size:15px;line-height:1.6;">${escapeHtml(body)}</p>
+    ${button('Review the request', escapeHtml(actionUrl))}
+  `)
+  return { subject: `${title} — Backenly`, html }
+}
+
+function buildSupportUpdateEmail(
+  title: string,
+  body: string,
+  metadata: Record<string, any>
+): NotificationEmailContent {
+  // Title and body carry the case subject and a reply excerpt, both written by
+  // people — escape them, unlike templates whose text is entirely our own.
+  const caseUrl = metadata.ticketId
+    ? `${APP_URL}/app/support/${encodeURIComponent(String(metadata.ticketId))}`
+    : `${APP_URL}/app/support`
+  const caseRef = metadata.caseNumber ? `Case #${escapeHtml(metadata.caseNumber)}` : 'Your support case'
+  const html = shell(`
+    <h1 style="font-size:22px;font-weight:800;margin:0 0 8px;color:#ffffff;">${escapeHtml(title)}</h1>
+    <p style="color:#6b7280;font-size:13px;margin:0 0 12px;">${caseRef}</p>
+    <p style="color:#9ca3af;margin:0 0 20px;font-size:15px;line-height:1.6;white-space:pre-line;">${escapeHtml(body)}</p>
+    ${button('View case', caseUrl)}
+  `)
+  return { subject: `${title} — Backenly Support`, html }
 }
 
 function buildGenericEmail(title: string, body: string): NotificationEmailContent {

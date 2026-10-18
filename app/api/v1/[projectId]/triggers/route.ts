@@ -14,6 +14,7 @@ import { verifyToken } from '@/lib/auth/jwt'
 import { prisma } from '@/lib/db'
 import { listTriggers, createTrigger, deleteTrigger } from '@/lib/services/trigger-service'
 import { enforceTriggerCreation } from '@/lib/entitlements/policy'
+import { billingAccountOf } from '@/lib/usage/account'
 import { canAccessProject, canAdministerProject, canWriteProject } from '@/lib/edition/guard'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
 
@@ -63,7 +64,8 @@ async function handlePOST(req: NextRequest, props: { params: Promise<{ projectId
 
   // ─── Plan enforcement: trigger limit per project ──────────────────────
   const currentTriggerCount = await prisma.appTrigger.count({ where: { projectId: params.projectId } })
-  const triggerCheck = await enforceTriggerCreation(userId, params.projectId, currentTriggerCount)
+  const triggerAccount = (await billingAccountOf(params.projectId)) ?? userId
+  const triggerCheck = await enforceTriggerCreation(triggerAccount, params.projectId, currentTriggerCount)
   if (triggerCheck !== true) {
     return NextResponse.json(
       {
@@ -95,7 +97,9 @@ async function handleDELETE(req: NextRequest, props: { params: Promise<{ project
   const triggerId = req.nextUrl.searchParams.get('id')
   if (!triggerId) return NextResponse.json({ error: 'id query parameter is required' }, { status: 400 })
 
-  await deleteTrigger(params.projectId, triggerId)
+  if (!(await deleteTrigger(params.projectId, triggerId))) {
+    return NextResponse.json({ error: 'Trigger not found in this project' }, { status: 404 })
+  }
   return NextResponse.json({ success: true })
 }
 

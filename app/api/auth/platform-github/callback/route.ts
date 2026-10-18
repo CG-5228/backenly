@@ -1,6 +1,7 @@
 export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
+import { clientIpFromHeaders } from '@/lib/security/client-ip'
 import { verify } from 'jsonwebtoken'
 import { createSession } from '@/lib/auth/session'
 import { prisma } from '@/lib/db'
@@ -8,6 +9,7 @@ import { onSignupCompleted } from '@/lib/platform-signals'
 import { assertSignupAllowed, isBlocked } from '@/lib/platform-controls'
 import { consume, AUTH_LIMITS, clientIp } from '@/lib/security/auth-rate-limit'
 import { githubVerifiedEmail } from '@/lib/auth/oauth/verified-email'
+import { providerSignInRefusal } from '@/lib/auth/oauth/second-factor'
 import { oauthMayCreateAccount } from '@/lib/auth/setup-token'
 
 function isSafeRedirect(target: unknown): target is string {
@@ -135,10 +137,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Founder blocklist — gates both new signups and existing logins.
-    const oauthIp =
-      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-      request.headers.get('x-real-ip') ||
-      null
+    const oauthIp = clientIpFromHeaders(request)
     const blockHit = await isBlocked({ email, ip: oauthIp })
     if (blockHit) {
       return NextResponse.redirect(
@@ -152,6 +151,16 @@ export async function GET(request: NextRequest) {
       where: { email },
       include: { role: true },
     })
+
+    // An account with two-factor authentication signs in with its password and
+    // authenticator code. Asked before anything is written to the account, so
+    // this sign-in links no provider and issues no session for it.
+    const refusal = providerSignInRefusal(user)
+    if (refusal) {
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/auth/login?error=${refusal}`,
+      )
+    }
 
     if (!user) {
       // An OAuth round trip carries no setup token, so it cannot claim a

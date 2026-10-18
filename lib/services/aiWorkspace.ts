@@ -1,34 +1,8 @@
 import { projectWorkspaceDir } from '@/lib/workspace/paths'
 import OpenAI from 'openai'
 import { prisma } from '@/lib/db'
-
-/**
- * The OpenAI client, built on first use rather than at import.
- *
- * This was a module-scope `new OpenAI({ apiKey: process.env.OPENAI_API_KEY })`,
- * and the SDK throws when the key is missing or empty. `next build` evaluates
- * route modules to collect their configuration, so importing any of the three
- * ai-workspace routes made OPENAI_API_KEY a BUILD-time requirement for the
- * whole application -- including deployments that never call an AI feature.
- *
- * That was invisible until Phase 8 added the first public Next build to CI,
- * where a fresh checkout with no credentials failed at
- * /api/ai-workspace/preview-diff. Supplying a fake key in CI would have made
- * the build pass while permanently encoding the accident, so the construction
- * moved instead.
- *
- * Every other OpenAI call site in this repository already builds its client
- * inside a function; this was the only one that did not.
- *
- * Failure semantics are deliberately UNCHANGED. A missing key still throws --
- * it just throws when an AI operation actually runs, which is the moment the
- * key is genuinely needed, rather than when the module is loaded.
- */
-function getOpenAIClient(): OpenAI {
-  return new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  })
-}
+import { workspaceRawClient } from '@/lib/data-plane/regional'
+import { chat } from '@/lib/ai/llm/chat'
 
 export interface BackendChangePlan {
   id: string
@@ -98,15 +72,19 @@ export async function getProjectContext(projectId?: string): Promise<ProjectCont
   let schemaTables: Array<{ name: string; columns: Array<{ name: string; type: string; nullable: boolean }> }> = []
   
   if (projectId) {
+    // The database holding the project's data, in its region. Resolved outside
+    // the try below: a region this process cannot reach must not read as a
+    // project with no tables.
+    const db = await workspaceRawClient(projectId)
     try {
       // Import workspace database utilities
       const { getWorkspaceDatabaseNames } = await import('./databaseProvisioning')
       const { HybridDatabase } = await import('../db/hybrid')
-      
+
       const { postgresSchema } = getWorkspaceDatabaseNames(projectId)
-      
+
       // Query ACTUAL tables from workspace schema
-      const actualTables = await prisma.$queryRawUnsafe<Array<{ table_name: string }>>(
+      const actualTables = await db.$queryRawUnsafe<Array<{ table_name: string }>>(
         `SELECT table_name FROM information_schema.tables WHERE table_schema = '${postgresSchema}' AND table_type = 'BASE TABLE' ORDER BY table_name`
       )
       
@@ -114,7 +92,7 @@ export async function getProjectContext(projectId?: string): Promise<ProjectCont
       schemaTables = await Promise.all(
         actualTables.map(async (table) => {
           try {
-            const structure = await HybridDatabase.getStructure('postgresql', postgresSchema, table.table_name)
+            const structure = await HybridDatabase.getStructure(projectId, 'postgresql', postgresSchema, table.table_name)
             return {
               name: table.table_name,
               columns: structure.map(col => ({
@@ -175,8 +153,8 @@ export async function getProjectContext(projectId?: string): Promise<ProjectCont
 }
 
 /**
- * Generate a demo backend change plan (without OpenAI)
- * Used when OPENAI_API_KEY is not configured
+ * Generate a demo backend change plan without a model, for when no AI
+ * provider is configured.
  */
 export async function generateDemoBackendPlan(
   prompt: string,
@@ -1056,17 +1034,17 @@ Your response must be valid JSON:
   "tier": "production-ready"
 }`
 
-  const completion = await getOpenAIClient().chat.completions.create({
-    model: 'gpt-4.1',
+  const completion = await chat({
+    purpose: 'build.plan',
     messages: [
       { role: 'system', content: planningPrompt },
       { role: 'user', content: `Design architecture for: ${prompt}` },
     ],
-    temperature: 0.3,
-    response_format: { type: 'json_object' },
+    json: true,
+    label: 'workspace-architecture',
   })
 
-  const architecture = JSON.parse(completion.choices[0].message.content || '{}')
+  const architecture = JSON.parse(completion.text || '{}')
   console.log('[Architecture Plan] Tier:', architecture.tier)
   console.log('[Architecture Plan] Entities:', architecture.entities?.length)
   console.log('[Architecture Plan] Routes:', architecture.routes?.length)
@@ -1651,8 +1629,8 @@ IMPORTANT: You MUST implement ALL ${architecture.routes?.length || 0} routes fro
   const startTime = Date.now()
 
   try {
-    const completion = await getOpenAIClient().chat.completions.create({
-      model: 'gpt-4.1',
+    const completion = await chat({
+      purpose: 'build.plan',
       messages: [
         { role: 'system', content: systemPrompt },
         { 
@@ -1660,17 +1638,15 @@ IMPORTANT: You MUST implement ALL ${architecture.routes?.length || 0} routes fro
           content: `User request: "${prompt}"\n\nGenerate ALL code to implement the ${architecture.routes?.length || 0}-route architecture plan above. Include all database models, API routes, middleware, and utilities.` 
         },
       ],
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
-    }, {
-      timeout: 180000, // 3 minutes timeout
+      json: true,
+      label: 'workspace-codegen',
     })
 
     const elapsed = Date.now() - startTime
     console.log('[STAGE 2] ✅ Code generation completed in ' + (elapsed / 1000).toFixed(2) + 's')
     console.log('[STAGE 2] Total time (both stages): ' + ((Date.now() - startTime) / 1000).toFixed(2) + 's')
 
-    const responseText = completion.choices[0].message.content || '{}'
+    const responseText = completion.text || '{}'
     const response = JSON.parse(responseText)
 
     // Log the raw response for debugging

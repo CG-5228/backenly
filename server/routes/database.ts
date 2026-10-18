@@ -17,6 +17,8 @@ interface RlsIdentity {
   userId: string
   isServiceRole: boolean
   role: string
+  /** The token belonged to a user the owner blocked — the request must 403. */
+  blocked?: boolean
 }
 
 /**
@@ -32,8 +34,18 @@ async function resolveRlsIdentity(req: Request, projectId: string, serviceRole: 
     projectId,
     req.headers['x-user-token'] as string | undefined,
   )
+  // A blocked user gets the promised 403, never a silent downgrade to the
+  // anonymous identity — public-readable tables would still serve them.
+  if (endUser === 'blocked') return { userId: '', isServiceRole: false, role: 'user', blocked: true }
   if (endUser) return { userId: endUser.userId, isServiceRole: false, role: endUser.role }
   return { userId: '', isServiceRole: false, role: 'user' }
+}
+
+/** Answer the promised 403 for a blocked end-user; true when the request is done. */
+function refuseIfBlocked(res: Response, rls: RlsIdentity): boolean {
+  if (!rls.blocked) return false
+  sendError(res, ErrorCodes.FORBIDDEN, 'This account has been blocked by the project owner.', 403)
+  return true
 }
 
 // ── Schemas ────────────────────────────────────────────────────────────────────
@@ -91,9 +103,13 @@ function buildWhere(where: Record<string, any> | undefined, startIdx = 1) {
         }
         if (op.contains !== undefined) { parts.push(`"${col}"::text ILIKE $${idx++}`); values.push(`%${op.contains}%`) }
         if (op.in !== undefined && Array.isArray(op.in)) {
-          const placeholders = op.in.map(() => `$${idx++}`).join(', ')
-          parts.push(`"${col}" IN (${placeholders})`)
-          values.push(...op.in)
+          if (op.in.length === 0) {
+            parts.push(`1=0`)
+          } else {
+            const placeholders = op.in.map(() => `$${idx++}`).join(', ')
+            parts.push(`"${col}" IN (${placeholders})`)
+            values.push(...op.in)
+          }
         }
       } else {
         parts.push(`"${col}" = $${idx++}`)
@@ -148,9 +164,10 @@ router.post('/:projectId/database/query', asyncRoute(v1AuthMiddleware), asyncRou
     const dataSql  = `SELECT * FROM "${schemaName}"."${tableName}" ${whereClause} ${orderByClause} LIMIT ${Number(limit)} OFFSET ${Number(offset)}`
 
     const rls = await resolveRlsIdentity(req, ctx.projectId, ctx.apiKey.serviceRole)
+    if (refuseIfBlocked(res, rls)) return
     const [countResult, rows] = await Promise.all([
-      executeWithUserContext<{ count: number }>(rls.userId, rls.isServiceRole, countSql, whereValues, rls.role),
-      executeWithUserContext<any>(rls.userId, rls.isServiceRole, dataSql, whereValues, rls.role),
+      executeWithUserContext<{ count: number }>(ctx.projectId, rls.userId, rls.isServiceRole, countSql, whereValues, rls.role),
+      executeWithUserContext<any>(ctx.projectId, rls.userId, rls.isServiceRole, dataSql, whereValues, rls.role),
     ])
 
     if (include) {
@@ -207,6 +224,7 @@ router.post('/:projectId/database/insert', asyncRoute(v1AuthMiddleware), asyncRo
     const inserted: any[] = []
 
     const rls = await resolveRlsIdentity(req, ctx.projectId, ctx.apiKey.serviceRole)
+    if (refuseIfBlocked(res, rls)) return
     for (const row of rows) {
       const cols = Object.keys(row).filter(c => /^[a-z_][a-z0-9_]*$/i.test(c))
       if (cols.length === 0) continue
@@ -214,20 +232,16 @@ router.post('/:projectId/database/insert', asyncRoute(v1AuthMiddleware), asyncRo
       const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ')
       const values = cols.map(c => row[c])
       const sql = `INSERT INTO "${schemaName}"."${tableName}" (${colList}) VALUES (${placeholders}) RETURNING *`
-      const result = await executeWithUserContext<any>(rls.userId, rls.isServiceRole, sql, values, rls.role)
+      const result = await executeWithUserContext<any>(ctx.projectId, rls.userId, rls.isServiceRole, sql, values, rls.role)
       if (result[0]) inserted.push(result[0])
     }
 
     // Non-blocking triggers + AI functions
     if (inserted.length > 0) {
       const { fireTriggers } = await import('@/lib/services/trigger-service')
-      const { fireAiFunctions } = await import('@/lib/services/ai-functions/executor')
       for (const row of inserted) {
         fireTriggers(ctx.projectId, { type: 'insert', table: tableName, data: row }).catch(
           (err: any) => console.warn('[Triggers] fire failed (non-fatal):', err?.message)
-        )
-        fireAiFunctions(ctx.projectId, { type: 'insert', table: tableName, data: row }).catch(
-          (err: any) => console.warn('[AiFunctions] fire failed (non-fatal):', err?.message)
         )
       }
     }
@@ -286,17 +300,14 @@ router.post('/:projectId/database/update', asyncRoute(v1AuthMiddleware), asyncRo
 
     const sql = `UPDATE "${schemaName}"."${tableName}" SET ${setParts.join(', ')} ${whereClause} RETURNING *`
     const rls = await resolveRlsIdentity(req, ctx.projectId, ctx.apiKey.serviceRole)
-    const result = await executeWithUserContext<any>(rls.userId, rls.isServiceRole, sql, values, rls.role)
+    if (refuseIfBlocked(res, rls)) return
+    const result = await executeWithUserContext<any>(ctx.projectId, rls.userId, rls.isServiceRole, sql, values, rls.role)
 
     if (result.length > 0) {
       const { fireTriggers } = await import('@/lib/services/trigger-service')
-      const { fireAiFunctions } = await import('@/lib/services/ai-functions/executor')
       for (const row of result) {
         fireTriggers(ctx.projectId, { type: 'update', table: tableName, data: row }).catch(
           (err: any) => console.warn('[Triggers] fire failed (non-fatal):', err?.message)
-        )
-        fireAiFunctions(ctx.projectId, { type: 'update', table: tableName, data: row }).catch(
-          (err: any) => console.warn('[AiFunctions] fire failed (non-fatal):', err?.message)
         )
       }
     }
@@ -345,19 +356,16 @@ router.post('/:projectId/database/delete', asyncRoute(v1AuthMiddleware), asyncRo
       return
     }
 
-    const sql = `DELETE FROM "${schemaName}"."${tableName}" ${whereClause} RETURNING id`
+    const sql = `DELETE FROM "${schemaName}"."${tableName}" ${whereClause} RETURNING *`
     const rls = await resolveRlsIdentity(req, ctx.projectId, ctx.apiKey.serviceRole)
-    const result = await executeWithUserContext<any>(rls.userId, rls.isServiceRole, sql, values, rls.role)
+    if (refuseIfBlocked(res, rls)) return
+    const result = await executeWithUserContext<any>(ctx.projectId, rls.userId, rls.isServiceRole, sql, values, rls.role)
 
     if (result.length > 0) {
       const { fireTriggers } = await import('@/lib/services/trigger-service')
-      const { fireAiFunctions } = await import('@/lib/services/ai-functions/executor')
       for (const row of result) {
         fireTriggers(ctx.projectId, { type: 'delete', table: tableName, data: row }).catch(
           (err: any) => console.warn('[Triggers] fire failed (non-fatal):', err?.message)
-        )
-        fireAiFunctions(ctx.projectId, { type: 'delete', table: tableName, data: row }).catch(
-          (err: any) => console.warn('[AiFunctions] fire failed (non-fatal):', err?.message)
         )
       }
     }

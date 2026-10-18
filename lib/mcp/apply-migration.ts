@@ -24,7 +24,7 @@
  * what ran and was undone, and `change` how its lifecycle ended.
  */
 
-import { prisma } from '@/lib/db/prisma'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { MigrationParseError, parseMigration, type PlannedAction } from '@/lib/mcp/migration-parser'
 
 export interface MigrationRefusal {
@@ -113,10 +113,15 @@ export function planMigration(sql: string): { ok: true; planned: PlannedAction[]
   }
 }
 
-/** The tables, of those named, that exist in a schema. */
-export async function existingTables(schema: string, names: string[]): Promise<Set<string>> {
+/**
+ * The tables, of those named, that exist in a schema of the project's
+ * database, in its region. Any other database has none of them, which would
+ * refuse every ALTER and wave every CREATE through.
+ */
+export async function existingTables(projectId: string, schema: string, names: string[]): Promise<Set<string>> {
   if (names.length === 0) return new Set()
-  const found = await prisma.$queryRaw<Array<{ table_name: string }>>`
+  const db = await workspaceRawClient(projectId)
+  const found = await db.$queryRaw<Array<{ table_name: string }>>`
     SELECT table_name FROM information_schema.tables
     WHERE table_schema = ${schema} AND table_name = ANY(${names})`
   return new Set(found.map((r) => r.table_name))
@@ -273,7 +278,7 @@ export async function applyMigrationToMain(
   const plan = planMigration(sql)
   if (!plan.ok) return plan as MigrationRefusal
   const planned = (plan as { ok: true; planned: PlannedAction[] }).planned
-  const existing = await existingTables(opts.workspaceSchema, tablesNamed(planned))
+  const existing = await existingTables(projectId, opts.workspaceSchema, tablesNamed(planned))
   const checked = checkPlan(planned, existing)
   if (!checked.ok) return checked as MigrationRefusal
   const ok = checked as Extract<typeof checked, { ok: true }>
@@ -286,6 +291,9 @@ export async function applyMigrationToMain(
       destructiveConfirmed: false,
       mcpOwnerConfirmed: true,
       agentSurface: opts.agentSurface === true,
+      // The parser produced this exact action. On failure, return the source
+      // statement to the migration caller rather than model-replanning it.
+      allowReplan: false,
       createdThisTurn: new Set<string>(),
     }),
   )

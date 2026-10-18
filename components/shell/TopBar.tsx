@@ -8,7 +8,8 @@
  * The breadcrumb names where you are; the right cluster holds the only
  * global actions. "Ask" toggles the Q&A Assistant (⌘/Ctrl+J), which answers
  * platform questions and never builds. Building goes through the one door:
- * the user's coding agent over MCP (Connect agent, the primary action).
+ * the user's coding agent over MCP (Connect agent, the primary action until
+ * that agent is connected, when the slot reads "Agent connected" instead).
  *
  * The environment label is honest: one environment today. Its tooltip names
  * the AWS region only on Backenly Cloud, because a self-hosted deployment runs
@@ -23,8 +24,10 @@ import { Cable, Check, ChevronsUpDown, Inbox, Plus, Sparkles } from 'lucide-reac
 import { useAssistantStore } from '@/lib/stores/use-assistant-store'
 import { CLOUD_CONTROL_PLANE } from '@cloud/control-plane'
 import { getProjects, type Project } from '@/lib/api/projects'
-import { BUTTON_BASE, BUTTON_VARIANTS, Kbd } from '@/components/inspector/kit'
+import { BUTTON_BASE, BUTTON_VARIANTS, Kbd, StatusDot } from '@/components/inspector/kit'
 import { FOCUS, R_CONTROL } from '@/components/console/tokens'
+import { HOME_REGION, regionLabel } from '@/lib/regions'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 import {
   AccountMenu,
   AccountScope,
@@ -61,6 +64,7 @@ export function TopBar() {
 
   const assistantOpen = useAssistantStore((s) => s.open)
   const toggleAssistant = useAssistantStore((s) => s.toggle)
+  const agent = useAgentConnection(projectId)
 
   // ⌘/Ctrl+J — toggle the assistant from anywhere in the workspace.
   useEffect(() => {
@@ -97,8 +101,14 @@ export function TopBar() {
         const res = await fetch(`/api/projects/${projectId}/health`, { credentials: 'include' })
         if (!res.ok) return
         const j = await res.json()
-        const findings = j.data?.findings ?? []
-        const pending = findings.filter((f: any) => f.status === 'pending_approval').length
+        // Both queues that wait on the user: findings the loop is holding, and
+        // calls their coding agent parked for approval. This counted only the
+        // held findings, and from the 50-row preview, so a parked deploy or
+        // drop left the inbox dark until it expired (AUT-08).
+        const held = typeof j.data?.needsAttention === 'number'
+          ? j.data.needsAttention
+          : (j.data?.findings ?? []).filter((f: any) => f.status === 'pending_approval').length
+        const pending = held + (typeof j.data?.agentApprovalsPending === 'number' ? j.data.agentApprovalsPending : 0)
         if (!cancelled) setPendingReview(pending)
       } catch {
         /* silent */
@@ -188,7 +198,7 @@ export function TopBar() {
       <span
         title={
           CLOUD_CONTROL_PLANE
-            ? 'Backenly Cloud runs one environment, in AWS ap-south-1, today'
+            ? `Backenly Cloud runs one environment, in ${regionLabel(HOME_REGION)}, today`
             : 'This deployment runs one environment'
         }
         className="ml-1 hidden h-[22px] items-center gap-1.5 rounded-[5px] border border-white/[0.07] px-1.5 text-[12px] text-zinc-400 lg:inline-flex"
@@ -244,14 +254,50 @@ export function TopBar() {
           <Kbd className="ml-0.5 hidden xl:inline-flex">⌘J</Kbd>
         </button>
 
-        {/* Connect agent — the one build door, the primary action. */}
-        <Link data-tour="connect-agent" href={`${basePath}/connect`} className={`${BUTTON_BASE} ${BUTTON_VARIANTS.primary} h-[32px] px-3 text-[13px]`}>
-          <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
-          <span className="hidden sm:inline">Connect agent</span>
-        </Link>
+        {/* Connect agent — the one build door, the primary action until the
+            user's agent is connected. Then the slot reports that instead of
+            asking again, and still opens Connect for keys or another agent.
+            Hidden rather than removed while the answer loads, so it neither
+            flashes the wrong state nor shifts the bar, and every state keeps
+            the tour's target. */}
+        {agent.connected ? (
+          <Link
+            data-tour="connect-agent"
+            href={`${basePath}/connect`}
+            title={connectedTitle(agent.lastSeenAt, agent.client)}
+            className={`${BUTTON_BASE} ${BUTTON_VARIANTS.secondary} h-[32px] min-w-[32px] px-2.5 text-[13px]`}
+          >
+            <StatusDot tone="operational" />
+            <span className="sr-only sm:not-sr-only">Agent connected</span>
+          </Link>
+        ) : (
+          <Link
+            data-tour="connect-agent"
+            href={`${basePath}/connect`}
+            className={`${BUTTON_BASE} ${BUTTON_VARIANTS.primary} h-[32px] px-3 text-[13px] ${agent.status === 'loading' ? 'invisible' : ''}`}
+          >
+            <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
+            <span className="hidden sm:inline">Connect agent</span>
+          </Link>
+        )}
 
         <AccountMenu />
       </div>
     </ConsoleBar>
   )
+}
+
+/** The connected slot's tooltip: which client, and how recently it called. */
+function connectedTitle(lastSeenAt: string | null, client: string | null): string {
+  const via = client ? ` through ${client}` : ''
+  const when = lastSeenAt ? `, last call ${ago(lastSeenAt)}` : ''
+  return `Your coding agent is connected over MCP${via}${when}. Open Connect to manage keys or add another agent.`
+}
+
+function ago(iso: string): string {
+  const minutes = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000)
+  if (minutes < 1) return 'just now'
+  const [n, unit]: [number, string] =
+    minutes < 60 ? [minutes, 'minute'] : minutes < 1440 ? [Math.floor(minutes / 60), 'hour'] : [Math.floor(minutes / 1440), 'day']
+  return `${n} ${unit}${n === 1 ? '' : 's'} ago`
 }

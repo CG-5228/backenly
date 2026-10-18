@@ -86,6 +86,7 @@ import { ExtensionsPanel } from '@/components/database/ExtensionsPanel'
 import { DatabaseSnapshots } from '@/components/database/DatabaseSnapshots'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { getCurrentProjectId } from '@/lib/api/client'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 import EnhancedSchemaVisualizer from '@/components/database/EnhancedSchemaVisualizer'
 
 
@@ -148,7 +149,9 @@ export default function ProjectDatabasePage() {
   
   // Resolve the definitive project ID - prioritize URL param, fallback to current session project
   const resolvedProjectId = urlProjectId || currentProjectId
-  
+  // The empty states offer "Connect your agent" only until it is connected.
+  const agent = useAgentConnection(resolvedProjectId)
+
   const [activeDb, setActiveDb] = useState<DatabaseType>('postgresql')
   const [databaseView, setDatabaseView] = useState<'platform' | 'workspace' | 'all'>('workspace')
   const [schemas, setSchemas] = useState<string[]>([])
@@ -1576,14 +1579,16 @@ export default function ProjectDatabasePage() {
                               <KitButton size="sm" icon={Plus} onClick={handleAddRow}>
                                 Insert row
                               </KitButton>
-                              <KitButton
-                                size="sm"
-                                variant="ghost"
-                                icon={Cable}
-                                onClick={() => router.push(`/app/projects/${resolvedProjectId}/connect`)}
-                              >
-                                Connect your agent
-                              </KitButton>
+                              {agent.needsConnect && (
+                                <KitButton
+                                  size="sm"
+                                  variant="ghost"
+                                  icon={Cable}
+                                  onClick={() => router.push(`/app/projects/${resolvedProjectId}/connect`)}
+                                >
+                                  Connect your agent
+                                </KitButton>
+                              )}
                             </>
                           }
                           className="h-full"
@@ -1952,14 +1957,16 @@ export default function ProjectDatabasePage() {
                     <div className="flex w-full flex-col items-center gap-3">
                       <AgentPrompt prompt="Add a products table with a name, a price in cents and a stock count. Anyone can read it; only admins can write." />
                       <div className="flex flex-wrap items-center justify-center gap-2">
-                        <KitButton
-                          variant="primary"
-                          size="sm"
-                          icon={Cable}
-                          onClick={() => router.push(`/app/projects/${resolvedProjectId}/connect`)}
-                        >
-                          Connect your agent
-                        </KitButton>
+                        {agent.needsConnect && (
+                          <KitButton
+                            variant="primary"
+                            size="sm"
+                            icon={Cable}
+                            onClick={() => router.push(`/app/projects/${resolvedProjectId}/connect`)}
+                          >
+                            Connect your agent
+                          </KitButton>
+                        )}
                         <KitButton size="sm" icon={Plus} onClick={openCreateTable} disabled={!selectedSchema}>
                           New table
                         </KitButton>

@@ -12,6 +12,7 @@ import { verifyToken } from '@/lib/auth/jwt'
 import { prisma } from '@/lib/db'
 import { listTriggers, createTrigger, deleteTrigger } from '@/lib/services/trigger-service'
 import { enforceTriggerCreation } from '@/lib/entitlements/policy'
+import { billingAccountOf } from '@/lib/usage/account'
 import { canAccessProject, canAdministerProject, canWriteProject } from '@/lib/edition/guard'
 import { asyncRoute } from '../lib/async-route'
 
@@ -77,7 +78,8 @@ router.post('/:projectId/triggers', asyncRoute(async (req: Request, res: Respons
 
   try {
     const currentTriggerCount = await prisma.appTrigger.count({ where: { projectId } })
-    const triggerCheck = await enforceTriggerCreation(auth.userId, projectId, currentTriggerCount)
+    const triggerAccount = (await billingAccountOf(projectId)) ?? auth.userId
+    const triggerCheck = await enforceTriggerCreation(triggerAccount, projectId, currentTriggerCount)
     if (triggerCheck !== true) {
       res.status(403).json({
         error: (triggerCheck as any).message,
@@ -111,14 +113,17 @@ router.delete('/:projectId/triggers', asyncRoute(async (req: Request, res: Respo
     return
   }
 
-  const triggerId = req.query.id as string
-  if (!triggerId) {
+  const triggerId = req.query.id
+  if (typeof triggerId !== 'string' || !triggerId) {
     res.status(400).json({ error: 'id query parameter is required' })
     return
   }
 
   try {
-    await deleteTrigger(projectId, triggerId)
+    if (!(await deleteTrigger(projectId, triggerId))) {
+      res.status(404).json({ error: 'Trigger not found in this project' })
+      return
+    }
     res.json({ success: true })
   } catch (err: any) {
     res.status(500).json({ error: err.message })

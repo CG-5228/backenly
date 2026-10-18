@@ -30,8 +30,6 @@ import { randomUUID } from 'crypto'
 import type { BuildJob, BuildNode, BuildPhase, Domain, BuildContext } from './types'
 import { phasesForDomain, detectDomain, genericPhases } from './domain-phases'
 import { injectBlueprintNodes, filterSchemaToBlueprintEntities } from './blueprint-injector'
-import { getOpenAIClient } from '../openai-service'
-import { getModel } from '../model-router'
 import {
   classifyDomainSemantically,
   analyzeAllTablePurposes,
@@ -41,6 +39,7 @@ import {
 } from '../semantic-domain-analyzer'
 import { shouldAutoGenerateCheckout, shouldAutoGenerateAdmin, shouldAutoGenerateAdminFromTables } from './domain-business-logic'
 
+import { chat } from '@/lib/ai/llm/chat'
 // ── Parsed Requirements ───────────────────────────────────────────────────────
 
 export interface ParsedRequirements {
@@ -284,9 +283,8 @@ async function parseRequirementsFromPrompt(prompt: string): Promise<ParsedRequir
 
   // Use LLM to extract the explicit requirements
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -312,12 +310,12 @@ Extraction rules:
         },
         { role: 'user', content: prompt },
       ],
-      temperature: 0,
-      max_tokens: 600,
-      response_format: { type: 'json_object' },
+      maxTokens: 600,
+      json: true,
+      label: 'domain-compiler',
     })
 
-    const raw = JSON.parse(response.choices[0].message.content || '{}')
+    const raw = JSON.parse(response.text || '{}')
     const parsedIntegrations: ParsedRequirements['requiredIntegrations'] = Array.isArray(raw.requiredIntegrations)
       ? raw.requiredIntegrations
       : []
@@ -1081,12 +1079,8 @@ export async function extractDetailedSchema(prompt: string): Promise<Map<string,
   if (!hasColumnSpec && !guestOrderMode) return result
 
   try {
-    const { getOpenAIClient } = await import('../openai-service')
-    const { getModel } = await import('../model-router')
-    const openai = getOpenAIClient()
-
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -1111,12 +1105,12 @@ Rules:
         },
         { role: 'user', content: prompt },
       ],
-      temperature: 0,
-      max_tokens: 1500,
-      response_format: { type: 'json_object' },
+      maxTokens: 1500,
+      json: true,
+      label: 'domain-compiler-tables',
     })
 
-    const raw = JSON.parse(response.choices[0].message.content || '{"tables":[]}')
+    const raw = JSON.parse(response.text || '{"tables":[]}')
     const tables: any[] = Array.isArray(raw.tables) ? raw.tables : []
 
     for (const t of tables) {
@@ -1164,9 +1158,8 @@ async function extractEntities(prompt: string): Promise<string[]> {
   const deterministicEntities = extractEntitiesFromExplicitList(prompt)
 
   try {
-    const openai = getOpenAIClient()
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -1179,11 +1172,11 @@ Example: ["users", "posts", "comments", "likes"]`,
         },
         { role: 'user', content: prompt },
       ],
-      temperature: 0,
-      max_tokens: 150,
-      response_format: { type: 'json_object' },
+      maxTokens: 150,
+      json: true,
+      label: 'domain-compiler-names',
     })
-    const raw = JSON.parse(response.choices[0].message.content || '{"tables":[]}')
+    const raw = JSON.parse(response.text || '{"tables":[]}')
     const llmTables: string[] = Array.isArray(raw) ? raw : (raw.tables ?? [])
     const filtered = llmTables
       .filter((t): t is string => typeof t === 'string')

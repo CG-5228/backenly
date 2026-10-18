@@ -140,31 +140,19 @@ async function _runReconciliation(projectId: string): Promise<void> {
   // exact same `type` value, so Prisma's `skipDuplicates` silently dropped every
   // item after the first instead of recording each one; (3) it had no reap path,
   // so once written it could never be withdrawn even after the drift resolved.
-  // Step 2 below (_runHealthScan → the migration agent) runs moments later in
-  // this same orchestration pass, detects the identical drift via the same
-  // detectSchemaDrift() call, and persists it correctly — one row per
-  // `${type}_${tableName}`, with reapMigrationFindings() now able to withdraw
-  // it. Writing it twice, once broken and once correctly, added nothing.
+  // Those kinds of drift are the canonical loop's to report, by cause:
+  // unregistered tables (orphan_table), columns missing or retyped against what
+  // was requested (intent_drift), and DDL over a direct connection
+  // (external_schema_change). See docs/autonomy-orchestrator-parity.md.
 }
 
-// ── Step 2: Multi-agent health scan ──────────────────────────────────────────
+// ── Step 2: Health scan (the canonical loop) ─────────────────────────────────
 
 async function _runHealthScan(projectId: string, userId: string): Promise<void> {
-  // Throttle: skip if a scan already ran in the last 30 minutes.
-  // The cron runs every 15 min; post-build can run much more frequently.
-  const { prisma } = await import('@/lib/db/prisma')
-  const recentScan = await prisma.autonomousAction.findFirst({
-    where: { projectId },
-    orderBy: { createdAt: 'desc' },
-    select: { createdAt: true },
-  }).catch(() => null)
-
-  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000)
-  if (recentScan && recentScan.createdAt > thirtyMinAgo) {
-    console.log(`[PostBuildOrchestrator] Health scan skipped — ran <30min ago for project ${projectId}`)
-    return
-  }
-
+  // No throttle. It used to skip when the agent orchestrator had written a scan
+  // record in the last 30 minutes, because that scan made model calls. The
+  // orchestrator is retired and nothing writes that record any more; what runs
+  // now is the reconciler, which runs every minute on its own anyway.
   const { runMonitoredHealthScan } = await import('@/lib/ai/background-monitor')
   await runMonitoredHealthScan(projectId, userId)
 }

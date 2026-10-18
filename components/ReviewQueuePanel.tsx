@@ -57,12 +57,22 @@ interface PendingApproval {
   /** Always sent by the trust report; normalized to null on the way in so the
    *  grouping contract holds even against a response that predates the field. */
   details: Record<string, unknown> | null
+  /** An AI-proposed repair waiting for approval of this exact version (lib/autonomy/ai-proposals.ts). */
+  proposal?: { id: string; version: string; summary: string; expiresAt: string }
 }
 
 /** Senior-engineer diagnosis written onto escalated findings (escalation-diagnosis). */
 interface FindingDiagnosis {
   rootCause?: string
   recommendation?: string
+  /**
+   * Where it came from. A deterministic investigation reached its conclusion
+   * from observations it made; a model-written diagnosis is a hypothesis that
+   * nothing has verified. They must never look the same on screen.
+   */
+  provenance: 'investigation' | 'ai_hypothesis'
+  /** Observations an investigation made (its evidence trail), when recorded. */
+  observations: number | null
 }
 
 interface TrustReportShape {
@@ -86,6 +96,7 @@ interface AgentApproval {
   message: string
   createdAt: string
   expiresAt: string
+  executedAt: string | null
   resultSummary: string | null
 }
 
@@ -157,7 +168,12 @@ function diagnosisOf(p: PendingApproval): FindingDiagnosis | null {
   if (!d || typeof d !== 'object') return null
   const rootCause = typeof d.rootCause === 'string' ? d.rootCause : undefined
   const recommendation = typeof d.recommendation === 'string' ? d.recommendation : undefined
-  return rootCause || recommendation ? { rootCause, recommendation } : null
+  if (!rootCause && !recommendation) return null
+  // Only the deterministic investigation is labelled as such; anything else,
+  // including a diagnosis with no recorded source, is shown as a hypothesis.
+  const provenance = d.model === 'deterministic-investigation' ? 'investigation' : 'ai_hypothesis'
+  const observations = Array.isArray(d.evidence) ? d.evidence.length : null
+  return { rootCause, recommendation, provenance, observations }
 }
 
 function timeAgo(iso: string): string {
@@ -310,6 +326,41 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
     timers.current.push(t)
   }
 
+  /**
+   * Approve one AI-proposed repair. The server re-checks everything the
+   * proposal was bound to, runs it once, and says whether all three checks
+   * confirmed it. Anything less is shown as exactly what it is.
+   */
+  const approveProposal = async (g: FindingGroup<PendingApproval>, proposal: NonNullable<PendingApproval['proposal']>) => {
+    setRow(g.key, { phase: 'applying' })
+    try {
+      const res = await fetch(`/api/projects/${projectId}/health/proposals/${proposal.id}/approve`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proposalVersion: proposal.version }),
+      })
+      const j = await res.json().catch(() => ({} as any))
+      if (res.ok && j?.fixed) {
+        setRow(g.key, { phase: 'verified' })
+        flashBanner('Fixed · verified', 'the change is in the catalog, the issue is gone on re-check, nothing else broke · Undo is in Applied changes')
+        const t = setTimeout(async () => {
+          await fetchReport(true)
+          setRowState(prev => {
+            const { [g.key]: _gone, ...rest } = prev
+            return rest
+          })
+        }, 2400)
+        timers.current.push(t)
+        return
+      }
+      setRow(g.key, { phase: 'error', message: j?.message || j?.error || 'The repair could not be applied. Try again in a moment.' })
+      if (res.status === 409 || res.ok) fetchReport(true)
+    } catch {
+      setRow(g.key, { phase: 'error', message: 'Network error. Check your connection and try again.' })
+    }
+  }
+
   const decideAgentRequest = async (approvalId: string, decision: 'approve' | 'reject') => {
     setRow(approvalId, { phase: decision === 'approve' ? 'applying' : 'dismissing' })
     try {
@@ -413,16 +464,22 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
   }
 
   const pendingAgents = agentApprovals.filter(a => a.status === 'pending')
+  // An approval the human already granted must not vanish from the queue
+  // while it runs — and if its execution died (server reports failed with no
+  // executedAt: the terminal update never ran), the unknown outcome is the
+  // human's to look at, not something to hide.
+  const runningAgents = agentApprovals.filter(a => a.status === 'approved')
+  const stuckAgents = agentApprovals.filter(a => a.status === 'failed' && !a.executedAt)
   // The header counts FINDINGS (what the user must clear), the list renders
   // GROUPS (what they must decide). Both numbers are shown, so folding nine
   // rows into one never looks like eight findings quietly disappearing.
-  const total = data.pendingApprovals.length + pendingAgents.length
+  const total = data.pendingApprovals.length + pendingAgents.length + stuckAgents.length
 
   return (
     <section className={CARD}>
       <PanelHeader
         count={total}
-        groupCount={groups.length + pendingAgents.length}
+        groupCount={groups.length + pendingAgents.length + stuckAgents.length}
         refreshing={refreshing}
         onRefresh={() => fetchReport(true)}
       />
@@ -452,7 +509,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {total === 0 ? (
+      {total === 0 && runningAgents.length === 0 ? (
         <div className="px-5 py-12 text-center">
           <CheckCircle2 className="mx-auto mb-3 size-5 text-emerald-400/70" />
           <p className="text-[13px] font-medium text-zinc-300">Nothing waiting on you</p>
@@ -466,6 +523,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
               group={g}
               state={rowState[g.key] ?? { phase: 'idle' }}
               onApprove={() => approveGroup(g)}
+              onApproveProposal={(pr) => approveProposal(g, pr)}
               onDismiss={() => dismissGroup(g)}
               onResetError={() => setRow(g.key, { phase: 'idle' })}
             />
@@ -480,6 +538,12 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
               onReject={() => decideAgentRequest(a.id, 'reject')}
               onResetError={() => setRow(a.id, { phase: 'idle' })}
             />
+          ))}
+          {runningAgents.map(a => (
+            <AgentOutcomeRow key={a.id} request={a} running />
+          ))}
+          {stuckAgents.map(a => (
+            <AgentOutcomeRow key={a.id} request={a} />
           ))}
         </ul>
       )}
@@ -594,7 +658,12 @@ function AgentRequestRow({
   // data written since. The details are on the change itself.
   const restore = a.tool === 'revert_schema_change'
   const fromBackenly = a.requestedBy === 'backenly'
-  const message = a.message.length > 180 ? a.message.slice(0, 180) + '…' : a.message
+  // The card is the ONLY thing the human reads before approving — a merge
+  // message carries the exact statements that reach production, and cutting
+  // it at 180 characters asked them to approve what they could not see.
+  const [showFull, setShowFull] = useState(false)
+  const long = a.message.length > 180
+  const shown = long && !showFull ? a.message.slice(0, 180) + '…' : a.message
   return (
     <li className="px-5 py-3.5">
       <div className="flex items-start gap-3">
@@ -607,9 +676,17 @@ function AgentRequestRow({
               <>Your coding agent wants to run <span className="font-mono text-[12px] text-violet-200">{a.tool}</span> on {a.target}</>
             )}
           </p>
-          <p className="mt-1 break-words text-[12px] leading-relaxed text-zinc-500">
-            {restore || fromBackenly ? message : `“${message}”`}
+          <p className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-zinc-500">
+            {restore || fromBackenly ? shown : `“${shown}”`}
           </p>
+          {long && (
+            <button
+              onClick={() => setShowFull(v => !v)}
+              className="mt-1 text-[12px] font-medium text-violet-300/90 underline underline-offset-2 transition-colors hover:text-violet-200"
+            >
+              {showFull ? 'Show less' : 'Show the full request'}
+            </button>
+          )}
           <p className="mt-1.5 font-mono text-[12px] text-zinc-600">
             {a.rowCount !== null && a.rowCount > 0 && (
               <span className="text-amber-400/90">{a.rowCount} row{a.rowCount === 1 ? '' : 's'} affected · </span>
@@ -658,6 +735,34 @@ function AgentRequestRow({
 }
 
 /**
+ * An agent request after the human decided: still executing, or approved and
+ * never heard from again (the terminal update never ran — a restart mid-run).
+ * No buttons: there is no decision left, only an outcome to witness. These
+ * rows exist so an approval can never silently vanish from the queue while
+ * its outcome is undecided or unknown.
+ */
+function AgentOutcomeRow({ request: a, running }: { request: AgentApproval; running?: boolean }) {
+  return (
+    <li className="px-5 py-3.5">
+      <div className="flex items-start gap-3">
+        <span className={`mt-1.5 size-1.5 shrink-0 rounded-full ${running ? 'bg-sky-400' : 'bg-amber-400'}`} />
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-medium text-zinc-100">
+            {running ? 'Approved — running now: ' : 'Approved, but the outcome is unknown: '}
+            <span className="font-mono text-[12px] text-violet-200">{a.tool}</span> on {a.target}
+          </p>
+          {!running && a.resultSummary && (
+            <p className="mt-1 break-words text-[12px] leading-relaxed text-amber-200/80">{a.resultSummary}</p>
+          )}
+          <p className="mt-1.5 font-mono text-[12px] text-zinc-600">MCP · {timeAgo(a.createdAt)}</p>
+        </div>
+        {running && <Loader2 className="size-3.5 shrink-0 animate-spin text-zinc-500" />}
+      </div>
+    </li>
+  )
+}
+
+/**
  * The prompt handed to the user's coding agent. Inherited from the Overview
  * advisor block when Autonomy became the single queue — some fixes genuinely
  * belong in the user's frontend code, and losing that door would have made the
@@ -681,12 +786,14 @@ function ApprovalRow({
   group: g,
   state,
   onApprove,
+  onApproveProposal,
   onDismiss,
   onResetError,
 }: {
   group: FindingGroup<PendingApproval>
   state: RowState
   onApprove: () => void
+  onApproveProposal: (proposal: NonNullable<PendingApproval['proposal']>) => void
   onDismiss: () => void
   onResetError: () => void
 }) {
@@ -695,6 +802,8 @@ function ApprovalRow({
   const head = g.members[0]
   const critical = g.severity === 'critical'
   const many = g.members.length > 1
+  // A proposal is bound to one finding, so it is offered on single rows only.
+  const proposal = !many ? head.proposal : undefined
 
   if (state.phase === 'verified') {
     return (
@@ -741,6 +850,11 @@ function ApprovalRow({
             if (!diag) return null
             return (
               <div className="mt-1.5 border-l border-white/[0.08] pl-3">
+                <p className="mb-0.5 text-[11.5px] font-medium uppercase tracking-wide text-zinc-500">
+                  {diag.provenance === 'investigation'
+                    ? `Confirmed by investigation${diag.observations ? ` · ${diag.observations} observation${diag.observations === 1 ? '' : 's'}` : ''}`
+                    : 'AI hypothesis · not verified'}
+                </p>
                 {diag.rootCause && (
                   <p className="text-[12.5px] leading-snug text-zinc-400">{diag.rootCause}</p>
                 )}
@@ -789,7 +903,19 @@ function ApprovalRow({
               spends a click discovering it — and say what to do instead. The
               hint is the same sentence the approve route would have returned,
               read from the one fix mapping (lib/core/fix-actions.ts). */}
-          {!g.actionable && state.phase !== 'error' && g.manualHint && (
+          {proposal && state.phase !== 'error' && (
+            <div className="mt-2 border-l border-violet-400/30 pl-3">
+              <p className="mb-0.5 text-[11.5px] font-medium uppercase tracking-wide text-violet-300/80">
+                AI-proposed repair · needs your approval
+              </p>
+              <p className="text-[12.5px] leading-snug text-zinc-300">{proposal.summary}</p>
+              <p className="mt-0.5 text-[12px] leading-snug text-zinc-500">
+                Recorded as fixed only if it is in the catalog, the issue is gone on re-check and nothing else broke. Undo restores the state before it.
+              </p>
+            </div>
+          )}
+
+          {!g.actionable && !proposal && state.phase !== 'error' && g.manualHint && (
             <p className="mt-2 border-l border-white/[0.08] pl-3 text-[12.5px] leading-snug text-zinc-400">
               {g.manualHint}
             </p>
@@ -812,7 +938,12 @@ function ApprovalRow({
               {/* The fix button exists only when a fix does. `fixableCount` is
                   computed from the executor's own action mapping, so this can
                   never promise a repair the engine does not have. */}
-              {g.actionable && (
+              {proposal && (
+                <PrimaryAction onClick={() => onApproveProposal(proposal)} busy={state.phase === 'applying'} busyLabel="Applying…">
+                  Approve & fix
+                </PrimaryAction>
+              )}
+              {!proposal && g.actionable && (
                 <PrimaryAction
                   onClick={onApprove}
                   busy={state.phase === 'applying'}

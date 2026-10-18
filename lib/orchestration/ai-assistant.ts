@@ -1,7 +1,8 @@
-import { chatCompletion, isAIEnabled } from '../openai/client'
 import { BackendStateGraph } from './backend-state-graph'
 import { CanonicalIntent } from './types'
 
+import { chat } from '@/lib/ai/llm/chat'
+import { aiAvailability } from '@/lib/ai/llm'
 /**
  * AI Assistant for Orchestration
  * 
@@ -18,10 +19,12 @@ export async function enhanceGuidanceMessage(
   userMessage: string,
   baseMessage: string
 ): Promise<string> {
-  if (!isAIEnabled()) return baseMessage
+  if (!aiAvailability().available) return baseMessage
 
   try {
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: `You are a calm, expert Product Manager for Backenly. 
@@ -38,9 +41,11 @@ export async function enhanceGuidanceMessage(
         Standard response: "${baseMessage}"
         Please provide a more natural, personalized version of this response.`
       }
-    ])
+    ],
+      label: 'orchestration-ai-assistant',
+    })
 
-    return response?.choices[0]?.message?.content || baseMessage
+    return response?.text || baseMessage
   } catch (error) {
     console.error('[AI Assistant] Guidance enhancement failed:', error)
     return baseMessage
@@ -54,10 +59,12 @@ export async function enhanceGuidanceMessage(
 export async function summarizeMessyPrompt(
   userMessage: string
 ): Promise<{ refinedPrompt?: string; suggestions?: string[] }> {
-  if (!isAIEnabled()) return {}
+  if (!aiAvailability().available) return {}
 
   try {
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: `You are a Product Manager. A user has provided a long, messy description of what they want to build.
@@ -69,9 +76,11 @@ export async function summarizeMessyPrompt(
         role: 'user',
         content: `Prompt: "${userMessage}"`
       }
-    ], { temperature: 0.3 })
+    ],
+      label: 'orchestration-ai-assistant',
+    })
 
-    const content = response?.choices[0]?.message?.content
+    const content = response?.text
     if (!content) return {}
 
     try {
@@ -98,10 +107,12 @@ export async function explainDecision(
   decisionType: 'SAFETY_BLOCK' | 'CHANGE_SUMMARY' | 'ERROR',
   context: { violations?: string[]; changes?: any[]; error?: string }
 ): Promise<string> {
-  if (!isAIEnabled()) return ''
+  if (!aiAvailability().available) return ''
 
   try {
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: `You are a helpful Product Manager explaining system decisions to a user.
@@ -117,9 +128,11 @@ export async function explainDecision(
         Technical Context: ${JSON.stringify(context)}
         Please explain this to the user.`
       }
-    ])
+    ],
+      label: 'orchestration-ai-assistant',
+    })
 
-    return response?.choices[0]?.message?.content || ''
+    return response?.text || ''
   } catch (error) {
     console.error('[AI Assistant] Decision explanation failed:', error)
     return ''
@@ -138,10 +151,12 @@ export async function generateDemoContent(
     samples: ["Users can sign up with Google", "Allow users to upload profile pictures", "Only admins can delete posts"]
   }
 
-  if (!isAIEnabled()) return defaultResponse
+  if (!aiAvailability().available) return defaultResponse
 
   try {
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: `You are a Sales Engineer for Backenly.
@@ -153,9 +168,11 @@ export async function generateDemoContent(
         role: 'user',
         content: `Topic: "${topic}"`
       }
-    ], { temperature: 0.8 })
+    ],
+      label: 'orchestration-ai-assistant',
+    })
 
-    const content = response?.choices[0]?.message?.content
+    const content = response?.text
     if (!content) return defaultResponse
 
     try {

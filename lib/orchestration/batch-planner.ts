@@ -10,11 +10,11 @@
  * NO questions. NO incremental prompts. ONE build.
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { BackendStateGraph } from './backend-state-graph'
 import { CanonicalIntent } from './types'
 import { IntentSpec, validateIntentSpec, intentSpecToBatchPlan } from './intent-spec'
 
+import { chat } from '@/lib/ai/llm/chat'
 export type ExecutionMode = 'BATCH' | 'GUIDED'
 
 export interface BatchEntity {
@@ -985,8 +985,6 @@ export async function parseBatchPlan(userMessage: string): Promise<BatchPlan> {
   
   console.log('[Batch Planner] 🧠 Falling back to LLM planning')
   
-  const openai = getOpenAIClient()
-  
   const systemPrompt = `You are Backenly's Intent Specification Generator.
 
 **CRITICAL: You MUST output a complete IntentSpec JSON. This is NON-NEGOTIABLE.**
@@ -1604,18 +1602,18 @@ Output:
 **CRITICAL: Use these examples as templates. When you see similar patterns in the user prompt, output the corresponding invariant structure.**`
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
       ],
-      temperature: 0.3, // Slightly increased for better pattern recognition
-      max_tokens: 6000, // Increased for complex schemas
-      response_format: { type: 'json_object' },
+      maxTokens: 6000,
+      json: true,
+      label: 'batch-planner',
     })
 
-    const rawContent = response.choices[0].message.content || '{}'
+    const rawContent = response.text || '{}'
     const intentSpec: IntentSpec = JSON.parse(rawContent)
 
     // DEBUG: Log extracted entities and fields

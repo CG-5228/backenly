@@ -16,7 +16,7 @@ import fs from 'fs'
 import path from 'path'
 import { Client } from 'pg'
 
-const MIGRATION = 'prisma/migrations-canonical/20261005120000_backend_change_ledger/migration.sql'
+const MIGRATION = 'prisma/migrations-canonical/20261018120000_backend_change_ledger/migration.sql'
 
 export function changeLedgerGuardSql(): string {
   const sql = fs.readFileSync(path.join(process.cwd(), MIGRATION), 'utf8')

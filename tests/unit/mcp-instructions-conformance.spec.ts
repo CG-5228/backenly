@@ -24,6 +24,15 @@
  * the check that keeps it fixed.
  */
 
+// The guide names the project's API address, which reads the project's region
+// from the platform database. This suite has none; a home-region project's
+// address is the deployment's origin (tests/integration/project-region.spec.ts
+// covers another region's).
+jest.mock('@/lib/data-plane/regional', () => ({
+  ...jest.requireActual('@/lib/data-plane/regional'),
+  projectApiOrigin: async (_projectId: string, homeOrigin: string) => homeOrigin,
+}))
+
 import { buildCatalog, STATE_SECTIONS } from '@/lib/mcp/catalog'
 import { dispatchTool } from '@/lib/ai/brain/tools'
 
@@ -125,6 +134,35 @@ describe('get_instructions names only advertised tools', () => {
     for (const m of guide.matchAll(/section:\s*"([a-z_]+)"/g)) {
       expect(Object.keys(STATE_SECTIONS)).toContain(m[1])
     }
+  })
+})
+
+describe('get_instructions deployment URLs', () => {
+  afterEach(() => jest.restoreAllMocks())
+
+  it.each([
+    ['local self-host', 'http://localhost:3100/', '', 'test', 'http://localhost:3100'],
+    ['public self-host', 'https://backend.example.test:8443/', '', 'production', 'https://backend.example.test:8443'],
+    ['alternate URL', '', 'https://alternate.example.test/', 'test', 'https://alternate.example.test'],
+    ['bind-all address', 'http://0.0.0.0:3100', 'https://alternate.example.test/', 'test', 'https://alternate.example.test'],
+    ['development fallback', '', '', 'test', 'http://localhost:3000'],
+    ['production fallback', '', '', 'production', 'https://backenly.com'],
+  ])('uses the deployment origin for %s', async (_label, appUrl, alternateUrl, mode, origin) => {
+    jest.replaceProperty(process, 'env', {
+      ...process.env,
+      NODE_ENV: mode,
+      NEXT_PUBLIC_APP_URL: appUrl,
+      NEXT_PUBLIC_URL: alternateUrl,
+    })
+    const projectId = '00000000-0000-4000-8000-000000000000'
+    const res = await dispatchTool('get_instructions', {}, { projectId })
+
+    expect(res.ok).toBe(true)
+    expect(res.data).toEqual({ projectId, apiBase: `${origin}/api/v1/${projectId}` })
+    expect(res.summary).toContain(`Base URL: \`${origin}/api/v1/${projectId}\``)
+    const urls = [...res.summary.matchAll(/https?:\/\/[^\s`]+/g)]
+    expect(urls.length).toBeGreaterThan(0)
+    for (const [url] of urls) expect(new URL(url).origin).toBe(origin)
   })
 })
 

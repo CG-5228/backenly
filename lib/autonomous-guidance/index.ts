@@ -5,10 +5,10 @@
  * Analyzes graph continuously and suggests optimizations.
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 import type { BackendStateGraph } from '@/lib/orchestration/backend-state-graph'
 
+import { chat } from '@/lib/ai/llm/chat'
 /**
  * Suggestion categories
  */
@@ -352,13 +352,11 @@ async function generateAISuggestions(
   }
   
   try {
-    const openai = getOpenAIClient()
-    
     const entityNames = Object.keys(graph.entities)
     const activityContext = recentActivity?.slice(0, 3).join(', ') || 'No recent activity'
     
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'insight.explain',
       messages: [
         {
           role: 'system',
@@ -406,11 +404,12 @@ Return ONLY valid JSON.`
           content: 'Suggest optimizations'
         }
       ],
-      temperature: 0.7,
-      max_tokens: 1500,
+      maxTokens: 1500,
+      json: true,
+      label: 'autonomous-guidance',
     })
     
-    const content = response.choices[0]?.message?.content
+    const content = response.text
     if (!content) {
       return []
     }

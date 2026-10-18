@@ -68,7 +68,7 @@ Project level (/app/projects/<id>), one sidebar:
 - Environments — an API key can be bound to a branch (create_api_key with branchId), and every request that key makes then reads and writes that branch instead of main. This is the ONLY way to select an environment: the schema is derived from the credential, never from a request header, because a client-settable schema selector would be a cross-tenant bypass. A key whose branch is merged or discarded is REFUSED, never silently pointed back at production. Scope note: branch routing covers the REST data plane (/api/v1/{id}/db and /api/v2) and end-user sign-up, sign-in, refresh and logout, which then use the branch's own users table and issue tokens only that branch accepts (a branch sign-up skips on_signup functions, webhooks, the active-user count and email verification, and lists them in skippedOnBranch). Every other endpoint (functions, storage, realtime, the emailed auth flows) REFUSES a branch-bound key with BRANCH_SURFACE_UNAVAILABLE rather than serving production. Data-plane and auth responses carry X-Backenly-Environment (main or branch:<name>), so a test can confirm which environment answered. Say "branch-scoped data and auth environment", not "fully isolated environment".
 - Autonomy — Activity (the loop timeline with receipts), Guardrails (the autonomy dial + category gates + restore points).
 - Monitoring — metrics + request logs. Deploy — publish, readiness, rollback. History — every change with receipts and per-change rollback.
-- Connect — wire a coding agent over MCP (per-agent setup cards, scoped keys), frontend SDK snippet, direct API access. Also reachable via the top-bar "Connect agent" button.
+- Connect — wire a coding agent over MCP (per-agent setup cards, scoped keys), frontend SDK snippet, direct API access. Also reachable from the top bar: the "Connect agent" button, which reads "Agent connected" once the user's agent is.
 - Project Settings — name, client keys, access, danger zone.
 The Review Queue is the inbox icon in the top bar (lit only when something waits on the user). The Assistant (top-bar button, ⌘J) is a Q&A panel available on every project page — it answers questions and points to sections, never builds. Building happens through Connect (the user's coding agent over MCP) or the Database section UI.
 DO NOT direct users to surfaces that no longer exist: there is no "Controls" hamburger, no Control Hub overlay, no separate "inspector", no "Back to workspace". If you remember such a surface, it was removed in the restructure — use the sections above.`
@@ -231,7 +231,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'enable_vector_search',
     name: 'Semantic / vector search (RAG)',
-    what: 'Enable pgvector + OpenAI embeddings on a table — adds an embedding column, a cosine-similarity index, and a /vector-search endpoint. New and updated rows are auto-embedded; queries are natural-language. Use for RAG, chatbots, "find similar X", recommendations, and any modern AI app.',
+    what: 'Enable pgvector + OpenAI embeddings on a table — adds an embedding column, a cosine-similarity index, and a /vector-search endpoint. Queries are natural-language; rows are searched once the app writes their embedding, which Backenly does not compute on write. Use for RAG, chatbots, "find similar X", recommendations, and any modern AI app.',
     tool: 'enable_vector_search',
   },
   {
@@ -335,7 +335,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'connect_frontend',
     name: 'Connect a frontend to this backend',
-    what: 'Connect a frontend URL (any Replit/Lovable/Bolt/Vercel/custom URL) to the deployed backend. Normalizes the URL, verifies the backend is deployed, pins the deployment version, and gates on a CONNECT confirmation. Use whenever the user names their frontend URL.',
+    what: 'Connect a frontend URL (any Replit/Lovable/Bolt/Vercel/custom URL) to this backend. Normalizes the URL, records the published version when there is one (no publish is needed first), and gates on a CONNECT confirmation. Use whenever the user names their frontend URL.',
     tool: 'connect_frontend',
   },
   {
@@ -355,7 +355,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'trigger_deploy',
     name: 'Deploy the backend (destructive)',
-    what: 'Publish the project so its REST APIs, auth, storage, triggers, and RLS are publicly callable. Runs the readiness gate first; engine returns a "Type DEPLOY" confirmation prompt unless force:true.',
+    what: 'Publish the project so its REST APIs, auth, storage, triggers, and RLS are publicly callable. It waits for a person: the call is queued for the project owner to approve, and the approved call runs the readiness gate and publishes.',
     tool: 'trigger_deploy',
   },
   {
@@ -373,7 +373,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'rollback_deploy',
     name: 'Roll back the deploy (destructive)',
-    what: 'Revert live to a previous published version. Engine returns a "Type ROLLBACK" confirmation prompt unless force:true. Live consumers see the older schema immediately.',
+    what: 'Mark a previous published version as current in the version history. Bookkeeping only: the live schema, data, RLS and functions do not change. It waits for a person: the call is queued for the project owner to approve, and the approved call runs exactly as made.',
     tool: 'rollback_deploy',
   },
   {
@@ -431,7 +431,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'create_api_key',
     name: 'Issue an API key',
-    what: 'Create a platform API key for server-to-server access. Permissions configurable; secret returned once.',
+    what: 'Create a publishable API key for an app, bound by row-level security; returned once. A service-role key is created by a person in Settings, never here.',
     tool: 'create_api_key',
   },
   {
@@ -542,12 +542,8 @@ export const TOOL_CAPABILITIES: Capability[] = [
     what: 'Read AI credits used, storage MB, request count, and plan limits. Use for "how close am I to my plan?".',
     tool: 'get_usage',
   },
-  {
-    id: 'set_alert',
-    name: 'Configure a monitoring alert',
-    what: 'Configure an alert on error rate, p95 latency, request rate, or integration failure. Channel: email + dashboard.',
-    tool: 'set_alert',
-  },
+  // No set_alert capability: nothing evaluates stored alerts, so advertising
+  // one promised a watchdog that can never bark (see lib/mcp/domains.ts).
 
   // ── Autonomy ──────────────────────────────────────────────────────────────
   {
@@ -578,7 +574,7 @@ export const MANUAL_CAPABILITIES: Capability[] = [
   {
     id: 'mcp_connect',
     name: 'Connect an AI coding agent over MCP (top-bar "Connect agent" button)',
-    what: 'Backenly ships a native MCP server (`@backenly/mcp-server` on npm) so Claude Code, Cursor, Codex, or ANY MCP-compatible host can drive this backend directly — this IS the violet "Connect agent" button in the top bar (the Connect page). Setup: (1) open Connect and generate a project-scoped MCP key, (2) for Claude Code run `claude mcp add backenly -- npx -y @backenly/mcp-server --project <projectId> --key <mcpKey>` (other hosts get a copy-paste config snippet on the same page), (3) open a new conversation in the host — Backenly appears as `backenly` in its tool list; an agent that installed it mid-conversation keeps working through `npx -y @backenly/cli@latest call <tool>` until then, and should not stop to ask for a restart. The connected agent gets the same governed vocabulary as this chat (read backend state, build tables/APIs/RLS/realtime, run brain chat); destructive ops like drop_table and delete_bucket are deliberately NOT exposed over MCP and stay confirmation-gated in the dashboard. When a user asks how to connect Claude Code, Cursor, or "their AI assistant", give these steps — NEVER say Backenly has no Claude Code / MCP integration.',
+    what: 'Backenly ships a native MCP server (`@backenly/mcp-server` on npm) so Claude Code, Cursor, Codex, or ANY MCP-compatible host can drive this backend directly — this IS the "Connect agent" button in the top bar, which reads "Agent connected" once their agent is (both open the Connect page). Setup: (1) open Connect and generate a project-scoped MCP key, (2) for Claude Code run `claude mcp add backenly -- npx -y @backenly/mcp-server --project <projectId> --key <mcpKey>` (other hosts get a copy-paste config snippet on the same page), (3) open a new conversation in the host — Backenly appears as `backenly` in its tool list; an agent that installed it mid-conversation keeps working through `npx -y @backenly/cli@latest call <tool>` until then, and should not stop to ask for a restart. The connected agent gets the same governed vocabulary as this chat (read backend state, build tables/APIs/RLS/realtime, run brain chat); destructive ops like drop_table and delete_bucket are deliberately NOT exposed over MCP and stay confirmation-gated in the dashboard. When a user asks how to connect Claude Code, Cursor, or "their AI assistant", give these steps — NEVER say Backenly has no Claude Code / MCP integration.',
     manualOnly: true,
   },
   {

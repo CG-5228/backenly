@@ -20,6 +20,8 @@ jest.mock('@/lib/db/prisma', () => ({
     healthFinding: { findMany: jest.fn(), findFirst: jest.fn() },
     correctionEvent: { count: jest.fn() },
     project: { findUnique: jest.fn() },
+    // The health route also reads the loop's last sensor record.
+    projectPreference: { findUnique: jest.fn().mockResolvedValue(null) },
   },
 }))
 
@@ -75,15 +77,19 @@ describe('getLastLoopTickAt', () => {
     mockPrisma.auditLog.findFirst.mockResolvedValue(null)
     const before = Date.now()
     await getLastLoopTickAt('p1')
+    const after = Date.now()
 
     // audit_logs has no composite [projectId, action, timestamp] index, and the
     // loop adds ~43k rows a month per project. An unbounded ORDER BY on a
     // per-dashboard-load query is the thing this bound exists to prevent.
+    // Bounded from both sides: the cutoff is taken during the call, so measuring
+    // it from `before` alone came out a millisecond short whenever the clock
+    // ticked, and failed CI at random.
     const where = mockPrisma.auditLog.findFirst.mock.calls[0][0].where
-    const since = where.timestamp.gte as Date
-    const lookbackMs = before - since.getTime()
-    expect(lookbackMs).toBeGreaterThanOrEqual(24 * 60 * 60 * 1000)
-    expect(lookbackMs).toBeLessThan(24 * 60 * 60 * 1000 + 5000)
+    const since = (where.timestamp.gte as Date).getTime()
+    const DAY = 24 * 60 * 60 * 1000
+    expect(since).toBeGreaterThanOrEqual(before - DAY)
+    expect(since).toBeLessThanOrEqual(after - DAY)
 
     expect(mockPrisma.auditLog.findFirst.mock.calls[0][0].orderBy).toEqual({
       timestamp: 'desc',

@@ -163,8 +163,8 @@ function Grain() {
    on, the way Linear and Vercel set theirs.
 
    The light is the point of the composition: a cold white key light from the
-   top left, a violet fill behind the film, and a horizon line the film sits
-   on. All static gradients, no blur filters, so it costs nothing per frame.
+   top left, and a violet fill behind the film that its own violet stage
+   dissolves into. All static gradients, no blur filters, so it costs nothing per frame.
 ───────────────────────────────────────────────────────────── */
 
 function Hero() {
@@ -208,7 +208,7 @@ function Hero() {
         <motion.p
           variants={heroItem}
           transition={{ duration: quiet ? 0 : 0.95, ease: EASE_OUT }}
-          className={`mt-7 max-w-[54ch] text-[17px] text-zinc-400 [text-wrap:pretty] md:mt-8 md:text-[20px] ${LEDE}`}
+          className={`relative z-10 mt-7 max-w-[54ch] text-[17px] text-zinc-400 [text-wrap:pretty] md:mt-8 md:text-[20px] ${LEDE}`}
         >
           Real Postgres, APIs, auth, storage, and realtime, driven by your agent over MCP, with
           every change governed, verified, and reversible.
@@ -217,7 +217,9 @@ function Hero() {
         <motion.div
           variants={heroItem}
           transition={{ duration: quiet ? 0 : 0.95, ease: EASE_OUT }}
-          className="mt-9 flex flex-col gap-3 sm:flex-row sm:items-center"
+          // Above the film: its ambient light spreads up this far, and would
+          // otherwise tint the buttons with whatever the film is showing.
+          className="relative z-10 mt-9 flex flex-col gap-3 sm:flex-row sm:items-center"
         >
           <Link href={isLoggedIn ? ROUTES.app : ROUTES.signup} className={PRIMARY_CTA}>
             {isLoggedIn ? 'Go to console' : 'Start free'}
@@ -227,9 +229,6 @@ function Hero() {
             <Icon icon="ri:github-fill" width={18} aria-hidden />
             Star on GitHub
           </a>
-          <span className="mt-1 text-[13px] text-zinc-500 sm:ml-3 sm:mt-0">
-            Free plan, no card. Apache-2.0.
-          </span>
         </motion.div>
 
         <motion.div
@@ -237,18 +236,11 @@ function Hero() {
           transition={{ duration: quiet ? 0 : 1.2, ease: EASE_OUT }}
           className="relative mt-[56px] md:mt-[80px]"
         >
-          {/* The horizon: a lit edge along the top of the frame. */}
-          <div
-            aria-hidden
-            className="pointer-events-none absolute -top-px left-[8%] right-[8%] z-10 h-px bg-[linear-gradient(to_right,transparent,rgba(196,181,253,0.7),rgba(255,255,255,0.9),rgba(196,181,253,0.7),transparent)]"
-          />
-          <div
-            aria-hidden
-            className="pointer-events-none absolute -top-[60px] left-1/2 z-0 h-[120px] w-[70%] -translate-x-1/2 bg-[radial-gradient(closest-side,rgba(167,139,250,0.28),transparent)]"
-          />
-          <div className="relative rounded-[18px] border border-white/[0.08] bg-white/[0.02] p-1.5 shadow-[0_60px_160px_-40px_rgba(0,0,0,1)] sm:p-2">
-            <HeroFilm />
-          </div>
+          {/* No bezel, border or horizon line around it: the film brings its
+              own violet stage and console window, and every frame the page
+              added on top read as a box inside a box. HeroFilm feathers its
+              edges into the page instead. */}
+          <HeroFilm />
         </motion.div>
       </div>
     </motion.section>
@@ -599,7 +591,7 @@ const faqs = [
   },
   {
     q: 'What does it cost?',
-    a: 'Self-hosting is free under Apache-2.0: you bring the servers, and an OpenAI key only if you want the natural-language build tools. The self-healing loop itself runs no model. On Backenly Cloud, the Free plan is genuinely free, with no credit card, and includes a real, permanent backend plus the self-healing loop every minute. Pro is $25/month and raises capacity and how much autonomy may fix per window, not the cadence; Enterprise is custom. Driving the backend from your own coding agent through the typed MCP tools is never metered as AI, and autonomy is included on every Cloud tier.',
+    a: 'Self-hosting is free under Apache-2.0: you bring the servers, and an AI provider key (Claude or OpenAI) only if you want the natural-language build tools. The self-healing loop itself runs no model. On Backenly Cloud, the Free plan is genuinely free, with no credit card, and includes a real, permanent backend plus the self-healing loop every minute. Pro is $25/month and raises capacity and how much autonomy may fix per window, not the cadence; Enterprise is custom. Driving the backend from your own coding agent through the typed MCP tools is never metered as AI, and autonomy is included on every Cloud tier.',
   },
   {
     q: 'If my agent does the building, what is the dashboard for?',
@@ -632,7 +624,7 @@ function FaqSection() {
             Anything else, ask the person who built it.
           </p>
           <div className="mt-7 flex flex-wrap gap-x-6 gap-y-3">
-            <Link href={ROUTES.resources} className={TEXT_LINK}>
+            <Link href={ROUTES.docs} className={TEXT_LINK}>
               Read the docs
               <ArrowRight aria-hidden className="h-4 w-4 transition-transform duration-200 group-hover:translate-x-0.5" />
             </Link>
@@ -724,7 +716,7 @@ function FaqItem({
    Closing
 
    Centred, and the page's last light: a horizon arc rising behind the ask,
-   answering the lit edge the hero film sits on.
+   answering the violet light the hero film opens the page in.
 ───────────────────────────────────────────────────────────── */
 
 function ClosingSection() {

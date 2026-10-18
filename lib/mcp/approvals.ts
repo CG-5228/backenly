@@ -1,31 +1,38 @@
 /**
- * MCP approval escalation — destructive ops become approvable requests
+ * MCP approval escalation — gated calls become approvable requests
  * instead of flat refusals.
  *
  * Flow:
- *   1. backend_chat over MCP hits the brain's destructive gate → the run ends
- *      blocked. The chat route calls `createApprovalRequest` with the danger
- *      details, and the agent receives { approval: { id, status: 'pending' } }.
+ *   1. A call that needs a human (`needsApproval`: destructive, or an executor
+ *      rated high-risk) is stopped before it runs — by the brain's gate under
+ *      backend_chat, or by the MCP tool route for a typed call. The caller
+ *      records it with `createApprovalRequest`: the exact tool and the exact
+ *      arguments. The agent receives { approval: { id, status: 'pending' } }.
  *   2. The human sees the request in the Review Queue (dashboard) and
  *      approves or rejects it.
- *   3. Approval re-runs the ORIGINAL message through the brain with
- *      destructiveConfirmed=true — the same resume path the dashboard chat
- *      uses — and records the outcome on the request row.
+ *   3. Approval runs THAT call verbatim (`runApprovedCall`) — no model, no
+ *      re-reading of the request text — and records the outcome on the row.
  *   4. The agent polls the `check_approval` MCP tool until status is
  *      executed / rejected / failed / expired.
  *
  * Safety invariants:
  *   • Approval authority is platform-JWT only (withProjectAccess) — a scoped
  *     agent key can create and poll requests but can NEVER decide one.
+ *   • What executes is exactly what the human read: the recorded tool and
+ *     arguments, never a re-interpretation of the request text. A request
+ *     without an exact call cannot be executed at all: approving one closes
+ *     it, unrun, with the reason.
  *   • Requests expire (default 24h). Expired requests cannot be approved.
+ *   • A request executes at most once (atomic pending → approved claim).
  *   • Execution happens server-side at decision time, by the approver's
  *     identity, with the standard audit trail.
  */
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
-import { runBrain, type BrainEvent } from '@/lib/ai/brain/agent'
+import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
+import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 
 export const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -64,11 +71,11 @@ export async function createApprovalRequest(input: {
   message: string
   danger: DangerInfo
   /**
-   * The exact arguments for `danger.tool`. When present, approval runs that
-   * call verbatim instead of replaying `message` through the brain, so what
-   * executes is what the human read. MCP domain tools always set it.
+   * The exact arguments for `danger.tool`. Approval runs this call verbatim,
+   * so what executes is what the human read. Required: a request that cannot
+   * name its exact call cannot be approved safely, so it must not be created.
    */
-  toolArgs?: Record<string, unknown>
+  toolArgs: Record<string, unknown>
 }) {
   const row = await prisma.agentApprovalRequest.create({
     data: {
@@ -80,11 +87,15 @@ export async function createApprovalRequest(input: {
       target: input.danger.target.slice(0, 300),
       rowCount: input.danger.rowCount,
       reversible: input.danger.reversible,
-      ...(input.toolArgs ? { toolArgs: input.toolArgs as Prisma.InputJsonValue } : {}),
+      toolArgs: input.toolArgs as Prisma.InputJsonValue,
       expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
     },
   })
 
+  // The request itself keeps its target, which is what the approver reads. The
+  // audit copy of it is left out for a project kept in another region, where
+  // it can name a row or a file (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
@@ -94,7 +105,7 @@ export async function createApprovalRequest(input: {
       details: JSON.stringify({
         approvalId: row.id,
         tool: input.danger.tool,
-        target: input.danger.target,
+        ...(quote ? { target: input.danger.target } : {}),
         rowCount: input.danger.rowCount,
         at: new Date().toISOString(),
       }),
@@ -102,13 +113,96 @@ export async function createApprovalRequest(input: {
     },
   }).catch(() => {})
 
+  // The owner is told. The request waits for them and expires, and it used to
+  // appear only in the Review Queue, so one nobody looked for simply ran out
+  // (AUT-08). Not awaited: a slow mail server must not hold the agent's answer.
+  notifyOwnerOfRequest(row).catch(() => {})
+
   return row
 }
 
-/** Lazily expire on read — no cron needed for correctness. */
-function effectiveStatus(row: { status: string; expiresAt: Date }): string {
-  if (row.status === 'pending' && row.expiresAt < new Date()) return 'expired'
-  return row.status
+/** One notice per burst of requests: see notifyOwnerOfRequest. */
+const NOTICE_COALESCE_MS = 10 * 60 * 1000
+
+async function notifyOwnerOfRequest(row: { id: string; projectId: string; tool: string; target: string; expiresAt: Date }) {
+  const project = await prisma.project.findUnique({ where: { id: row.projectId }, select: { userId: true, name: true } })
+  if (!project?.userId) return
+  // An agent that parks ten calls in a minute sends one notice, not ten: the
+  // Review Queue lists every request. A new notice goes out once the owner has
+  // read the last one, or ten minutes after it.
+  const recent = await prisma.platformNotification.findFirst({
+    where: {
+      userId: project.userId,
+      type: 'approval_requested',
+      readAt: null,
+      createdAt: { gt: new Date(Date.now() - NOTICE_COALESCE_MS) },
+      metadata: { path: ['projectId'], equals: row.projectId },
+    },
+    select: { id: true },
+  })
+  if (recent) return
+  const { notifyApprovalRequested } = await import('@/lib/notifications/platform')
+  await notifyApprovalRequested(project.userId, {
+    projectId: row.projectId,
+    projectName: project.name,
+    approvalId: row.id,
+    tool: row.tool,
+    target: row.target,
+    expiresAt: row.expiresAt,
+  })
+}
+
+/**
+ * Every status a request can carry. `approved` is the moment between the claim
+ * and the outcome. `partial` is no longer written: it came from the replay path
+ * that approval replaced, when one approval could run several changes. Older
+ * rows still carry it, and check_approval reports a row as it was stored.
+ */
+export type ApprovalStatus =
+  | 'pending'
+  | 'approved'
+  | 'executed'
+  | 'rejected'
+  | 'expired'
+  | 'failed'
+  | 'partial'
+
+/**
+ * Grace past EXECUTE_CAP_MS before an 'approved' row is presumed dead. The cap
+ * bounds runApprovedCall itself, so a row still 'approved' this long after the
+ * decision means the terminal update never ran — a crash or restart mid-run.
+ */
+const STUCK_APPROVED_GRACE_MS = 2 * 60 * 1000
+
+const STUCK_APPROVED_SUMMARY =
+  'Execution never reported back within its ten-minute cap — the server likely ' +
+  'restarted mid-run. The outcome is unknown: the operation may have fully or ' +
+  'partially applied. Check the change history before asking the agent to retry.'
+
+/**
+ * Lazily resolve what a row IS on read — no cron needed for correctness.
+ * 'pending' past its TTL is expired. 'approved' is a moment, not a resting
+ * state: decideApproval writes the terminal status when runApprovedCall
+ * returns, so a row stuck there past cap+grace is reported as failed with an
+ * honest summary instead of telling the agent to keep polling forever.
+ */
+function effectiveView(row: {
+  status: string
+  expiresAt: Date
+  decidedAt: Date | null
+  resultSummary: string | null
+}): { status: string; resultSummary: string | null } {
+  if (row.status === 'pending' && row.expiresAt < new Date()) {
+    return { status: 'expired', resultSummary: row.resultSummary }
+  }
+  if (
+    row.status === 'approved' &&
+    row.decidedAt &&
+    Date.now() - row.decidedAt.getTime() > EXECUTE_CAP_MS + STUCK_APPROVED_GRACE_MS
+  ) {
+    return { status: 'failed', resultSummary: row.resultSummary ?? STUCK_APPROVED_SUMMARY }
+  }
+  return { status: row.status, resultSummary: row.resultSummary }
 }
 
 /** Poll shape returned to the agent — never leaks approver identity. */
@@ -117,14 +211,50 @@ export async function getApprovalForProject(projectId: string, id: string) {
     where: { id, projectId },
   })
   if (!row) return null
+  const view = effectiveView(row)
   return {
     id: row.id,
-    status: effectiveStatus(row),
+    status: view.status,
     tool: row.tool,
     target: row.target,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
-    resultSummary: row.resultSummary,
+    resultSummary: view.resultSummary,
+  }
+}
+
+/**
+ * The other kind of parked request: an executor-gated medium/high action the
+ * chat door queued as an `ai_action_pending` HealthFinding (Review Queue,
+ * Autonomy page). check_approval resolves these too, so a parked action has
+ * an id the agent can poll instead of vanishing from its point of view.
+ */
+export async function getParkedActionForProject(projectId: string, id: string) {
+  const row = await prisma.healthFinding.findFirst({
+    where: { id, projectId, type: 'ai_action_pending' },
+  })
+  if (!row) return null
+  const details = (row.details as Record<string, unknown> | null) ?? {}
+  const statusMap: Record<string, string> = {
+    pending_approval: 'pending',
+    applied: 'executed',
+    auto_fixed: 'executed',
+    dismissed: 'rejected',
+    stale: 'expired',
+  }
+  return {
+    id: row.id,
+    kind: 'parked_action' as const,
+    status: statusMap[row.status] ?? row.status,
+    tool:
+      typeof details.executorAction === 'string'
+        ? details.executorAction
+        : typeof details.title === 'string'
+          ? details.title
+          : row.type,
+    target: typeof details.location === 'string' ? details.location : null,
+    createdAt: row.detectedAt.toISOString(),
+    resultSummary: null,
   }
 }
 
@@ -134,25 +264,28 @@ export async function listApprovals(projectId: string) {
     orderBy: { createdAt: 'desc' },
     take: 50,
   })
-  return rows.map((r) => ({
-    id: r.id,
-    status: effectiveStatus(r),
-    tool: r.tool,
-    target: r.target,
-    // Who asked: a coding agent's key, or Backenly itself (a change that failed
-    // its checks and could not be recovered without a person).
-    requestedBy: r.apiKeyId ? ('agent' as const) : ('backenly' as const),
-    // The change a restore request is about, so the inbox can link to it.
-    changeId: r.tool === 'revert_schema_change' ? ((r.toolArgs as { changeId?: string } | null)?.changeId ?? null) : null,
-    rowCount: r.rowCount,
-    reversible: r.reversible,
-    message: r.message,
-    createdAt: r.createdAt.toISOString(),
-    expiresAt: r.expiresAt.toISOString(),
-    decidedAt: r.decidedAt?.toISOString() ?? null,
-    executedAt: r.executedAt?.toISOString() ?? null,
-    resultSummary: r.resultSummary,
-  }))
+  return rows.map((r) => {
+    const view = effectiveView(r)
+    return {
+      id: r.id,
+      status: view.status,
+      tool: r.tool,
+      target: r.target,
+      // Who asked: a coding agent's key, or Backenly itself (a change that failed
+      // its checks and could not be recovered without a person).
+      requestedBy: r.apiKeyId ? ('agent' as const) : ('backenly' as const),
+      // The change a restore request is about, so the inbox can link to it.
+      changeId: r.tool === 'revert_schema_change' ? ((r.toolArgs as { changeId?: string } | null)?.changeId ?? null) : null,
+      rowCount: r.rowCount,
+      reversible: r.reversible,
+      message: r.message,
+      createdAt: r.createdAt.toISOString(),
+      expiresAt: r.expiresAt.toISOString(),
+      decidedAt: r.decidedAt?.toISOString() ?? null,
+      executedAt: r.executedAt?.toISOString() ?? null,
+      resultSummary: view.resultSummary,
+    }
+  })
 }
 
 export async function decideApproval(input: {
@@ -166,13 +299,13 @@ export async function decideApproval(input: {
   })
   if (!row) return { ok: false, status: 'missing', error: 'Approval request not found' }
 
-  const current = effectiveStatus(row)
+  const current = effectiveView(row).status
   if (current !== 'pending') {
     return { ok: false, status: current, error: `Request is ${current}, not pending` }
   }
 
-  // A restore rewrites production, so approving one takes the same authority
-  // as running one from the console: admin rights on the project, not access.
+  // A restore rewrites production, so deciding one takes the same authority as
+  // running one from the console: admin rights on the project, not access.
   // Declining one is a decision too (it keeps a change that failed its checks),
   // so it takes the same.
   if (row.tool === 'revert_schema_change') {
@@ -187,7 +320,7 @@ export async function decideApproval(input: {
       where: { id: row.id },
       data: { status: 'rejected', decidedBy: input.approverUserId, decidedAt: new Date() },
     })
-    await auditDecision(input, row.tool, row.target, 'rejected')
+    await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_REJECTED')
     // Declining to restore a change that failed its checks is a decision to
     // keep it. A no-op for a change that was not waiting on one (an agent
     // asking to restore a healthy change, say).
@@ -201,6 +334,34 @@ export async function decideApproval(input: {
     return { ok: true, status: 'rejected' }
   }
 
+  // A request that does not name its exact call cannot be executed safely:
+  // the only thing left to run would be the request's MESSAGE, and replaying a
+  // message runs whatever the model chooses, not the operation the human read.
+  // Such rows predate exact-call approvals. Close them, unrun, and say why.
+  const exactArgs = row.toolArgs
+  const isExact = !!exactArgs && typeof exactArgs === 'object' && !Array.isArray(exactArgs)
+  if (!isExact) {
+    const summary =
+      'Not executed. This request was raised before approvals were bound to one exact operation, ' +
+      'so approving it could not guarantee that what ran is what you read. Nothing was changed. ' +
+      'Ask the agent to request the operation again; the new request will carry the exact call.'
+    const closed = await prisma.agentApprovalRequest.updateMany({
+      where: { id: row.id, status: 'pending' },
+      data: {
+        status: 'failed',
+        decidedBy: input.approverUserId,
+        decidedAt: new Date(),
+        resultSummary: summary,
+      },
+    })
+    if (closed.count === 0) {
+      const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
+      return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
+    }
+    await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_UNBOUND_REFUSED')
+    return { ok: false, status: 'failed', resultSummary: summary }
+  }
+
   // Claim atomically so a double-click / second tab cannot execute twice.
   const claimed = await prisma.agentApprovalRequest.updateMany({
     where: { id: row.id, status: 'pending' },
@@ -210,176 +371,58 @@ export async function decideApproval(input: {
     const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
     return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
   }
-  await auditDecision(input, row.tool, row.target, 'approved')
+  await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_GRANTED')
 
-  // Every schema change the approved work makes is recorded as the approver's
-  // decision on the agent's request, so the change history can say both.
-  const { withChangeAttribution } = await import('@/lib/changes/ledger')
-  return withChangeAttribution(
+  // The exact call, verbatim. The approver's identity carries the authority;
+  // `destructiveConfirmed` tells the executor its own confirmation gate is
+  // already satisfied for THIS call, which a human just read and approved.
+  // Every change it makes to production is recorded as the approver's decision
+  // on the requester's call (lib/changes/attribution.ts), so the change history
+  // can say both.
+  const { withChangeAttribution } = await import('@/lib/changes/attribution')
+  const outcome = await withChangeAttribution(
     { source: 'approval', actorUserId: input.approverUserId, apiKeyId: row.apiKeyId },
-    () => executeApproved(input, row),
-  )
-}
-
-async function executeApproved(
-  input: { projectId: string; approvalId: string; approverUserId: string },
-  row: Awaited<ReturnType<typeof prisma.agentApprovalRequest.findFirstOrThrow>>,
-): Promise<{ ok: boolean; status: string; error?: string; resultSummary?: string }> {
-  // An exact call runs verbatim. Only requests without one (raised by
-  // backend_chat from prose) replay their message through the brain below.
-  const exactArgs = row.toolArgs
-  if (exactArgs && typeof exactArgs === 'object' && !Array.isArray(exactArgs)) {
-    const outcome = await runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
+    () => runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
       projectId: input.projectId,
       userId: input.approverUserId,
       sessionToken: undefined,
       destructiveConfirmed: true,
       createdThisTurn: new Set<string>(),
-    })
-    await prisma.agentApprovalRequest.update({
-      where: { id: row.id },
-      data: { status: outcome.status, executedAt: new Date(), resultSummary: outcome.summary.slice(0, 2000) },
-    })
-    return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
-  }
-
-  // Execute: replay the original message with destructive confirmation — the
-  // exact resume path the dashboard confirmation card uses.
-  //
-  // ── `executed` must mean "and here is what changed" ─────────────────────────
-  //
-  // The status was derived from `result.success` alone, so it carried no
-  // information about what actually happened to the schema. Two failure modes
-  // followed, in opposite directions (defect #8):
-  //
-  //   • `executed` on a run that succeeded overall while doing something OTHER
-  //     than what was asked — the report saw owner-only auto RLS recorded as a
-  //     successful custom-policy application.
-  //   • `failed` on a run that had already APPLIED part of its plan before
-  //     stopping — "Approved but execution failed" on a request that had removed
-  //     the old policies and re-applied some of them.
-  //
-  // In both cases the truth was in the event stream and was thrown away. The
-  // events are now scanned for mutations that landed, a `partial` status is
-  // recorded when some did and the run still failed, and the applied list is
-  // written into the summary the agent polls. An agent that knows three of five
-  // steps landed can finish the job; one told only "failed" replays the whole
-  // thing.
-  const events: BrainEvent[] = []
-  let summary = ''
-  let ok = false
-  let timedOut = false
-
-  // Same abort-survival accounting as the chat route: an approved replay that
-  // overruns EXECUTE_CAP_MS has still spent the tokens, and the rejected race
-  // means `result` is never readable on that path.
-  let spentTokens = 0
-  let charged = false
-  const chargeOnce = () => {
-    if (charged || spentTokens <= 0) return
-    charged = true
-    import('@/lib/entitlements/policy')
-      .then(({ chargeAiCredits }) => chargeAiCredits(input.approverUserId, spentTokens))
-      .catch(() => {})
-  }
-
-  try {
-    const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        timedOut = true
-        reject(new Error(`Approved execution exceeded ${Math.round(EXECUTE_CAP_MS / 1000)}s`))
-      }, EXECUTE_CAP_MS).unref?.()
-    })
-    const result = await Promise.race([
-      runBrain(
-        {
-          projectId: input.projectId,
-          userId: input.approverUserId,
-          message: row.message,
-          sessionToken: undefined,
-          destructiveConfirmed: true,
-          onTokens: (n) => { spentTokens += n },
-        },
-        (e) => events.push(e),
-      ),
-      timeout,
-    ])
-    ok = result.success
-    summary = result.summary
-    // Approval replay runs the brain again — a second full model loop on our
-    // key — so it is charged like any other turn. Without this, escalating a
-    // destructive request through the Review Queue would be a free way to spend
-    // our OpenAI budget.
-    spentTokens = Math.max(spentTokens, result.tokensUsed)
-    chargeOnce()
-  } catch (err: any) {
-    chargeOnce()
-    ok = false
-    summary = err?.message ?? 'Execution failed'
-  }
-
-  const applied = appliedMutations(events)
-
-  // `partial` is a distinct terminal status, not a flavour of failed. A caller
-  // that sees `failed` may safely assume nothing changed; on a partial run that
-  // assumption is false and acting on it double-applies.
-  const status = ok ? 'executed' : applied.length > 0 ? 'partial' : 'failed'
-
-  const detail =
-    status === 'executed'
-      ? summary
-      : status === 'partial'
-        ? `${summary}\n\n⚠️ PARTIALLY APPLIED — ${applied.length} change(s) DID take effect before the run ` +
-          `stopped: ${applied.join('; ')}.\nDo NOT replay the original request; verify the current state with ` +
-          `get_table_schema / read_backend_state and ask for only what is still missing.` +
-          (timedOut ? `\nThe run hit its ${Math.round(EXECUTE_CAP_MS / 1000)}s execution budget.` : '')
-        : `${summary}\n\nNothing was applied — the backend is in the state it was before approval.`
-
+    }),
+  )
+  // The approver gets the full result now. What is stored for later readers is
+  // the status alone for a project kept in another region, whose result can
+  // quote its rows (lib/data-plane/residency.ts).
+  const stored = (await quotesKeptHere(input.projectId)) ? storableResultSummary(outcome.summary) : NOT_QUOTED
   await prisma.agentApprovalRequest.update({
     where: { id: row.id },
-    data: {
-      status,
-      executedAt: new Date(),
-      resultSummary: detail.slice(0, 2000),
-    },
+    data: { status: outcome.status, executedAt: new Date(), resultSummary: stored },
   })
-
-  return { ok, status, resultSummary: detail }
+  return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
 
-/**
- * Mutations from a brain run that actually landed.
- *
- * Read-only tools are excluded by prefix rather than by an allowlist of writers,
- * so a tool added later is treated as a mutation until proven otherwise — the
- * safe direction for a function whose job is to warn that something changed.
- */
-const NON_MUTATION_TOOL = /^(read_backend_state|get_|list_|check_|run_query|run_test|finish|answer_question|propose_plan|ask_user)/
-
-function appliedMutations(events: BrainEvent[]): string[] {
-  const out: string[] = []
-  for (const e of events) {
-    if (e.type !== 'tool_done') continue
-    const tool = (e as any).tool as string | undefined
-    if (!tool || NON_MUTATION_TOOL.test(tool)) continue
-    out.push((e as any).title || tool)
-  }
-  return out
-}
+type ApprovalAuditAction =
+  | 'AGENT_APPROVAL_GRANTED'
+  | 'AGENT_APPROVAL_REJECTED'
+  /** Approved, but the request named no exact call, so nothing was run. */
+  | 'AGENT_APPROVAL_UNBOUND_REFUSED'
 
 async function auditDecision(
   input: { projectId: string; approverUserId: string; approvalId: string },
   tool: string,
   target: string,
-  decision: string,
+  action: ApprovalAuditAction,
 ) {
+  // No copy of the target for a project kept in another region: the request
+  // row has it (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
       userId: input.approverUserId,
-      action: decision === 'approved' ? 'AGENT_APPROVAL_GRANTED' : 'AGENT_APPROVAL_REJECTED',
+      action,
       type: 'mcp',
-      details: JSON.stringify({ approvalId: input.approvalId, tool, target, at: new Date().toISOString() }),
+      details: JSON.stringify({ approvalId: input.approvalId, tool, ...(quote ? { target } : {}), at: new Date().toISOString() }),
       timestamp: new Date(),
     },
   }).catch(() => {})
@@ -423,11 +466,32 @@ export async function runApprovedCall(
           `Nothing was applied. Raise the request again once whatever it asks for is in place.`,
       }
     }
-    return { status: 'failed', summary: `${result.summary}\n\nThe approved call reported failure; nothing was applied.` }
+    // Not "nothing was applied": a deploy, a merge or a data migration can stop
+    // part-way, and nothing here can tell which of its steps took effect.
+    return {
+      status: 'failed',
+      summary:
+        `${result.summary}\n\nThe approved call reported failure. Whether any part of it took effect ` +
+        `is not known here, so read the current state before raising it again.`,
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { status: 'failed', summary: `${message}\n\nThe approved call did not complete. Read the current state before asking again.` }
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+/**
+ * A result summary as it may be PERSISTED.
+ *
+ * `resultSummary` is served forever: `listApprovals` hands it to every project
+ * member on the Review Queue, and `check_approval` hands it to the agent's key.
+ * An executor summary can carry a credential — executeRotateKey prints the new
+ * key under "copy now — shown once" — and storing that summary made "once"
+ * mean "until the row is deleted". The live response to the approving admin
+ * keeps the raw summary; what is stored never may.
+ */
+export function storableResultSummary(summary: string): string {
+  return withholdSecrets(summary).slice(0, 2000)
 }

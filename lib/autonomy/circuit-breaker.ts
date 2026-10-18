@@ -123,7 +123,9 @@ function windowMinutes(): number {
 export const AUTONOMOUS_AUDIT_ACTIONS = [
   'HEALTH_AUTO_FIXED',          // auto-fix-engine._executeAutoFix
   'FIX_PLAN_AUTO_EXECUTED',     // auto-fix-engine.runFixPlan
-  'AGENT_AUTO_FIXED',           // agent-orchestrator.executeAutoFixes
+  // The retired agent orchestrator. No longer written; kept so its historic
+  // rows still appear in feeds, where they read as applied but not verified.
+  'AGENT_AUTO_FIXED',
 ] as const
 
 /**
@@ -221,8 +223,8 @@ export async function checkBreaker(projectId: string): Promise<BreakerDecision> 
  *
  * Paths that already write a recognised AUTONOMOUS_AUDIT_ACTIONS row on success
  * (auto-fix-engine) do NOT need to call this — their existing audit write is
- * the ledger entry. Paths that previously wrote nothing (agent-orchestrator)
- * call this so every autonomous action is counted consistently.
+ * the ledger entry. A path that writes no such row of its own calls this, so
+ * every autonomous action is counted consistently.
  */
 export async function recordAutonomousAction(
   projectId: string,

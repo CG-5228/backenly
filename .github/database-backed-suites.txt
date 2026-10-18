@@ -37,11 +37,37 @@ tests/bench/prisma-uuid-binding.spec.ts
 tests/build-runs/build-run-service.test.ts
 tests/build-runs/hydration.test.ts
 tests/integration/mcp-oauth-flow.spec.ts
+tests/integration/mcp-direct-access-url.spec.ts
+tests/integration/mcp-transport-hygiene.spec.ts
 tests/integration/webhook-delivery.spec.ts
+tests/integration/webhook-trigger-url-required.spec.ts
+tests/integration/state-webhooks-section.spec.ts
+tests/integration/integrations-auto-wiring.spec.ts
 tests/integration/end-user-email-verification-opt-in.spec.ts
 tests/integration/signin-enumeration.spec.ts
 tests/integration/project-smtp-and-templates.spec.ts
 tests/integration/storage-bucket-policy.spec.ts
+tests/integration/storage-runtime-policy.spec.ts
+tests/integration/function-off-switch.spec.ts
+tests/integration/function-create-truthful.spec.ts
+tests/integration/function-selfheal-consent.spec.ts
+tests/integration/function-egress-guard.spec.ts
+tests/integration/function-row-events-data-plane.spec.ts
+tests/integration/project-route-response-shape.spec.ts
+tests/integration/realtime-sse-slot-release.spec.ts
+
+# Connect auto-wiring does what its receipt lists: Stripe adds the payment
+# columns and registers a webhook handler in the one shape the receiver fires,
+# email providers wire the on_signup welcome trigger only where auth exists,
+# and every connect syncs activeIntegrations. The live provider probe and the
+# LLM generator are the two stubbed seams; vault, executor and DDL are real.
+tests/integration/integrations-autowiring.spec.ts
+# Realtime surfaces CI can honestly cover: SSE tickets burn in the project's
+# real _token_blacklist ledger (single-use, expiry, project binding) and the
+# broadcast route enforces its payload cap over a real pg_notify. Frame
+# delivery through the LISTEN hub stays a staging case.
+tests/integration/realtime-ticket-broadcast.spec.ts
+tests/integration/export-database-rls.spec.ts
 tests/integration/postgres-admin.spec.ts
 
 # Needs a real Postgres AND a git worktree of an older release.
@@ -72,6 +98,7 @@ tests/integration/rate-limit-shared-store.spec.ts
 
 __tests__/projects/deletion-transaction.test.ts
 __tests__/projects/purge-outbox.test.ts
+tests/integration/project-deletion-complete.spec.ts
 
 # The ProjectResolver regression matrix (commit 2). Pins the behaviour the ~70
 # authorization call sites are being migrated TO, before they are migrated, so
@@ -101,6 +128,140 @@ __tests__/auth/project-routes-authorization.test.ts
 # project owns and there is no undo, so the VIEWER/DEVELOPER/ADMIN/OWNER matrix
 # gets its own suite rather than being folded into the general route tests.
 __tests__/auth/project-delete-authorization.test.ts
+
+# Workspace OAuth client credentials (end-user social sign-in). The routes took
+# the project from the x-project-id header after requireAuth and nothing else,
+# so any signed-in account could list, replace or delete another project's OAuth
+# client. Pins the role ladder: stranger nothing (404, no existence oracle),
+# VIEWER read, DEVELOPER save, ADMIN delete. Real sessions, real resolver, real
+# membership rows.
+__tests__/auth/workspace-oauth-authorization.test.ts
+
+# The workspace ZIP download had the same shape: authenticated, then the header
+# project id trusted. Pins that the guard is getCurrentProjectId like its
+# workspace/files siblings: 401 / 403 / 404 / 400 before any disk access, and an
+# authorized caller reaches the route's own disk lookup.
+__tests__/auth/workspace-download-authorization.test.ts
+
+# The catalog routes (schemas, indexes, relationships) read only the named
+# project's own schemas, from its own database: a second tenant's schema,
+# real and populated beside the first, is never listed and is refused 403 when
+# named; the platform view is refused; the project's own answers are real.
+__tests__/auth/catalog-routes-own-schema.test.ts
+
+# Next's own /api/v1/{projectId} routes (end-user auth, healthz, and every route
+# recordedV1 wraps) answer a locked or paused project with the runtime gate's
+# 503, codes and words, and reach their handlers again once it serves.
+tests/integration/next-routes-serving-gate.spec.ts
+
+# Credential surfaces are held to a role, not to membership. The Connect page's
+# routes (mint/revoke MCP keys, read/provision/rotate direct Postgres
+# credentials, full pg_dump export) authorized with withProjectValidation alone,
+# so a Cloud organization VIEWER could mint a full-write mcp_live_ key or
+# exfiltrate the tenant. Pins the floor: VIEWER/DEVELOPER 403 with no side
+# effect, ADMIN/OWNER allowed, masked key list stays a VIEWER read, and
+# single-tenant operators unaffected. Real sessions, resolver and guard.
+__tests__/auth/connect-credential-authorization.test.ts
+
+# Provider secrets: the platform AuthProvider collection is admin-only and
+# redacted, and per-project deploy-provider credentials are ADMIN-floored with
+# the decrypted material never leaving the server (INT-11 / INT-12).
+tests/integration/provider-credential-floors.spec.ts
+# Settings API keys are a PROJECT surface (admins see and revoke agent keys,
+# ex-members do not), and the withProjectAccess routes carry explicit floors:
+# share-report ADMIN, Supabase import DEVELOPER (SET-03 / SET-04).
+tests/integration/settings-keys-and-floors.spec.ts
+
+# Operate decisions (approve a parked agent request, run or undo a repair,
+# dismiss findings, set the autonomy dial, grant Tier-2 maintenance consent,
+# create/merge/discard branches, publish) authorized membership only, so a Cloud
+# VIEWER could be the "human approval" the safety model hinges on. Pins the
+# floors: DEVELOPER for build-grade decisions, ADMIN for approvals, consent,
+# merge and rollback; reads stay VIEWER; single-tenant operators unaffected.
+__tests__/auth/operate-role-floors.test.ts
+# Blocking an end user must flip the row. The workspace users table is FORCE
+# row-level security, and BLOCK_USER/UNBLOCK_USER ran their UPDATE with no
+# claims, so under the production app role every approved block answered "not
+# found" and changed nothing. Pins the FORCE premise under a non-superuser
+# role, that the executor takes the service-role claims path, and the real
+# row flip both ways through the real executor door.
+__tests__/auth/block-user-rls.test.ts
+# A blocked end user's token is refused at request time under the app role.
+# The runtime's resolver and Next's v1 middleware read users.is_blocked with no
+# claims, which FORCE row-level security answers with no row for a
+# non-bypassing role, so the token was accepted. Pins the premise and both
+# checks with the project's client running as such a role.
+__tests__/auth/blocked-token-under-app-role.test.ts
+# Every other path that takes or issues an end-user token applies revocation
+# and blocking, under the same non-bypassing role: Next's v1 middleware reads a
+# token in Authorization as the runtime does, the storage download and
+# accept-invite resolve theirs through the shared check (accept-invite reading
+# the email as the service role), OAuth, magic-link and reset sign-ins refuse a
+# blocked user and still sign the others in, and the function runner gives a
+# revoked or blocked token no identity. Real users, link and teams tables, and
+# the real flows, are the property.
+__tests__/auth/end-user-token-paths.test.ts
+# ENABLE_REALTIME answered "Realtime active" for tables that never streamed: a
+# failed CREATE TRIGGER (missing/wrong-case table) was a footnote under the
+# banner, a refused table (internal, auth-managed users) was listed under
+# "Enabled by this call", and an empty project got "active for 0 table(s)".
+# Pins failure codes, refusal reasons, catalog read-back gating, the skipped
+# ledger on project-wide calls, and the honest empty-project answer.
+__tests__/services/realtime-enable-honesty.test.ts
+# The dashboard's Insert/Edit/Delete row buttons ran bare prisma writes, which
+# FORCE row-level security refuses under the production app role — the better
+# the agent's RLS, the more broken the data grid. getTableRows was fixed to
+# read as owner; the writes were not. Pins the refusal premise under a
+# non-superuser role, all three writes through the service-role machinery
+# (environment-independent mechanism pin), and the real row effects.
+__tests__/database/dashboard-row-writes-rls.test.ts
+
+# A realtime change reaches a subscriber only if that subscriber could select
+# the row: a real own-rows policy, two end users, anonymous and service-role
+# subscribers, deletes reduced to the key, and a table without a primary key.
+__tests__/database/realtime-row-visibility.test.ts
+# Schema snapshots stored ZERO tables (the parser expected a format the
+# introspector never emitted), so the History snapshot view was always empty
+# and rollback diffed two empty sets and reported "Dropped 0 table(s)" as
+# success. Pins catalog-true snapshots (columns, types, uniques, defaults,
+# FKs), a real rollback that names what it dropped, the users-table guard,
+# honest failure when dropped structure cannot be recreated, and the no-diff
+# answer.
+__tests__/database/schema-version-snapshots.test.ts
+
+# Monitoring read what nothing writes: metrics/errors read the Log table (its
+# only writers are platform auth events with no projectId) and told every
+# project "No API metrics available yet" / "Your APIs are running smoothly"
+# while api_request_logs held the traffic and the 500s; the Logs tab was empty
+# forever. Pins metrics/errors derived from the runtime record (branch rows
+# excluded, windows honoured, session-timezone-proof bounds) and the explorer
+# serving the union of both stores with working filters and DB-side counts.
+__tests__/monitoring/monitoring-truth.test.ts
+
+# Trigger webhooks fired a RAW fetch on the stored URL from the web process and
+# persisted the failure text — an SSRF primitive with a persistence layer,
+# readable back over MCP — while endpoint webhooks had already moved to
+# safeFetch. And syncWebhookCapture's "after a table is added" contract had no
+# caller on any creation path, so webhooks never saw rows in newer tables.
+# Pins guard-validated creation, guarded delivery (raw fetch never touched),
+# the capped stored failure, and the capture sync on CREATE_TABLE.
+__tests__/services/trigger-webhook-egress.test.ts
+# ApiKey.permissions was written by set_key_permissions and the key editor but
+# never read by the data plane: /api/v1 db and /api/v2 served writes to any
+# valid key, so narrowing a leaked key to ['read'] changed nothing while the
+# tool answered "permissions updated". Pins the method gate on BOTH doors
+# (read-only refused on writes with INSUFFICIENT_KEY_PERMISSIONS, read+write
+# and service-role unaffected) and that SET_KEY_PERMISSIONS over the real
+# executor takes effect on the very next request. Real server, real socket.
+tests/integration/key-permission-gate.spec.ts
+# A parked branch merge replayed the migration log as it was at EXECUTION time,
+# so an agent could park an innocent merge and append statements before the
+# human clicked approve — breaking the approvals contract "what executes is
+# exactly what the human read". Pins the approved statement list frozen into
+# the request: a grown log refuses MERGE_STALE (unit and end-to-end through
+# createApprovalRequest/decideApproval), a matching log merges, and the
+# console's unpinned live-diff merge is unchanged.
+__tests__/branches/merge-approval-freeze.test.ts
 
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
@@ -311,6 +472,12 @@ __tests__/auth/ai-workspace-tenant-isolation.test.ts
 # privilege escalation and 2FA bypass. Separates WHO may touch a record from
 # WHICH fields they may set: self-service must not become self-promotion.
 __tests__/auth/user-record-authorization.test.ts
+
+# DELETE on the same route checked only that the caller was signed in, so any
+# account could delete any other with every project it owned. Admin only now,
+# and not self-service (that is /api/auth/delete-account). Calls the real
+# handler; two-sided.
+__tests__/auth/user-delete-authorization.test.ts
 # A fresh install must not fill its log with errors about a non-event. The
 # autonomy sweep purges end-user auth tables that do not exist until a project
 # enables auth; its information_schema pre-check treated an EMPTY answer as a
@@ -318,6 +485,20 @@ __tests__/auth/user-record-authorization.test.ts
 # the output from a SUBPROCESS: an in-process capture saw nothing and passed
 # identically against the bug.
 __tests__/services/fresh-install-auth-purge.test.ts
+
+# Every "fixed" claim comes from a recorded, re-checked outcome: /health says
+# how each finding closed and counts only confirmed repairs, POST /health only
+# dismisses, the away digest and event feed mark unconfirmed changes as such
+# and claim no rollback, and the loop's sensor record names checks that could
+# not run. Real findings, audit rows and preferences are the property.
+tests/integration/fixed-claims-from-verified-state.spec.ts
+
+# Support cases at the real routes: owner-scoped reads and writes (another
+# account's case is 404), the paid-plan severity gate, the status machine
+# (reply reopens, closed refuses), the AI first responder recording
+# replied/unavailable/failed truthfully, and 404 CLOUD_ONLY_FEATURE off Cloud.
+# Case rows, thread rows and the in-app notification are the property.
+tests/integration/support-center.spec.ts
 
 # Five destructive routes that did not check who was asking. Three had NO
 # authentication at all - anyone reaching the server could roll back a live
@@ -438,6 +619,17 @@ tests/integration/selfhost-failed-migration.spec.ts
 # entrypoint, real Prisma CLI, real PostgreSQL. Needs CREATE DATABASE/ROLE.
 tests/integration/migration-ownership-recovery.spec.ts
 
+# ── Regional database initialisation ────────────────────────────────────────
+#
+# tools/managed-db/regional/bootstrap.sh, run from a copy of exactly the files
+# its image carries, against a PostgreSQL 16 cluster the suite creates with
+# initdb and throws away: the procedure creates cluster-wide roles by their real
+# names, so it cannot share the service database. An administrator that is not
+# a superuser, like the RDS master, then owns what was installed, and the
+# application's own paths run against it. Needs PostgreSQL 16 server binaries
+# (PG_BINDIR) and, in CI, pgvector; it fails rather than skips without them.
+tests/integration/regional-bootstrap.spec.ts
+
 # ── Credential rotation ─────────────────────────────────────────────────────
 #
 # A rotation proven only by "the new password works" is not proven: the point of
@@ -541,6 +733,8 @@ tests/integration/project-activity-clock.spec.ts
 # approves it. Runs as the cloud edition with only the plan lookup supplied,
 # because the single-tenant resolver rightly refuses a database of many projects.
 tests/integration/mcp-domain-operations.spec.ts
+tests/integration/dbtools-secret-redaction.spec.ts
+tests/integration/overview-truthful-counts.spec.ts
 
 # Sandbox function runs lost every ctx.log line, after a success and after a
 # failure: the worker sends them in the message that ends the run, and the
@@ -548,6 +742,10 @@ tests/integration/mcp-domain-operations.spec.ts
 # real executor and worker, and checks the persisted run record.
 tests/integration/sandbox-function-logs.spec.ts
 tests/integration/apply-migration-existing-table.spec.ts
+
+# Failed migration DDL preserves PostgreSQL data and stops without asking the
+# model to substitute a different action. Uses real projects, rows and catalogs.
+tests/integration/apply-migration-dispatch.spec.ts
 # MCP acceptance (scripts/mcp-acceptance/cases.ts): two agent workflows, twice
 # each, and the acceptance cases no other suite covered. Real MCP route, real
 # keys, provisioned projects, runtime engine mode.
@@ -559,10 +757,72 @@ tests/integration/mcp-acceptance-cases.spec.ts
 # hardcoded 10 GB on the S3 path, and never a client-supplied storageUsed.
 __tests__/storage/storage-quota-follows-plan.test.ts
 
+# The nightly cleanup sweep destroyed live data two ways: an "incomplete
+# uploads" step that soft-deleted 100 arbitrary active rows per run without ever
+# checking storage, and an orphan sweep whose known-paths set excluded
+# soft-deleted rows, so files inside the 7-day recovery window had their objects
+# physically destroyed. Pins: active files untouched, retention honoured both
+# ways, fresh objects/rows spared by grace windows, dryRun inert. Real database;
+# S3 is the injected in-memory double the function signature exists for.
+__tests__/storage/storage-lifecycle-cleanup.test.ts
+# Bucket visibility must be TRUE: create_bucket/set_public wrote only the
+# isPublic label while serving, upload clamping and the console enforce
+# accessPolicy, so the agent was told "now private" after a leak while every
+# object kept serving to anonymous callers. Pins both fields written together,
+# the lock-down of a diverged legacy bucket, and read-backs (create message,
+# set_public, list_buckets) reporting the ENFORCED policy via the real mayRead.
+__tests__/storage/bucket-visibility-truth.test.ts
+
 # The usage ledger counts every metered quantity exactly once: batches applied
 # with an exactly-once id, a failed or ambiguous flush retried without double
 # counting, a SIGTERM spool replayed once, and an insert-only monthly close.
 __tests__/usage/usage-ledger.test.ts
+
+# AI spend: concurrent reservations from separate connections cannot pass a
+# monthly limit, settled and unknown spend count against it, deployment-paid
+# calls are held against both budgets, and each reservation settles once
+# (charged, released or booked as unknown), with abandoned ones expiring as
+# unknown. Row locks are the property, so it needs a real Postgres.
+tests/integration/ai-spend-ledger.spec.ts
+
+# The brain on the AI gateway, end to end with a scripted model: what each call
+# sends, every tool call answered in one turn with thinking carried back, credits
+# in cost-weighted tokens, usage rows per call, and the approval gate, cut-off,
+# deadline and no-provider paths. It reads and writes the project, its
+# workspace schema and its conversation, so it needs a real Postgres.
+tests/integration/brain-on-gateway.spec.ts
+
+# /v1/{projectId}/ai/generate: model names resolve to the deployment's aliases,
+# the output is capped, the project's credits gate and pay for it, and a provider
+# failure answers with a code and plain words. It reads the project and writes
+# its usage row, so it needs a real Postgres.
+tests/integration/runtime-generate.spec.ts
+
+# Escalated findings: the deterministic investigation first, then the model
+# investigator with real read-only probes, a checked hypothesis stored as one,
+# once per evidence, with backoff after failures. The probes read the
+# project's catalog, so it needs a real Postgres.
+tests/integration/escalation-investigation.spec.ts
+
+# The first AI repair class end to end: a lab fault, a bound proposal, a person's
+# approval of that exact version, governed execution checked three ways, Undo,
+# and the stale, double-approval, ineligible and resolve_finding guards. It
+# alters a workspace table and restores it, so it needs a real Postgres.
+tests/integration/ai-fix-proposals.spec.ts
+
+# The lab's AI arm: each fault seeded, broken, filed by its canonical detector
+# and handed to the investigator (a scripted model), measured as gates (no
+# unapproved mutation, no false "fixed", no model call on a healthy backend
+# with nothing escalated)
+# separately from utility. It seeds and alters lab schemas, so it needs a real
+# Postgres.
+tests/integration/ai-lab-arm.spec.ts
+
+# AI credit holds: a customer-paid call's worst case held on the account's usage
+# row before it is sent, one conditional update so racing calls cannot both
+# take the last credits, released on settle, stale after a crash, never a
+# charge. The row and the race are real, so it needs a real Postgres.
+tests/integration/ai-credit-holds.spec.ts
 
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
@@ -627,14 +887,149 @@ tests/integration/last-login-id-type.spec.ts
 
 # The contract probe is exempt from the end-user auth limits only with the
 # internal-traffic token AND a reserved address; every other combination,
-# and every customer, keeps the 10-per-window budgets. The routes' own check
+# and every customer, keeps the published budgets. The routes' own check
 # order against a real workspace is the property, so it needs a real Postgres.
 tests/integration/probe-auth-rate-limit.spec.ts
+
+# End-user sign-in budgets failures, not sign-ins, on both runtimes: a shopper
+# signing in repeatedly, and many shoppers behind one address, are never
+# refused, while ten wrong passwords still lock an account and thirty from one
+# address still refuse it. Real routes, bcrypt and workspace users tables are
+# the property, so it needs a real Postgres.
+tests/integration/end-user-signin-counts-failures.spec.ts
+
+# End-user sign-up lets a shared address bring in more customers than the old
+# limit of ten, and still refuses the eleventh "already registered" answer (the
+# existence oracle) on both runtimes; Backenly's probe is exempt only with its
+# signed token. Real routes and workspace users tables are the property, so it
+# needs a real Postgres.
+tests/integration/end-user-signup-limit.spec.ts
 tests/integration/go-live-empty-guard.spec.ts
 
 # One-time tours remain caller-scoped, idempotent and unavailable until their
 # migration is applied, so a missing table never repeats the tour.
 tests/integration/tours-seen.spec.ts
+
+# The auth email policy is reachable from the agent's auth tool and from the
+# Auth page, through one service, and neither door can turn verification on
+# while no sender exists: real MCP keys, a real session cookie, real workspace
+# DDL for the grandfathered email_verified column.
+tests/integration/auth-email-policy.spec.ts
+
+# rotate_trigger_secret keeps its advertised contract: the docs print the
+# declared triggerName-or-triggerId alternative instead of "nothing", the
+# new secret rides data.secret and really rotates the row, and a call with
+# neither argument still refuses. A real AppTrigger row is the property.
+tests/integration/rotate-secret-contract.spec.ts
+# Webhook capture and delivery fail loudly or not at all: the sync names the
+# tables it could not capture and both callers surface them, and a PENDING
+# delivery whose first attempt died is swept to a real retry while a fresh
+# one is left alone. Real capture triggers, webhook rows and a live local
+# receiver (behind the per-test egress opt-in) are the property.
+tests/integration/webhook-capture-truth.spec.ts
+# No surface claims an alert that can never fire: SET_ALERT refuses honestly
+# and stores nothing, the brain no longer offers set_alert (matching the MCP
+# door's removal), and prompts/capabilities stopped advertising it. A real
+# project row proves nothing is written.
+tests/integration/monitoring-alerts-honesty.spec.ts
+# The Webhooks console reads the same AppTrigger / TriggerDeliveryLog rows the
+# MCP webhooks tool writes, the trigger list never serves the signing secret,
+# and a dead delivery replays for real against a live receiver. Real rows and
+# a real local HTTP receiver are the property.
+tests/integration/trigger-webhooks-console.spec.ts
+# API keys live an honest lifecycle: create_api_key stamps no silent expiry
+# (opt-in expiresInDays is stored, returned and named), and
+# set_key_permissions parks unapproved calls, validates the real permission
+# vocabulary, refuses admin escalation and service-role edits even when
+# approved, and narrows with a before/after receipt. Real key rows are the
+# property.
+tests/integration/key-lifecycle-honesty.spec.ts
+# The integrations connect door keeps its contract: unknown provider ids are
+# refused with the served list, any alias or casing stores under the one
+# canonical id everything looks up, disconnect clears what the console reads
+# on both doors, and OneSignal connects fully (REST key + App ID) through the
+# typed call with send_push naming what is missing. Real vault rows are the
+# property; PostHog (stored-unverifiable) keeps CI off external APIs.
+tests/integration/integrations-connect-contract.spec.ts
+# One credential is one vault row: a console connect writes no env-var alias,
+# a lookup by env-var name resolves to the stored row (build-status still
+# clears its block), legacy alias rows are never read or listed, and a console
+# DELETE of stripe leaves no alias keeping the runtime connected. Real vault
+# rows and the real credentials, keys and build-status routes are the
+# property; PostHog and seeded rows keep CI off provider APIs.
+tests/integration/integration-key-one-row.spec.ts
+# Function management names the function it acted on: delete_schedule deletes
+# the exact job, an agent's create of a taken name is refused before any model
+# call, a second function on an event is created with the overlap named, every
+# form of a name finds the function, an HTTP create never converts a hook,
+# set_active needs a direction, and only Stripe functions need Stripe. Real
+# function rows; only the LLM code generator is stubbed.
+tests/integration/functions-agent-contract.spec.ts
+# The typed schema doors agree with apply_migration: create_table of an
+# existing table and add_column on a missing one are refused with nothing
+# changed, and a mistyped name is answered with the closest real table.
+# Real workspace tables are the property.
+tests/integration/db-doors-agree.spec.ts
+# A readiness read changes nothing: the scorer's checks write only when fixing
+# is asked for, the agent read defaults to a read, and the Deploy page reads
+# on load and fixes only on an explicit action. Real project, users table and
+# function rows are the property.
+tests/integration/readiness-reads-never-write.spec.ts
+# The deploy tool tells the truth: status names the current published version
+# (after a rollback too), deploy has no staging target, the first publish,
+# an update and a no-op each say what happened, and an approved deploy is
+# audited as the approver acting by approval. Real deployment, graph and
+# audit rows are the property; only the readiness gate's verdict is fixed,
+# because a superuser test connection bypasses the RLS it checks.
+tests/integration/deploy-tool-truth.spec.ts
+# Storage answers agents with what the runtime will do: no shareable link into
+# an owner_only bucket, a file still flagged public in a private bucket gets
+# an expiring signed link on both drivers, and create_bucket on an existing
+# bucket reports its real visibility and refuses a contradicting request.
+# Real bucket and file rows are the property; the S3 case only presigns.
+tests/integration/storage-agent-truth.spec.ts
+# One operation means one thing on every agent door: Apple sign-in is refused
+# (only the providers the runtime serves are offered), a password reset is
+# never parked on one door and run on the other, and the first connected
+# frontend origin says the CORS allowlist is now exclusive. Real OAuth config,
+# end-user, finding and ConnectedApp rows are the property.
+tests/integration/agent-doors-agree.spec.ts
+# A parked executor action is pollable: the APPROVAL_REQUIRED refusal carries
+# the Review Queue finding's id and the poll call, check_approval resolves
+# parked findings alongside destructive-gate approvals with one status
+# vocabulary, and another project's finding never resolves. Real finding
+# rows are the property.
+tests/integration/parked-actions-pollable.spec.ts
+# The agent can set the access policy the runtime enforces: set_bucket_policy
+# writes all four values to a real bucket row with the derived isPublic
+# label, refuses unknown policies naming the vocabulary, and the catalog and
+# docs advertise the contract. Real bucket rows are the property.
+tests/integration/storage-policy-action.spec.ts
+# Realtime scope is explicit: enable without a tableName refuses instead of
+# silently streaming every table, allTables is the named project-wide switch
+# the agent's tool cannot forward, and both park paths name the tables a
+# project-wide disable stops. Real workspace tables and NOTIFY triggers are
+# the property.
+tests/integration/realtime-scope-truth.spec.ts
+# The storage runtime is correct on both drivers: the S3 driver clamps a
+# requested isPublic to the bucket policy at write time like the local one,
+# multipart complete leaves exactly one real row and counts the bytes once,
+# the signed-upload fallback plants no phantom row, and metadata answers from
+# the row without fetching the object. Real buckets, rows and chunk files are
+# the property; only the S3 network call is stubbed.
+tests/integration/storage-runtime-correctness.spec.ts
+# "Already up to date" is decided by a hash of the live catalog, recorded on
+# the Deployment row, never by the graph pointer the MCP schema path does not
+# move: an agent ALTER publishes a new version, an unchanged catalog is a
+# truthful no-op, and a legacy row without a hash never claims up to date.
+# Real workspace DDL and Deployment rows are the property.
+tests/integration/publish-noop-truth.spec.ts
+# The storage console pages and counts honestly: the files route forwards
+# limit/offset/search, countFiles answers from the same WHERE on the metadata
+# DB (so it holds for both blob drivers), and one page is never presented as
+# the whole project. Real StorageFile rows past the first page are the
+# property.
+tests/integration/storage-files-pagination.spec.ts
 
 # A new end user's session works from sign-up: the Next sign-up route signs with
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
@@ -642,11 +1037,30 @@ tests/integration/tours-seen.spec.ts
 # Real provisioned projects (encrypted secrets) and real users are the property.
 tests/integration/end-user-session-tokens.spec.ts
 
+# Blocking an end user stops their EXISTING token at request time on both
+# data doors (the promised 403), unblocking restores it, and a legacy
+# workspace without is_blocked keeps serving. Real workspace users tables,
+# real tokens and a real key row are the property.
+tests/integration/blocked-end-user-tokens.spec.ts
+# Presence identity is bound to the caller's sign-in on both runtimes: the
+# public key alone or a mismatched X-User-Token can no longer mark another
+# user online or kick them offline, while self, and service-role callers,
+# still work. Real key rows, real tokens and the real workspace presence
+# table are the property.
+tests/integration/presence-identity-binding.spec.ts
+
 # A key bound to a preview branch is refused by every runtime surface that is
 # not branch-scoped, at both doors (the Express app and recordedV1), and the
 # data plane says which environment answered. Mount order against real key and
 # branch rows is the property, so it needs a real Postgres.
 tests/integration/branch-key-surfaces.spec.ts
+
+# A key is served only where it belongs: an MCP key is refused by every runtime
+# surface from anywhere, and a service-role key by every surface from a browser,
+# at both doors and again in each route's own authentication, while a key in its
+# own place still reaches its router. Real key rows and mount order are the
+# property, so it needs a real Postgres.
+tests/integration/key-placement-surfaces.spec.ts
 
 # A preview branch has a working endpoint: the agent tool issues a branch key,
 # the runtime serves the branch and tags its request log rows, every production
@@ -670,6 +1084,133 @@ tests/integration/branch-auth.spec.ts
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
 # Real provisioned projects (encrypted secrets) and real users are the property.
+
+# Whether a user's coding agent is connected: an MCP key or OAuth connection
+# their agent authenticated with (authenticateMcp's stamp), unexpired, for this
+# user and this project only, and the console status route built on it: owner
+# answered, stranger refused, revoking disconnects. Real keys and stamps.
+tests/integration/agent-connection.spec.ts
+
+# An approval runs only the exact call it recorded: a request with no stored
+# call is closed without running anything and says why, a closed request cannot
+# be approved again, and every new request stores its exact arguments. Real
+# approval rows and audit rows are the property, so it needs a real Postgres.
+tests/integration/approval-binding.spec.ts
+
+# Resetting an end user's password from an agent never changes the password and
+# never returns a credential; an unknown account is reported plainly. Real
+# workspace users tables are the property, so it needs a real Postgres.
+tests/integration/reset-password-sends-link.spec.ts
+
+# A project's data is read in its own region and nowhere else: a second
+# database stands in for another region's, a regional project with no
+# connection is refused rather than served from the home database, and with
+# one its queries, raw client, RLS-scoped SQL, workspace client and function
+# role sync reach only the regional database. Two real databases are the
+# property, so it needs a real Postgres.
+tests/integration/project-region.spec.ts
+
+# A regional project's customer data on platform rows stays in its region: a
+# second database stands in for another region's, holding the real
+# regional_bodies table. Webhook and trigger payloads and replies, and function
+# run logs and errors, are kept there and nowhere in the home database; retries,
+# replays and listings read them back; a home project is unchanged; the region
+# prunes after 30 days. Two real databases and a real receiver are the
+# property, so it needs a real Postgres.
+tests/integration/regional-bodies.spec.ts
+
+# Model spend on the MCP tool route is gated and charged wherever it happens:
+# functions.schedule is refused up front with no credits and charged exactly
+# what its model calls used; integrations.connect stores the key with no
+# credits and names each function it could not wire, and with credits every
+# wiring call is held and charged; a failed typed call is reported as it failed,
+# never handed to a model for a different action. Real route, key, holds, vault
+# and usage rows are the property, so it needs a real Postgres.
+tests/integration/model-spend-on-every-tool.spec.ts
+# Function runs say what they do: an HTTP function's creation check asks a GET
+# handler for its contract instead of running it, and every check is recorded
+# in the function's run log; ctx.db.query pages with an explicit limit, offset
+# and orderBy (default 100, at most 1000), so a job can reach every row once.
+# Real function, log and workspace rows are the property, so it needs a real
+# Postgres.
+tests/integration/functions-runtime-honesty.spec.ts
+
+# A service-role key is never minted by an agent: create_api_key with
+# serviceRole true is refused on the typed MCP door and the brain's door with
+# SERVICE_KEY_REQUIRES_HUMAN and mints nothing, publishable keys still work, and
+# no agent-facing text offers one. Real route, MCP key and key rows are the
+# property, so it needs a real Postgres.
+tests/integration/service-key-human-only.spec.ts
+# Agent credentials are managed in one place: Settings, API keys lists the
+# app's keys only (never an MCP key or a browser-authorised agent connection),
+# and the Disconnect the Agents tab offers ends a real OAuth connection, its
+# access token refused and its refresh token gone. Real key rows, a real OAuth
+# token exchange and a platform session are the property, so it needs a real
+# Postgres.
+tests/integration/agent-connections-revocable.spec.ts
+# Calls a coding agent parked for approval are counted where the owner and the
+# agent look: /health answers agentApprovalsPending (live requests only) beside
+# a findings-only needsAttention, get_autonomy_status names both queues as the
+# briefing does, and creating a request notifies the project's owner. Real
+# approval, finding and notification rows are the property, so it needs a real
+# Postgres.
+tests/integration/parked-approvals-visible.spec.ts
+# The dashboard's resource cards answer the real table count with a card-sized
+# list in the card's shape: 15 real workspace tables give tableCount 15 and
+# twelve { name, rowCount, estimated } entries with exact counts, and the
+# route's fallbacks are typed so a count slip cannot typecheck. Real workspace
+# tables are the property, so it needs a real Postgres.
+tests/integration/dashboard-stats-counts.spec.ts
+# delete_trigger deletes the one trigger it names in this project, or nothing,
+# and says which: an approved call naming no trigger deletes nothing (it used to
+# delete every trigger in the project), another project's id or a mistyped one
+# is recorded as failed instead of executed, a shared name is refused, both REST
+# routes answer 404, and the approval card names the trigger. Real trigger and
+# approval rows are the property, so it needs a real Postgres.
+tests/integration/delete-trigger-scope.spec.ts
+# Regional jobs: a snapshot or restore of a project kept in another region,
+# asked for at home and carried out in that region. No generic worker can claim
+# one, each region claims its own, a run past its timeout counts as an attempt,
+# and a failure records the platform's sentence, never the database's. Real
+# background_jobs rows and the claim's SQL are the property, so it needs a real
+# Postgres.
+__tests__/queue/regional-jobs.test.ts
+
+# The daily cleanup's 90-day retention of approval requests (from their
+# decision, or their expiry when nobody decided) and security events. Real rows
+# and deleteMany filters are the property, so it needs a real Postgres.
+__tests__/queue/retention.test.ts
+
+# Each region's copy of what authorizes its projects' requests: the capture
+# triggers from the migration, delivery to a second database standing in for a
+# region, the watermark, removal of revoked keys and deleted projects, the
+# encrypted signing secret, and a copy out of step after a restore emptied and
+# delivered afresh. The triggers and both databases are the property, so it
+# needs a real Postgres.
+tests/integration/auth-projection.spec.ts
+
+# A regional request authorized from the region's copy while it is fresh: off
+# reads home only, enforce reads the copy and fails closed (503
+# AUTHORIZATION_UNAVAILABLE) when the copy is stale and home cannot answer,
+# shadow answers from home and reports differences, end-user tokens verify
+# against the copy's secret, and a delivered lock refuses the project. Both
+# databases and the Express app are the property, so it needs a real Postgres.
+tests/integration/auth-projection-reads.spec.ts
+
+# A key's rate limit counted in its project's region once the copy is enforced:
+# home's rules (limit, a new window when the old one ends, its length changes
+# or the key is rotated), atomic under concurrency, one counter for the Express
+# runtime and the Next-owned routes with no write home per request, the mirror
+# of counts home for the console, and home counting while off or in shadow.
+# Both databases and the real SQL are the property, so it needs a real Postgres.
+tests/integration/auth-rate-windows.spec.ts
+
+# A revocation reported done only once the project's region has it: a home
+# project's change is not applicable, a regional key's revocation is confirmed
+# with the copy no longer holding the key, a region that cannot apply it leaves
+# it pending within the time allowed, and a lockdown reports where it stands.
+# Both databases and the real SQL are the property, so it needs a real Postgres.
+tests/integration/auth-projection-confirm.spec.ts
 
 # Governed changes and restoring them: every class of schema change (additive,
 # destructive, rename, retype, data rewrite) is checkpointed, applied and

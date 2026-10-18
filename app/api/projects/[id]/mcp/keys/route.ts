@@ -10,17 +10,22 @@ export const dynamic = 'force-dynamic'
  * Auth: platform JWT via withProjectValidation. The dashboard owner is the
  * only one who can mint MCP keys for a project.
  *
- * MCP keys differ from runtime SDK keys in three ways:
- *   - scope = 'mcp'                — required for /api/mcp/* surfaces.
+ * MCP keys differ from runtime SDK keys in four ways:
+ *   - scope = 'mcp'                — required for /api/mcp/* surfaces, and
+ *                                    refused by the runtime API (/api/v1,
+ *                                    /api/v2) from anywhere, so an MCP key is
+ *                                    never an app's key. A visual cue was not
+ *                                    enough: agents shipped them in frontends.
+ *                                    lib/security/key-placement.ts.
  *   - keyType = 'mcp'              — distinct from 'public'/'dashboard' so the
  *                                    IAM key list can show them separately.
- *   - serviceRole = true           — runtime data CRUD bypasses end-user RLS,
- *                                    matching how the dashboard's data browser
- *                                    operates on behalf of the project owner.
- *   - keyPrefix starts 'mcp_live_' — visually distinguishable from sk_live_
- *                                    so a user pasting the wrong key into
- *                                    Claude Code or their app gets an obvious
- *                                    visual cue something is off.
+ *   - serviceRole = true           — records what the key can do: its db_*
+ *                                    tools act as the project owner and bypass
+ *                                    end-user RLS (lib/mcp/runtime-db.ts),
+ *                                    matching the dashboard's data browser.
+ *   - keyPrefix starts 'mcp_live_' — visually distinguishable from a project
+ *                                    key, so a user can tell which one they
+ *                                    are holding.
  */
 
 import crypto from 'crypto'
@@ -114,6 +119,10 @@ export async function POST(
   props: { params: Promise<{ id: string }> },
 ) {
   const params = await props.params
+  // ADMIN: this mints a real credential with full write over MCP. Issuing one
+  // is administration, the same rule /api/api-keys applies and the same rank
+  // the OAuth connect door asks at consent — membership alone let an
+  // organization VIEWER mint a key that bypasses every role they hold.
   return withProjectValidation<any>(req, async ({ projectId, userId }) => {
     let body: { label?: string; name?: string; readOnly?: boolean } = {}
     try { body = await req.json() ?? {} } catch { /* allow empty */ }
@@ -181,5 +190,5 @@ export async function POST(
         createdAt: record.createdAt,
       },
     })
-  })
+  }, { floor: 'administer' })
 }

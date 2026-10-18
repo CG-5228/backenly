@@ -2,10 +2,11 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
-import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes } from '@/lib/api/v1/errors'
+import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes, regionErrorResponse } from '@/lib/api/v1/errors'
 import { deleteSchema } from '@/lib/api/v1/schemas'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
 
@@ -71,7 +72,11 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     // Prefer soft delete when the table has a deleted_at column.
     // Fall back to hard delete for tables created before this feature or without the column.
     let result: any[]
-    const hasSoftDelete = await prisma.$queryRawUnsafe<{ count: number }[]>(
+    // The catalog of the project's database, in its region. Resolved before
+    // the fail-soft catch below, which reads any failure as "no deleted_at
+    // column" and so as a HARD delete.
+    const db = await workspaceRawClient(context.projectId)
+    const hasSoftDelete = await db.$queryRawUnsafe<{ count: number }[]>(
       `SELECT COUNT(*)::int AS count FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = $2 AND column_name = 'deleted_at'`,
       schemaName, tableName
@@ -83,6 +88,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
                        SET deleted_at = NOW(), "updatedAt" = NOW()
                        ${whereClause} AND deleted_at IS NULL RETURNING id`
       result = await executeWithUserContext(
+        context.projectId,
         context.endUserId ?? '',
         context.apiKey.serviceRole,
         softSql,
@@ -92,6 +98,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     } else {
       const hardSql = `DELETE FROM "${schemaName}"."${tableName}" ${whereClause} RETURNING id`
       result = await executeWithUserContext(
+        context.projectId,
         context.endUserId ?? '',
         context.apiKey.serviceRole,
         hardSql,
@@ -103,15 +110,11 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     // Fire event triggers + AI functions + activity log + notifications (non-blocking)
     if (result.length > 0) {
       const { fireTriggers } = await import('@/lib/services/trigger-service')
-      const { fireAiFunctions } = await import('@/lib/services/ai-functions/executor')
       const { triggerActivityAndNotification } = await import('@/lib/ai/activity-log-engine')
       const actorId = context.apiKey?.userId
       for (const row of result) {
         fireTriggers(context.projectId, { type: 'delete', table: tableName, data: row }).catch(
           (err: any) => console.warn('[Triggers] fire failed (non-fatal):', err?.message)
-        )
-        fireAiFunctions(context.projectId, { type: 'delete', table: tableName, data: row }).catch(
-          (err: any) => console.warn('[AiFunctions] fire failed (non-fatal):', err?.message)
         )
         triggerActivityAndNotification(context.projectId, 'deleted', tableName, String(row.id || ''), actorId, row).catch(() => {})
       }
@@ -120,7 +123,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     return createSuccessResponse({ success: true, deleted: result.length })
   } catch (error: any) {
     console.error('Database delete error:', error)
-    return createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to delete data', 500)
+    return regionErrorResponse(error) ?? createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to delete data', 500)
   }
 }
 

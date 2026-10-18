@@ -25,6 +25,7 @@
  */
 
 import { NextRequest } from 'next/server'
+import { clientIpFromHeaders } from '@/lib/security/client-ip'
 import { authenticateRequest } from '@/lib/auth/middleware'
 import { recordSecurityEvent } from '@/lib/platform-controls'
 import {
@@ -90,10 +91,7 @@ export async function getCurrentProjectId(request: NextRequest): Promise<string>
       // and stays on the Security tab. Asking for NO project is a client bug,
       // not an attack, so it is not reported as one.
       if (!(err instanceof ProjectContextRequiredError) && requested) {
-        const ip =
-          request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-          request.headers.get('x-real-ip') ||
-          null
+        const ip = clientIpFromHeaders(request)
         recordSecurityEvent({
           kind: 'cross_tenant',
           severity: 'high',
@@ -148,6 +146,48 @@ export async function validateProjectOwnership(
   if (resourceProjectId !== projectId) {
     throw new TenantIsolationError(`${resourceType} does not belong to the specified project`)
   }
+}
+
+/**
+ * Resolve the request's project AND require a capability on it.
+ *
+ * `getCurrentProjectId` answers "may this caller see this project", which is
+ * VIEWER and above. A route that changes the project, or removes something from
+ * it, needs a higher answer, and the guard (`canWriteProject`,
+ * `canAdministerProject`) is the only place that gives one. Pass the guard
+ * function the route needs as `may`.
+ *
+ * Refusals are shaped so they cannot become an existence oracle: a caller who
+ * may not see the project gets the same 404 whether it exists or not. A member
+ * whose role is too low gets 403, because they can already see it exists.
+ */
+export async function requireProjectCapability(
+  request: NextRequest,
+  may: (userId: string, projectId: string) => Promise<boolean>
+): Promise<{ userId: string; projectId: string }> {
+  const auth = await authenticateRequest(request)
+  if (!auth.authenticated || !auth.userId) {
+    throw new TenantIsolationError('Authentication required', 401, 'UNAUTHENTICATED')
+  }
+
+  let projectId: string
+  try {
+    projectId = await getCurrentProjectId(request)
+  } catch (err) {
+    if (err instanceof TenantIsolationError && (err.status === 403 || err.status === 404)) {
+      throw new TenantIsolationError('Project not found', 404, 'PROJECT_NOT_FOUND')
+    }
+    throw err
+  }
+
+  if (!(await may(auth.userId, projectId))) {
+    throw new TenantIsolationError(
+      'Your role in this project does not allow this change',
+      403,
+      'PROJECT_ROLE_INSUFFICIENT'
+    )
+  }
+  return { userId: auth.userId, projectId }
 }
 
 /**

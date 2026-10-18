@@ -13,6 +13,7 @@
  * autonomous history exactly.
  */
 
+import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
 import { prisma } from '@/lib/db/prisma'
 import { AUTONOMOUS_AUDIT_ACTIONS } from './circuit-breaker'
 import {
@@ -29,6 +30,7 @@ import { classifyFix } from '@/lib/core/fix-classifier'
 import { revertEligibility } from '@/lib/core/auto-fix-engine'
 import { INVARIANTS } from './desired-state'
 import { resolveExecutionMode, type ExecutionModeState } from './execution-mode'
+import { describeProposal } from './ai-proposals'
 
 export interface TrustScoreboard {
   windowDays: number
@@ -38,7 +40,12 @@ export interface TrustScoreboard {
   escalations: number
   /** Times the circuit breaker tripped (runaway protection fired). */
   breakerTrips: number
-  /** Rollbacks of autonomous actions (the trust-critical "0" we want). */
+  /**
+   * Applied fixes a person undid with Undo, whether the loop applied them on its
+   * own or after an approval (the trust-critical "0" we want). A deploy or
+   * version rollback is a separate operation someone asked for, and is not a
+   * fix being reverted, so it is not counted.
+   */
   rollbacks: number
   /**
    * Share of autonomous fixes whose gap was re-probed after the fix and
@@ -116,6 +123,12 @@ export interface PendingApproval {
    * differed by a table name but not whether they shared a cause.
    */
   details: Record<string, unknown>
+  /**
+   * An AI-proposed repair waiting for a person's approval of this exact
+   * version (lib/autonomy/ai-proposals.ts). Present only while it is pending
+   * and unexpired; the queue offers "Approve & fix" only when it is.
+   */
+  proposal?: { id: string; version: string; summary: string; expiresAt: string }
 }
 
 /**
@@ -293,7 +306,10 @@ function humanize(action: string, details: string | null): string {
     case 'auto_fix':
       // The trust UI's headline rows — render the canonical "what because why"
       // sentence so the trust feed and the activity feed agree word-for-word.
-      return explainAutonomyEvent(d).full
+      // Only a recorded 'confirmed' outcome is a verified fix: the retired
+      // orchestrator's AGENT_AUTO_FIXED rows and FIX_PLAN_AUTO_EXECUTED record
+      // none, so they read as what they were.
+      return `${explainAutonomyEvent(d).full}${isVerifiedFix(d.verification) ? '' : ' (it ran, but could not be confirmed)'}`
     case 'escalation':
       if (!d.findingType && typeof d.summary === 'string' && d.summary) return d.summary
       // Never the raw type. `Held back for your approval: rls_expression_invalid`
@@ -325,6 +341,9 @@ function humanize(action: string, details: string | null): string {
     case 'failed':
       return `Approved fix could not be applied${d.findingType ? ` (${d.findingType.replace(/_/g, ' ')})` : ''} — left for your review`
     case 'rollback':
+      if (action === 'HEALTH_FIX_ROLLED_BACK') {
+        return d.findingType ? `You undid a fix: ${summariseFinding(d.findingType, d)}` : 'You undid a fix'
+      }
       // A governed change's recovery writes its own sentence (lib/changes/recovery.ts).
       if (typeof d.summary === 'string' && d.summary) return d.summary
       return `Rolled back a previous change${d.findingType ? `: ${d.findingType.replace(/_/g, ' ')}` : ''}`
@@ -333,6 +352,14 @@ function humanize(action: string, details: string | null): string {
     default:
       if (action === 'AUTONOMY_LEVEL_CHANGED' && d.level) {
         return `You set the autonomy level to ${String(d.level).toLowerCase()}`
+      }
+      if (action === 'AUTONOMY_DETECTOR_RETIRED') {
+        const n = Number(d.withdrawn) || 0
+        const kept = Number(d.kept) || 0
+        return (
+          `Withdrew ${n} finding${n === 1 ? '' : 's'} from a retired check` +
+          (kept > 0 ? `; ${kept} you had acted on ${kept === 1 ? 'stays' : 'stay'} listed` : '')
+        )
       }
       // Same bare-type leak as the escalation rows: this printed as
       // "health fix requested", which names neither what was requested nor
@@ -440,8 +467,10 @@ export async function buildTrustReport(
     prisma.auditLog.count({
       where: { projectId, timestamp: { gte: since }, action: 'AUTONOMY_CIRCUIT_OPEN' },
     }),
+    // Undo of an applied fix. Counting every ROLLBACK_* row counted deploy and
+    // version rollbacks people asked for, and never counted an undone fix.
     prisma.auditLog.count({
-      where: { projectId, timestamp: { gte: since }, action: { startsWith: ROLLBACK_PREFIX } },
+      where: { projectId, timestamp: { gte: since }, action: 'HEALTH_FIX_ROLLED_BACK' },
     }),
     // Fixes whose gap was re-probed after the fix and confirmed gone. The
     // kernel stamps `verification` into the HEALTH_AUTO_FIXED payload
@@ -535,8 +564,24 @@ export async function buildTrustReport(
     })
   }
 
+  // The live AI proposals for these rows. A table that does not exist yet (a
+  // deployment before the migration) reads as none.
+  const proposals = pending.length
+    ? await prisma.aiFixProposal.findMany({
+        where: { projectId, status: 'pending', expiresAt: { gt: new Date() }, findingId: { in: pending.map(p => p.id) } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, findingId: true, action: true, params: true, proposalVersion: true, expiresAt: true },
+      }).catch(() => [] as Array<{ id: string; findingId: string; action: string; params: unknown; proposalVersion: string; expiresAt: Date }>)
+    : []
+  const proposalByFinding = new Map<string, (typeof proposals)[number]>()
+  for (const pr of proposals) if (!proposalByFinding.has(pr.findingId)) proposalByFinding.set(pr.findingId, pr)
+
   const pendingApprovals: PendingApproval[] = pending.map(p => {
-    const det = (p.details ?? {}) as Record<string, any>
+    const raw = (p.details ?? {}) as Record<string, any>
+    // Legacy pending rows stored executor params unredacted; never serve them.
+    const det = raw.executorParams
+      ? { ...raw, executorParams: redactSecretParams(raw.executorParams), executorParamsSealed: undefined }
+      : raw
     return {
       id: p.id,
       type: p.type,
@@ -552,11 +597,27 @@ export async function buildTrustReport(
       source: det.source ?? 'autonomy',
       resource: det.location ?? det.tableName ?? undefined,
       details: det,
+      ...(proposalByFinding.has(p.id)
+        ? (() => {
+            const pr = proposalByFinding.get(p.id)!
+            return {
+              proposal: {
+                id: pr.id,
+                version: pr.proposalVersion,
+                summary: describeProposal(pr.action, (pr.params ?? {}) as Record<string, unknown>),
+                expiresAt: pr.expiresAt.toISOString(),
+              },
+            }
+          })()
+        : {}),
     }
   })
 
   const appliedChanges: AppliedChange[] = applied.map(f => {
-    const det = (f.details ?? {}) as Record<string, any>
+    const rawDet = (f.details ?? {}) as Record<string, any>
+    const det = rawDet.executorParams
+      ? { ...rawDet, executorParams: redactSecretParams(rawDet.executorParams), executorParamsSealed: undefined }
+      : rawDet
     const eligibility = revertEligibility(f.type, det)
     return {
       findingId: f.id,

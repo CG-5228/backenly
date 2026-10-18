@@ -221,7 +221,7 @@ export const FLAGS = {
    * Hard limits while on:
    *   - Action whitelist enforced via Zod against the AIAction discriminated union.
    *   - Every fix still routes through executeAction → mutate.ts governance.
-   *   - Destructive actions still trip lib/ai/brain/pending-destructive.ts.
+   *   - The author can never emit a destructive action (its whitelist excludes them).
    *   - Max 5 novel fixes per build.
    */
   get ENABLE_AGENTIC_FIX_AUTHOR(): boolean { return readBool('ENABLE_AGENTIC_FIX_AUTHOR') },

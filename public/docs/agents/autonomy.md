@@ -32,7 +32,7 @@ Some actions never run from the call that asks for them: every one marked "waits
    - `executed`: done.
    - `rejected`: do not retry; ask your human what they want instead.
    - `expired`: nobody decided within 24 hours.
-   - `failed`: nothing was applied; safe to try again.
-   - `partial`: some changes landed before the run stopped; read `resultSummary` and verify state instead of replaying the call.
+   - `failed`: the call did not complete. Read `resultSummary` and check the current state before raising it again: a call that stops part-way, such as a deploy or a data migration, can leave some of its work applied.
+   - `partial`: only on requests from before approvals ran one exact call. Some changes landed before the run stopped; read `resultSummary` and verify state instead of replaying the call.
 
 A read-only key is never parked: its write calls are refused with `READ_ONLY_KEY` before anything else happens. Calling a destructive tool directly by an older name (for example `delete_bucket`) is refused with `DESTRUCTIVE_NEEDS_APPROVAL`; use the section tool's action, which parks it.

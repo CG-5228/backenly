@@ -5,10 +5,10 @@
  * Transforms entity inference from "tables" to "real-world workflows".
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 import type { BackendStateGraph } from '@/lib/orchestration/backend-state-graph'
 
+import { chat } from '@/lib/ai/llm/chat'
 /**
  * Actor in the system (user types, roles)
  */
@@ -78,16 +78,14 @@ export async function inferInteractionGraph(
       existingEntities: Object.keys(existingGraph.entities).length,
     })
     
-    const openai = getOpenAIClient()
-    
     // Build context from existing entities
     const existingEntities = Object.keys(existingGraph.entities)
     const existingContext = existingEntities.length > 0
       ? `\n\nEXISTING ENTITIES: ${existingEntities.join(', ')}`
       : ''
     
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -163,11 +161,12 @@ Return ONLY valid JSON.`
           content: 'Analyze this domain and infer the interaction graph'
         }
       ],
-      temperature: 0.5,
-      max_tokens: 2000,
+      maxTokens: 2000,
+      json: true,
+      label: 'flow-reasoning',
     })
     
-    const content = response.choices[0]?.message?.content
+    const content = response.text
     if (!content) {
       throw new Error('No response from AI')
     }
