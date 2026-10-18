@@ -99,6 +99,15 @@ export async function withChangeLock<T>(
   const key = projectToLockKey(projectId)
   let locked = false
   let broken = false
+  // A checked-out client's error (its connection dropped, or the server ended
+  // the session) is emitted on the client, not the pool, and unhandled it ends
+  // the process. The statement in flight fails with it anyway; the session's
+  // lock went with the session, and the connection is discarded on release.
+  const lost = (err: Error) => {
+    broken = true
+    console.error(`[ChangeLock] connection for ${projectId} lost:`, err.message)
+  }
+  client.on('error', lost)
   try {
     const waitMs = Math.max(1, Math.floor(opts.waitMs ?? DEFAULT_WAIT_MS))
     await client.query(`SET lock_timeout = ${waitMs}`)
@@ -126,6 +135,7 @@ export async function withChangeLock<T>(
         console.error(`[ChangeLock] could not release the change lock for ${projectId}; discarding the connection`)
       }
     }
+    client.off('error', lost)
     client.release(broken)
   }
 }

@@ -17,7 +17,10 @@
  *   a recovery that fails stops automation for the project until a person
  *   decides, and says so;
  *   work interrupted by a restart is settled from the catalog, never re-run;
- *   turning autonomy off does not turn any of this off.
+ *   turning autonomy off does not turn any of this off;
+ *   a restore whose connection is cut is rolled back and can run again, and a
+ *   restore that ran but left production unlike its restore point is never
+ *   reported as recovered.
  */
 
 jest.mock('@cloud/entitlements', () => {
@@ -416,4 +419,111 @@ describe('work a restart interrupted', () => {
     // It now needs a person; clear it so automation is not left paused.
     expect((await keepChange(projectId, stale.id, ownerId)).ok).toBe(true)
   })
+})
+
+// ── When the world misbehaves ────────────────────────────────────────────────
+
+describe('a recovery the world interferes with', () => {
+  it('a restore whose database connection is cut while it waits is rolled back, says so, and runs again', async () => {
+    await ddl(`CREATE TABLE ${T('flaky_net')} (id serial PRIMARY KEY)`)
+    const { change } = await withChangeAttribution({ source: 'dashboard', actorUserId: ownerId }, () =>
+      withGovernedChange({ projectId, title: 'flaky_net.a' }, async () => { await ddl(`ALTER TABLE ${T('flaky_net')} ADD COLUMN a text`) }))
+    const blocker = new Client({ connectionString: process.env.DATABASE_URL })
+    const watcher = new Client({ connectionString: process.env.DATABASE_URL })
+    await blocker.connect()
+    await watcher.connect()
+    const blockerPid = (await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    await blocker.query('BEGIN')
+    await blocker.query(`LOCK TABLE ${T('flaky_net')} IN ACCESS SHARE MODE`)
+    let out: Awaited<ReturnType<typeof recoverChange>>
+    try {
+      const running = recoverChange(projectId, change!.id, { mode: 'manual', actorUserId: ownerId })
+      // The restore waits for its lock. Cut its connection, as a network drop would.
+      let cut = false
+      for (let i = 0; i < 100 && !cut; i++) {
+        const waiting = await watcher.query(
+          `SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%flaky_net%' AND pid <> $1 AND pid <> pg_backend_pid()`,
+          [blockerPid],
+        )
+        if (waiting.rows.length > 0) {
+          await watcher.query('SELECT pg_terminate_backend($1)', [waiting.rows[0].pid])
+          cut = true
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+      }
+      expect(cut).toBe(true)
+      out = await running
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await blocker.end()
+      await watcher.end()
+    }
+    expect(out).toMatchObject({ ok: false, code: 'RECOVERY_FAILED' })
+    expect((out as any).error).toMatch(/nothing was changed/i)
+    expect((await record(change!.id)).status).toBe('healthy')
+    expect(await columnsOf('flaky_net')).toEqual(['a', 'id'])
+    expect(await events(change!.id)).toContain('recovery_failed')
+    // Nothing half-made is left to surface later as a change needing a person.
+    expect(await prisma.backendChange.count({
+      where: { projectId, recoversId: change!.id, status: { notIn: ['healthy', 'failed'] } },
+    })).toBe(0)
+
+    // The next attempt gets a fresh connection, and the restore runs.
+    const again = await recoverChange(projectId, change!.id, { mode: 'manual', actorUserId: ownerId })
+    expect(again).toMatchObject({ ok: true, status: 'restored' })
+    expect(await columnsOf('flaky_net')).toEqual(['id'])
+  }, 60_000)
+
+  it('a restore that ran, but left production unlike its restore point, is never reported as recovered', async () => {
+    await protectedTable('drifty')
+    // Something outside Backenly that alters a table whenever it is altered (an
+    // operator's event trigger, an extension), here only for drifty, once.
+    const fn = `bkn_test_drift_${crypto.randomBytes(4).toString('hex')}`
+    await ddl(`CREATE FUNCTION public.${fn}() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+      DECLARE r record;
+      BEGIN
+        FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+          IF r.objid = to_regclass('${T('drifty')}') AND NOT EXISTS (
+            SELECT 1 FROM pg_attribute WHERE attrelid = r.objid AND attname = 'sneaky' AND NOT attisdropped
+          ) THEN
+            EXECUTE 'ALTER TABLE ${T('drifty')} ADD COLUMN sneaky text';
+          END IF;
+        END LOOP;
+      END $f$`)
+    let change: Awaited<ReturnType<typeof asAgent>>['change']
+    try {
+      ;({ change } = await asAgent('break drifty', async () => {
+        await ddl(`ALTER TABLE ${T('drifty')} DISABLE ROW LEVEL SECURITY`)
+        // Armed once the change has applied, so only the recovery meets it.
+        await ddl(`CREATE EVENT TRIGGER ${fn}_evt ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION public.${fn}()`)
+      }))
+    } finally {
+      await ddl(`DROP EVENT TRIGGER IF EXISTS ${fn}_evt`)
+      await ddl(`DROP FUNCTION IF EXISTS public.${fn}()`)
+    }
+
+    // The restore ran: row-level security is back on. But the table is not
+    // what the restore point says, so it is not called recovered.
+    expect(await rlsOn('drifty')).toBe(true)
+    expect(await columnsOf('drifty')).toContain('sneaky')
+    expect(change!.status).toBe('manual_intervention_required')
+    expect(change!.recovery!.explanation).toMatch(/did not match the restore point/)
+    const r = await record(change!.id)
+    expect(r.status).toBe('manual_intervention_required')
+    expect(r.recoveredById).toBeNull()
+    expect(await events(change!.id)).toEqual(expect.arrayContaining(['verification_failed', 'recovery_started', 'recovery_failed', 'manual_intervention_required']))
+    expect(await events(change!.id)).not.toContain('recovery_completed')
+    const failedEvent = await prisma.backendChangeEvent.findFirstOrThrow({ where: { changeId: change!.id, type: 'recovery_failed' } })
+    expect((failedEvent.data as any).phase).toBe('verification')
+    const restore = await prisma.backendChange.findFirstOrThrow({ where: { projectId, recoversId: change!.id } })
+    expect(restore.status).not.toBe('healthy')
+    expect((restore.verification as any).outcome).toBe('contradicted')
+    expect(JSON.stringify((restore.verification as any).checks)).toMatch(/sneaky/)
+    const { changes } = await listChanges(projectId)
+    expect(changes.find((c) => c.id === change!.id)!.outcome.state).not.toBe('recovered')
+
+    // A person decides; automation resumes for the project.
+    expect((await keepChange(projectId, change!.id, ownerId)).ok).toBe(true)
+  }, 60_000)
 })

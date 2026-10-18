@@ -659,6 +659,11 @@ export async function recoverChange(projectId: string, changeId: string, opts: R
       // a value check failed, or the connection went away before COMMIT).
       const to: ChangeStatus = opts.mode === 'automatic' ? 'recovery_failed' : back
       await releaseRecovery(change.id, claim.claim, to)
+      // A connection lost mid-restore leaves the restore's own record open, the
+      // catalog unread. Every statement it ran was in that one transaction, so
+      // it is closed as failed here, not left for the reconciler to report as
+      // a change that needs a person.
+      if (restoreRecord) await closeUncommitted((restoreRecord as { id: string }).id, projectId, err)
       const step = err instanceof RecoveryStepError && err.step ? { index: err.index, sql: err.step.sql, describe: err.step.describe } : undefined
       await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'execute', error: keptText(String(err?.message ?? err), await quotesKeptHere(projectId)).slice(0, 500), ...(step ? { step: step.describe } : {}) })
       recordTiming('recovery', Date.now() - started, { projectId, mode: opts.mode, outcome: 'failed' })
@@ -674,6 +679,12 @@ export async function recoverChange(projectId: string, changeId: string, opts: R
     await recordEvent(change.id, projectId, 'recovery_failed', { phase: 'after_commit', error: keptText(String(err?.message ?? err), await quotesKeptHere(projectId)).slice(0, 500) })
     return fail('RECOVERY_FAILED', `The restore was applied but could not be confirmed (${err?.message ?? err}). Backenly will check it again.`, { status: 'recovering' })
   }
+}
+
+async function closeUncommitted(recordId: string, projectId: string, err: unknown): Promise<void> {
+  const error = keptText(String((err as { message?: string })?.message ?? err), await quotesKeptHere(projectId))
+  const closed = await transition(recordId, ['applying'], 'failed', { error: error.slice(0, 2000), completedAt: new Date() }).catch(() => false)
+  if (closed) await recordEvent(recordId, projectId, 'apply_failed', { error: error.slice(0, 500), committed: false })
 }
 
 function targetSeqOf(change: LoadedChange): string {

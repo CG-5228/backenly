@@ -17,7 +17,9 @@
  *   person's decision on the agent's request;
  *   a request that could never be carried out is answered at once;
  *   the agent cannot reach the change record through SQL;
- *   a migration that fails part-way is recovered automatically.
+ *   a migration that fails part-way is recovered automatically;
+ *   an agent that turns the autonomy dial off and sends arguments meant to skip
+ *   recovery still has its breaking change recovered.
  */
 
 jest.mock('@cloud/entitlements', () => {
@@ -48,6 +50,7 @@ import { decideApproval } from '@/lib/mcp/approvals'
 import { listChanges } from '@/lib/changes/history'
 import { closeChangeLockPool } from '@/lib/changes/lock'
 import { forgetProtection } from '@/lib/branches/protection'
+import { ensureAuthUsersTable } from '@/lib/services/end-user-auth-table'
 import { installChangeLedgerGuard } from '../helpers/change-ledger-guard'
 
 let ownerId: string
@@ -263,5 +266,39 @@ describe('a migration that fails part-way', () => {
     expect(shown.outcome.state).toBe('recovered')
     // The recovery is how the change ended, not a row of its own.
     expect(changes.some((c) => c.id === recovery.id)).toBe(false)
+  }, 120_000)
+})
+
+describe('an agent switching off what protects production', () => {
+  it('turns the autonomy dial off and sends arguments meant to skip recovery: its breaking change is recovered anyway', async () => {
+    const off = await call('autonomy', { action: 'set_level', level: 'OFF' })
+    expect(off.status).toBe(200)
+    expect((await prisma.project.findUniqueOrThrow({ where: { id: projectId }, select: { autonomyLevel: true } })).autonomyLevel).toBe('OFF')
+
+    // End-user sign-in, with someone signed up.
+    await ensureAuthUsersTable(projectId, { email: 'owner@example.test' })
+    await prisma.$executeRawUnsafe(`INSERT INTO "${schema}".users (email, password) VALUES ('end-user@example.test', 'hash')`)
+
+    const r = await call('apply_migration', {
+      sql: 'ALTER TABLE users RENAME COLUMN email TO login_email',
+      autoRecover: false, recover: false, skipRecovery: true, rollback: false, protect: false, autonomy: 'OFF',
+    })
+    expect(r.status).toBe(400)
+    expect(r.body).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED', applied: [], recovered: true })
+    expect(r.body.error).toMatch(/sign-in/i)
+
+    const cols = await prisma.$queryRawUnsafe<Array<{ column_name: string }>>(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = '${schema}' AND table_name = 'users'`,
+    )
+    expect(cols.map((c) => c.column_name)).toContain('email')
+    expect(cols.map((c) => c.column_name)).not.toContain('login_email')
+    expect(await prisma.$queryRawUnsafe(`SELECT email FROM "${schema}".users`)).toEqual([{ email: 'end-user@example.test' }])
+
+    const failed = await prisma.backendChange.findUniqueOrThrow({ where: { id: r.body.change.id } })
+    expect(failed).toMatchObject({ source: 'mcp', apiKeyId: keyId, status: 'recovered' })
+    expect((failed.verification as any).checks.find((c: any) => c.id === 'auth')).toMatchObject({ outcome: 'contradicted' })
+    const recovery = await prisma.backendChange.findUniqueOrThrow({ where: { id: failed.recoveredById! } })
+    expect(recovery).toMatchObject({ kind: 'recovery', source: 'system', status: 'healthy' })
+    expect((recovery.verification as any).outcome).toBe('confirmed')
   }, 120_000)
 })
