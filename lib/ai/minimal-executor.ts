@@ -3510,8 +3510,9 @@ async function executeSingleAction(
 
   // Schema-changing actions get their restore point from the change ledger,
   // which wraps executeAction (SCHEMA_CHANGE_ACTIONS above). The per-action
-  // SchemaVersion snapshot that used to be taken here recorded no columns, and
-  // the rollback built on it could only drop tables.
+  // SchemaVersion snapshot that used to be taken here held the catalog only:
+  // rolling back to it dropped the tables and columns added since, with their
+  // data, and could not bring back anything dropped.
 
   try {
     switch (action.action) {
