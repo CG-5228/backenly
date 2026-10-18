@@ -1034,6 +1034,97 @@ describe('reapplying after the app wrote since the restore: only those writes co
 
 // ── What apply_migration refuses ─────────────────────────────────────────────
 
+// ── DROP INDEX: the executor's own action, as an approved unused-index finding runs it ──
+
+changeClass('DROP INDEX, as an approved unused-index finding runs it: the index comes back exactly', {
+  tables: ['catalogue'],
+  arrange: async () => {
+    await migrated('CREATE TABLE catalogue (title text, shelf text)')
+    await migrated('CREATE INDEX catalogue_shelf ON catalogue (shelf)')
+    await exec(`INSERT INTO ${T('catalogue')} (title, shelf) VALUES ('Dune', 'B2'), ('Emma', 'A1')`)
+  },
+  act: async () => {
+    const r = await asPerson(() =>
+      executeAction({ action: 'DROP_INDEX', params: { indexName: 'catalogue_shelf', tableName: 'catalogue', confirmed: true } } as any, projectId, undefined, 0, undefined, false))
+    if (!r.success) throw new Error(`DROP_INDEX failed: ${r.message}`)
+    return latestChangeId()
+  },
+  // It removes no data, and it creates nothing either: transforming, not additive.
+  risk: 'transforming',
+  recorded: (row, after) => {
+    expect(after.cat.tables.catalogue.indexes.map((i) => i.name)).not.toContain('catalogue_shelf')
+    expect((row.footprint as any[]).flatMap((c) => c.details)).toEqual(expect.arrayContaining([expect.stringMatching(/^− .*catalogue_shelf/)]))
+  },
+}, () => {
+  it('a unique index is refused by the executor: nothing changes, and the history lists nothing new', async () => {
+    await migrated('CREATE UNIQUE INDEX catalogue_title ON catalogue (title)')
+    // A change that failed before changing anything is recorded as failed, and not listed.
+    const listed = () => prisma.backendChange.count({ where: { projectId, status: { not: 'failed' } } })
+    const before = await listed()
+    const r = await asPerson(() =>
+      executeAction({ action: 'DROP_INDEX', params: { indexName: 'catalogue_title', tableName: 'catalogue', confirmed: true } } as any, projectId, undefined, 0, undefined, false))
+    expect(r.success).toBe(false)
+    expect(await listed()).toBe(before)
+    expect((await catalog()).tables.catalogue.indexes.map((i) => i.name)).toContain('catalogue_title')
+  })
+})
+
+// ── A large table ─────────────────────────────────────────────────────────────
+
+describe('a large table: 200,000 rows through a dropped column and a rewrite, each restored exactly', () => {
+  const ROWS = 200_000
+  /** Every value of a column, in id order, reduced to one digest: exact, without reading 200k rows into Node. */
+  const fingerprint = async (column: string) => {
+    const r = await query<{ n: number; digest: string }>(
+      `SELECT count(*)::int AS n, md5(string_agg(coalesce("${column}"::text, '<null>'), ',' ORDER BY id)) AS digest FROM ${T('ledger_lines')}`,
+    )
+    return r[0]
+  }
+  let memo: { n: number; digest: string }
+  let region: { n: number; digest: string }
+
+  beforeAll(async () => {
+    await migrated('CREATE TABLE ledger_lines (amount numeric, memo text, region text)')
+    await exec(
+      `INSERT INTO ${T('ledger_lines')} (amount, memo, region)
+       SELECT (g % 997)::numeric / 7, 'memo ' || g, CASE g % 3 WHEN 0 THEN 'EU' WHEN 1 THEN 'us' ELSE 'APAC' END
+         FROM generate_series(1, ${ROWS}) g`,
+    )
+    memo = await fingerprint('memo')
+    region = await fingerprint('region')
+    expect(memo.n).toBe(ROWS)
+  }, 300_000)
+
+  it('a dropped column keeps all 200,000 values, and its restore brings every one back', async () => {
+    const dropped = await asPerson(() => dropWorkspaceColumn(projectId, { tableName: 'ledger_lines', columnName: 'memo' }))
+    const id = (dropped as any).change.id as string
+    const row = await record(id)
+    expect(row).toMatchObject({ status: 'healthy', risk: 'destructive' })
+    const kept = ((row.preserved as any).entries as any[]).find((e) => e.kind === 'column' && e.table === 'ledger_lines')
+    expect(kept.rows).toBe(ROWS)
+    expect(await columnsOf('ledger_lines')).not.toContain('memo')
+
+    const p = (await previewRecovery(projectId, id))!
+    expect(p.safety).toBe('lossless')
+    const out = await restore(id, p.acknowledgement)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect((out as Extract<typeof out, { ok: true }>).verification.outcome).toBe('confirmed')
+    expect(await fingerprint('memo')).toEqual(memo)
+  }, 300_000)
+
+  it('a rewrite of two thirds of the rows keeps its images, and its restore puts every original value back', async () => {
+    const id = await dataMigration([{ op: 'normalize_values', table: 'ledger_lines', column: 'region', mapping: { EU: 'eu', APAC: 'apac' } }])
+    expect(await query(`SELECT count(*)::int AS n FROM ${T('ledger_lines')} WHERE region IN ('EU', 'APAC')`)).toEqual([{ n: 0 }])
+    expect((await record(id)).risk).toBe('data_rewrite')
+
+    const p = (await previewRecovery(projectId, id))!
+    expect({ safety: p.safety, reason: p.reason, proof: p.details.proof }).toEqual({ safety: 'lossless', reason: null, proof: expect.objectContaining({ ok: true }) })
+    const out = await restore(id, p.acknowledgement)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect(await fingerprint('region')).toEqual(region)
+  }, 300_000)
+})
+
 describe('statements apply_migration refuses: nothing applied, nothing recorded', () => {
   it.each([
     ['RENAME TABLE', 'ALTER TABLE pantry RENAME TO larder', 'UNSUPPORTED_STATEMENT'],
@@ -1043,6 +1134,13 @@ describe('statements apply_migration refuses: nothing applied, nothing recorded'
     ['CREATE TYPE … AS ENUM', "CREATE TYPE mood AS ENUM ('calm', 'busy')", 'UNSUPPORTED_STATEMENT'],
     ['an enum column', "ALTER TABLE shelves ADD COLUMN mood mood", 'UNSUPPORTED_TYPE'],
     ['CREATE VIEW', 'CREATE VIEW pantry_items AS SELECT item FROM pantry', 'UNSUPPORTED_STATEMENT'],
+    // No agent path drops a constraint or an index, or changes a primary key,
+    // which Backenly manages. The engine's handling of each is proved in
+    // change-recovery.spec.ts, and a plain index's drop below.
+    ['DROP CONSTRAINT', 'ALTER TABLE contacts DROP CONSTRAINT contacts_email_key', 'DESTRUCTIVE_REFUSED'],
+    ['DROP INDEX', 'DROP INDEX pantry_item_idx', 'DESTRUCTIVE_REFUSED'],
+    ['a primary key moved to another column', 'ALTER TABLE shelves ADD PRIMARY KEY (title)', 'UNSUPPORTED_CONSTRAINT'],
+    ['the primary key dropped', 'ALTER TABLE shelves DROP CONSTRAINT shelves_pkey', 'DESTRUCTIVE_REFUSED'],
     ['a refused statement after a valid one', 'CREATE TABLE never_made (x text);\nDROP TABLE shelves', 'DESTRUCTIVE_REFUSED'],
     ['rows moved between tables (INSERT … SELECT)', 'INSERT INTO larder (item) SELECT item FROM pantry', 'DML_NOT_MIGRATION'],
     ['rows deleted (DELETE)', 'DELETE FROM pantry WHERE qty IS NULL', 'DML_NOT_MIGRATION'],

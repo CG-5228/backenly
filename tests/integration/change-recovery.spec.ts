@@ -488,6 +488,183 @@ describe('a data migration that rewrote values', () => {
 
 // ── Ordering ─────────────────────────────────────────────────────────────────
 
+// ── Guarantees removed, keys moved, tables consolidated ──────────────────────
+//
+// No agent path does any of these: apply_migration refuses DROP CONSTRAINT,
+// DROP INDEX and every primary-key change (change-classes-executor.spec.ts),
+// and moves no rows between tables. A person's governed change still can, and
+// its restore must put each back exactly, or refuse where today's rows would
+// break what it puts back. Never offered as lossless and then failed.
+
+describe('a dropped CHECK, UNIQUE and FOREIGN KEY constraint', () => {
+  let changeId: string
+  let before: CatalogSnapshot
+
+  beforeAll(async () => {
+    await ddl(`CREATE TABLE ${T('ticket_owners')} (id serial PRIMARY KEY)`)
+    await ddl(`INSERT INTO ${T('ticket_owners')} DEFAULT VALUES`)
+    await ddl(`CREATE TABLE ${T('triage_tickets')} (id serial PRIMARY KEY,
+      priority integer CONSTRAINT triage_priority_range CHECK (priority BETWEEN 1 AND 5),
+      code text CONSTRAINT triage_code_key UNIQUE,
+      owner_id integer CONSTRAINT triage_owner_fkey REFERENCES ${T('ticket_owners')}(id) ON DELETE SET NULL)`)
+    await ddl(`INSERT INTO ${T('triage_tickets')} (priority, code, owner_id) VALUES (1, 'a', 1), (5, 'b', NULL)`)
+    before = await catalog()
+    const closed = await change('drop the triage constraints', async () => {
+      await ddl(`ALTER TABLE ${T('triage_tickets')} DROP CONSTRAINT triage_priority_range, DROP CONSTRAINT triage_code_key, DROP CONSTRAINT triage_owner_fkey`)
+    })
+    changeId = closed.id
+  }, 60_000)
+
+  it('is transforming: it removes no data, and creates nothing', async () => {
+    expect(await record(changeId)).toMatchObject({ status: 'healthy', risk: 'transforming' })
+    expect((await catalog()).tables.triage_tickets.constraints.map((c) => c.name)).toEqual(['triage_tickets_pkey'])
+  })
+
+  it('restores all three exactly, losslessly', async () => {
+    const p = (await previewRecovery(projectId, changeId))!
+    expect(p.safety).toBe('lossless')
+    const out = await restore(changeId)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect(tableSignature((await catalog()).tables.triage_tickets)).toEqual(tableSignature(before.tables.triage_tickets))
+  })
+})
+
+describe('a dropped constraint that a row written since would break', () => {
+  it.each([
+    ['a CHECK', 'gauges', 'level integer CONSTRAINT gauges_level_range CHECK (level BETWEEN 0 AND 10)', null, 'gauges_level_range', '(level) VALUES (42)'],
+    ['a UNIQUE', 'badges', 'code text CONSTRAINT badges_code_key UNIQUE', "(code) VALUES ('x')", 'badges_code_key', "(code) VALUES ('x')"],
+    ['a FOREIGN KEY', 'loans', 'owner_id integer CONSTRAINT loans_owner_fkey REFERENCES "%s"."ticket_owners"(id)', null, 'loans_owner_fkey', '(owner_id) VALUES (999)'],
+  ])('%s: never offered as lossless, and the restore is refused and changes nothing', async (_label, table, column, seed, constraint, violation) => {
+    await ddl(`CREATE TABLE ${T(table)} (id serial PRIMARY KEY, ${column.replace('%s', schema)})`)
+    if (seed) await ddl(`INSERT INTO ${T(table)} ${seed}`)
+    const closed = await change(`drop ${constraint}`, async () => {
+      await ddl(`ALTER TABLE ${T(table)} DROP CONSTRAINT ${constraint}`)
+    })
+    await ddl(`INSERT INTO ${T(table)} ${violation}`)
+    const shape = tableSignature((await catalog()).tables[table])
+    const count = async () => (await rows<{ n: number }>(`SELECT count(*)::int AS n FROM ${T(table)}`))[0].n
+    const rowsNow = await count()
+
+    const p = (await previewRecovery(projectId, closed.id))!
+    expect(p.safety).toBe('blocked')
+    expect(p.reason).toMatch(new RegExp(`${constraint}|violat|would fail`, 'i'))
+    // Run anyway, the proof runs for real inside the restore's transaction and is
+    // rolled back: the change stays in effect, untouched, and nothing escalates.
+    const out = await restore(closed.id, { anything: 1 })
+    expect(out).toMatchObject({ ok: false, code: 'RECOVERY_FAILED', status: 'healthy' })
+    expect((out as any).error).toMatch(/nothing was changed/)
+    expect(tableSignature((await catalog()).tables[table])).toEqual(shape)
+    expect(await count()).toBe(rowsNow)
+    expect((await record(closed.id)).status).toBe('healthy')
+  })
+})
+
+describe('a primary key moved to another column', () => {
+  let before: CatalogSnapshot
+
+  it('restores the original key exactly, losslessly', async () => {
+    await ddl(`CREATE TABLE ${T('serials')} (id serial PRIMARY KEY, code text NOT NULL)`)
+    await ddl(`INSERT INTO ${T('serials')} (code) VALUES ('a'), ('b')`)
+    before = await catalog()
+    const closed = await change('key serials by code', async () => {
+      await ddl(`ALTER TABLE ${T('serials')} DROP CONSTRAINT serials_pkey`)
+      await ddl(`ALTER TABLE ${T('serials')} ADD CONSTRAINT serials_code_pkey PRIMARY KEY (code)`)
+    })
+    expect(await record(closed.id)).toMatchObject({ status: 'healthy', risk: 'transforming' })
+    const p = (await previewRecovery(projectId, closed.id))!
+    expect(p.safety).toBe('lossless')
+    const out = await restore(closed.id)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect(tableSignature((await catalog()).tables.serials)).toEqual(tableSignature(before.tables.serials))
+    expect(await rows(`SELECT id, code FROM ${T('serials')} ORDER BY id`)).toEqual([{ id: 1, code: 'a' }, { id: 2, code: 'b' }])
+  })
+
+  it('with a row written since that repeats an id, the restore is refused and changes nothing', async () => {
+    await ddl(`CREATE TABLE ${T('vouchers')} (id serial PRIMARY KEY, code text NOT NULL)`)
+    await ddl(`INSERT INTO ${T('vouchers')} (code) VALUES ('a')`)
+    const closed = await change('key vouchers by code', async () => {
+      await ddl(`ALTER TABLE ${T('vouchers')} DROP CONSTRAINT vouchers_pkey`)
+      await ddl(`ALTER TABLE ${T('vouchers')} ADD CONSTRAINT vouchers_code_pkey PRIMARY KEY (code)`)
+    })
+    // Legal now that the key is code: the same id again.
+    await ddl(`INSERT INTO ${T('vouchers')} (id, code) VALUES (1, 'b')`)
+    const shape = tableSignature((await catalog()).tables.vouchers)
+    const p = (await previewRecovery(projectId, closed.id))!
+    expect(p.safety).toBe('blocked')
+    const out = await restore(closed.id, { anything: 1 })
+    expect(out).toMatchObject({ ok: false, code: 'RECOVERY_FAILED', status: 'healthy' })
+    expect((out as any).error).toMatch(/nothing was changed/)
+    expect(tableSignature((await catalog()).tables.vouchers)).toEqual(shape)
+    expect((await record(closed.id)).status).toBe('healthy')
+    expect(await rows(`SELECT id, code FROM ${T('vouchers')} ORDER BY code`)).toEqual([{ id: 1, code: 'a' }, { id: 1, code: 'b' }])
+  })
+})
+
+describe('two tables consolidated into one: rows moved between tables', () => {
+  let changeId: string
+  const people = (table: string) => rows<{ name: string; email: string | null }>(`SELECT name, email FROM ${T(table)} ORDER BY id`)
+  let customers: Array<{ name: string; email: string | null }>
+  let leads: Array<{ name: string; email: string | null }>
+
+  beforeAll(async () => {
+    await ddl(`CREATE TABLE ${T('customers')} (id serial PRIMARY KEY, name text NOT NULL, email text)`)
+    await ddl(`CREATE TABLE ${T('leads')} (id serial PRIMARY KEY, name text NOT NULL, email text)`)
+    await ddl(`INSERT INTO ${T('customers')} (name, email) VALUES ('ada', 'ada@x'), ('alan', NULL)`)
+    await ddl(`INSERT INTO ${T('leads')} (name, email) VALUES ('grace', 'grace@x'), ('linus', 'linus@x')`)
+    customers = await people('customers')
+    leads = await people('leads')
+    const closed = await change('consolidate customers and leads into contacts', async () => {
+      await ddl(`CREATE TABLE ${T('contacts')} (id serial PRIMARY KEY, name text NOT NULL, email text, kind text NOT NULL)`)
+      await ddl(
+        `INSERT INTO ${T('contacts')} (name, email, kind)
+         SELECT name, email, 'customer' FROM ${T('customers')} UNION ALL SELECT name, email, 'lead' FROM ${T('leads')}`,
+      )
+      for (const t of ['customers', 'leads']) expect((await archiveTable(projectId, schema, t)).handled).toBe(true)
+    })
+    changeId = closed.id
+  }, 60_000)
+
+  it('is destructive, with both source tables kept whole', async () => {
+    const r = await record(changeId)
+    expect(r).toMatchObject({ status: 'healthy', risk: 'destructive' })
+    const entries = (r.preserved as any).entries as any[]
+    expect(entries.map((e) => `${e.kind}:${e.table}:${e.rows}`).sort()).toEqual(['table:customers:2', 'table:leads:2'])
+    expect(await exists(schema, 'customers')).toBe(false)
+    expect((await rows<{ n: number }>(`SELECT count(*)::int AS n FROM ${T('contacts')}`))[0].n).toBe(4)
+  })
+
+  it('restores both source tables value for value, and removes the consolidated one', async () => {
+    const p = (await previewRecovery(projectId, changeId))!
+    expect(p.safety).toBe('lossless')
+    const out = await restore(changeId)
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
+    expect(await people('customers')).toEqual(customers)
+    expect(await people('leads')).toEqual(leads)
+    expect(await exists(schema, 'contacts')).toBe(false)
+  })
+
+  it('reapplied, then written to: restoring again sets the new contact aside for approval, never dropping it', async () => {
+    const recoveryId = (await record(changeId)).recoveredById!
+    const again = await restore(recoveryId, (await previewRecovery(projectId, recoveryId))?.acknowledgement)
+    expect(again).toMatchObject({ ok: true })
+    await ddl(`INSERT INTO ${T('contacts')} (name, email, kind) VALUES ('margaret', 'm@x', 'lead')`)
+
+    const p = (await previewRecovery(projectId, changeId))!
+    expect(p.safety).toBe('needs_approval')
+    // The whole consolidated table leaves the app, so all five of its rows are
+    // what a person approves: the new one, and four whose values also come back
+    // in the restored source tables. Counted in full, never fewer.
+    expect(p.acknowledgement).toEqual({ 'rows_set_aside:contacts:': 5 })
+    const out = await restore(changeId, p.acknowledgement)
+    expect(out).toMatchObject({ ok: true })
+    expect(await people('customers')).toEqual(customers)
+    expect(await people('leads')).toEqual(leads)
+    const kept = ((await record((out as any).recoveryId)).preserved as any).entries.find((e: any) => e.table === 'contacts')
+    expect(kept.rows).toBe(5)
+    expect(await rows(`SELECT name FROM "${kept.vault}"."${kept.vaultTable}" WHERE name = 'margaret'`)).toEqual([{ name: 'margaret' }])
+  })
+})
+
 describe('changes in order', () => {
   it('a later change to the same table blocks a restore and is named; restoring it first clears the way', async () => {
     await ddl(`CREATE TABLE ${T('stack')} (id serial PRIMARY KEY)`)
