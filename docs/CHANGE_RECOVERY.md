@@ -39,12 +39,17 @@ applying ─┬─> verifying ─┬─> healthy ──────────�
           └─> partially_applied ──────────────────┤
                                                   ├─> recovering ─┬─> recovered
                                                   │               └─> recovery_failed
-                                                  └─> awaiting_approval ─> recovering
-recovery_failed / an interrupted applying ─> manual_intervention_required
+                                                  └─> awaiting_approval ─┬─> recovering
+                                                                          └─> kept (a person declined)
+recovery_failed / an interrupted applying ─> manual_intervention_required ─┬─> recovering
+                                                                          └─> kept
+kept ─> recovering (a person restores it later)
 ```
 
-Only `healthy` and `unverified` mean "this change is in effect and nothing is
-pending". A recovery that ran but whose result Backenly could not confirm is
+`healthy`, `unverified` and `kept` mean "this change is in effect and nothing
+is pending"; `kept` also says it failed its checks and a person chose to keep
+it, which clears it from the queue and lets automatic recovery resume for the
+project. A recovery that ran but whose result Backenly could not confirm is
 never `recovered`.
 
 ## Checkpoints
@@ -147,7 +152,16 @@ change applied → protected verification
 
 It runs in the same change lock as the change, so no other change can land in
 between. A recovery that fails stops: no retries, the evidence stays, and the
-change becomes `manual_intervention_required` with an approval request.
+change becomes `manual_intervention_required`. While any change of the project
+needs a person, Backenly takes no further automatic recovery action there: a
+new failure waits for approval too, until that person restores or keeps the
+stuck change.
+
+A recovery waiting for approval is an ordinary request in the existing
+approvals inbox (`lib/mcp/approvals.ts`): tool `revert_schema_change`, the
+change id, and exactly the impact Backenly measured. Approving runs it (admin
+only), checked again under lock against what was approved; declining keeps the
+change (`kept`). A restore or keep from the console answers the request.
 
 ## Manual restore
 
@@ -176,9 +190,35 @@ recovery of a recovery; the console never presents it as one.
 update, no delete except with the project. `backend_changes` rows cannot change
 their identity, attribution or evidence once written, and status can only move
 along the lifecycle above. Each event carries the principals
-(`lib/principal`): who requested, who authorised, who executed. Recoveries are
-also written to the audit log as `ROLLBACK_*` rows, so the Autonomy page's
-activity feed and its "Rolled back" count include them.
+(`lib/principal`): who requested, who authorised, who executed. Recoveries and
+restores are also written to the audit log as `ROLLBACK_CHANGE_*` rows, so the
+Autonomy page's activity feed and its "Rolled back" count include them; a
+reapply (`CHANGE_REAPPLIED`), a change kept as it is (`CHANGE_KEPT`) and a
+recovery waiting for a person (`CHANGE_RECOVERY_*`) appear in the feed without
+counting as rollbacks.
+
+## Regions and residency
+
+A project's schema lives in its region's database (`lib/data-plane/regional.ts`),
+so everything a change does to the project's data happens there: the change
+lock and the connection it holds (`lib/changes/lock.ts`), the catalog read for
+the checkpoint and for verification, every vault, and the restore itself. A
+region this process has no connection to is refused with
+`REGION_NOT_CONFIGURED`; nothing falls back to the home database, where the
+schema is not. The SQL recorder is installed on the region's own client, so a
+regional change's statements are captured where they are sent.
+
+The change records themselves are platform rows in the home region. For a
+project kept elsewhere they keep names, counts, the footprint, the catalog
+structure (the same class of record as the workspace schema snapshots) and
+each check's outcome, and withhold the SQL that ran, step summaries, error
+text and the request as written (`lib/changes/residency.ts`, after
+`lib/data-plane/residency.ts`). View details says the SQL stays in the region.
+The data a change kept is never on a platform row: it is in the vault, a schema
+in the project's own database.
+
+Region qualification (`scripts/qualify-region.ts`) restores a governed change
+from the console and requires the restore to come back verified.
 
 ## What is not automated
 
