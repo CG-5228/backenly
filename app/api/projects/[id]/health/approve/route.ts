@@ -22,7 +22,8 @@ import { withProjectAccess } from '@/lib/auth/route-protection'
 import { canWriteProject } from '@/lib/edition/guard'
 import { prisma } from '@/lib/db/prisma'
 import { executeApprovedFix, revertAutoFix } from '@/lib/core/auto-fix-engine'
-import { quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
+import { quotedError, quotesKeptHere, recordedStatements } from '@/lib/data-plane/residency'
+import type { RecordedStatement } from '@/lib/execution/sql-recorder'
 import { heldActionRecord } from '@/lib/operational-memory/held-action-targets'
 import { resolvePendingActionMemory } from '@/lib/operational-memory/ledger'
 
@@ -195,10 +196,14 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
         message: quotedError(result.message, quote),
         snapshotId: result.snapshotId ?? null,
         // The statements the approved fix actually ran, captured at the driver
-        // (lib/execution/sql-recorder.ts). The audit row outlives the finding,
-        // so the record of what was executed belongs here as well as in
-        // finding.details.rollbackData.
-        statements: (result.rollbackData as Record<string, unknown> | undefined)?.statements ?? [],
+        // (lib/execution/sql-recorder.ts), without their bound values for a held
+        // action or a project kept in another region (lib/data-plane/residency.ts).
+        // The audit row outlives the finding, so the record of what was executed
+        // belongs here as well as in finding.details.rollbackData.
+        statements: recordedStatements(
+          ((result.rollbackData as Record<string, unknown> | undefined)?.statements ?? []) as RecordedStatement[],
+          { quote, held: finding.type === 'ai_action_pending' },
+        ),
         // Drives the ledger copy: only 'confirmed' may claim re-verification.
         verification: result.verification ?? 'unverified',
         // Only 'ran' may claim nothing else broke.
