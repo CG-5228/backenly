@@ -673,7 +673,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     }
     await check('rls', 'v1-own-rows-only', ['insert-a', 'insert-b'], async () => {
       for (const who of ['a', 'b'] as const) {
-        const rows: Array<{ owner_id: string; body: string }> = await users[who]!.client[TABLE].list({ limit: 1000 })
+        const rows: Array<{ owner_id: string; body: string }> = await users[who]!.client[TABLE].list({ limit: 100 })
         must(rows.length > 0, `user ${who} sees none of its rows`)
         must(rows.every((r) => r.owner_id === users[who]!.id), `user ${who} sees another user's row`)
         must(rows.some((r) => r.body === `${run}-${who}`), `user ${who} does not see this run's row`)
@@ -889,7 +889,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(/does not exist/i.test(gone), `${rollbackTable} is still in the region's schema after the rollback: ${gone.slice(0, 160)}`)
       const tables = await mcp!.call('read_backend_state', { section: 'tables' })
       must(tables.text.includes(TABLE), `the rollback removed ${TABLE}, which the restore point recorded`)
-      const rows: Array<{ body: string }> = await users.a!.client[TABLE].list({ limit: 1000 })
+      const rows: Array<{ body: string }> = await users.a!.client[TABLE].list({ limit: 100 })
       must(rows.some((r) => r.body === `${run}-a`), `user a no longer sees its row in ${TABLE} after the rollback`)
       return `rolled back to v${restorePoint!.versionNum}: ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
     })
@@ -993,7 +993,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     let snapshotId: string | null = null
     const atSnapshot: Record<'a' | 'b', string[]> = { a: [], b: [] }
     const idsOf = async (who: 'a' | 'b') =>
-      ((await users[who]!.client[TABLE].list({ limit: 1000 })) as Array<{ id: string }>).map((r) => r.id).sort()
+      ((await users[who]!.client[TABLE].list({ limit: 100 })) as Array<{ id: string }>).map((r) => r.id).sort()
     await check('recovery', 'snapshot', ['sign-in', 'insert-a', 'insert-b'], async () => {
       for (const who of ['a', 'b'] as const) atSnapshot[who] = await idsOf(who)
       const known = new Set(((await operatorJson(snapshotsPath)).data ?? []).map((s: { id: string }) => s.id))
