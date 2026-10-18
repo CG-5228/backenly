@@ -193,10 +193,21 @@ async function withFixGroup<T>(findingId: string, fn: () => Promise<T>): Promise
   const { withChangeAttribution, currentAttribution } = await import('@/lib/changes/attribution')
   const groupId = `fix:${findingId}:${randomUUID().slice(0, 8)}`
   const result = await withChangeAttribution({ source: currentAttribution()?.source ?? 'autonomy', groupId }, fn)
-  const changes = await prisma.backendChange
-    .findMany({ where: { groupId, kind: 'change' }, orderBy: { seq: 'desc' }, select: { id: true } })
-    .catch(() => [] as Array<{ id: string }>)
-  return { result, changeIds: changes.map((c) => c.id) }
+  return { result, changeIds: await changesInGroup(groupId) }
+}
+
+/**
+ * The governed changes a fix group made, newest first. The fix has already run
+ * by now, so failing to read them must not make it look as if it had not:
+ * none recorded means its Undo says so (revertEligibility).
+ */
+async function changesInGroup(groupId: string): Promise<string[]> {
+  try {
+    const changes = await prisma.backendChange.findMany({ where: { groupId, kind: 'change' }, orderBy: { seq: 'desc' }, select: { id: true } })
+    return changes.map((c) => c.id)
+  } catch {
+    return []
+  }
 }
 
 // ── Core engine ───────────────────────────────────────────────────────────────
