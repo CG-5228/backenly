@@ -31,7 +31,7 @@ import { prisma } from '@/lib/db'
 import { enqueue } from '@/lib/queue'
 import { createHash } from 'node:crypto'
 import { readTableFacts, relationExists, type TableFacts } from './facts'
-import { ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
+import { hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
 import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
 import { inFlightChain } from './backfill-job'
@@ -215,11 +215,13 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       await runStatements(step.sql)
       const after = await readTableFacts(schema, spec.host)
       const trig = after?.triggers.find(t => t.name === n.forward)
-      if (!trig) {
-        return { status: 'failed', detail: `CREATE TRIGGER reported no error but ${n.forward} is not on ${spec.host}` }
-      }
-      if (!after?.triggers.some(t => t.name === n.cascadeMark)) {
-        return { status: 'failed', detail: `CREATE TRIGGER reported no error but ${n.cascadeMark} is not on ${spec.host}` }
+      const expected = hostLadderObjects(spec)
+      const missing = [
+        ...expected.triggers.filter(name => !after?.triggers.some(t => t.name === name)),
+        ...expected.policies.filter(name => !after?.policies.some(p => p.name === name)),
+      ]
+      if (!trig || missing.length > 0) {
+        return { status: 'failed', detail: `the statements reported no error but ${spec.host} lacks ${missing.join(', ') || n.forward}` }
       }
       return {
         status: 'completed',

@@ -209,7 +209,7 @@ export async function rehearseExtraction(
   const host = fq(scratch.schema, spec.host)
   const sat = fq(scratch.schema, spec.satellite)
   const fk = qi(names.fkColumn)
-  const carried = carriedObjects(facts, spec, names, scratch, { includeForeignKeys: false })
+  const carried = carriedObjects(facts, spec, names, scratch)
   // Exactly as plan.ts computes them, so the rungs rehearsed are the rungs approved.
   const readers = granteesWith(facts, 'SELECT')
   const writers = granteesWith(facts, 'UPDATE').filter(r => readers.includes(r))
@@ -504,6 +504,9 @@ async function reproduceHostAccess(
               pg_get_expr(p.polwithcheck, p.polrelid) AS chk
          FROM pg_policy p
         WHERE p.polrelid = to_regclass(format('%I.%I', $1::text, $2::text))
+          -- Backenly's own (a ladder already under way): rendered for the copy
+          -- by the ladder itself, never copied from the live table.
+          AND p.polname NOT LIKE 'bkn\\_evo\\_%'
         ORDER BY p.polname`,
       facts.schema,
       spec.host,

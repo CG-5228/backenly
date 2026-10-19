@@ -42,11 +42,11 @@
 import { prisma } from '@/lib/db'
 import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-flight'
 import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
-import { readTableFacts } from './facts'
+import { readTableFacts, type TableFacts } from './facts'
 import { latestRun, ledgerSteps, readLatestEvolutionApproval } from './consent'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite, reloadDataPlane, runStatements, unregisterTable } from './primitives'
-import { closeWritesSql, dropForwardSyncSql, dropSatelliteSql, fq, ladderNames, revokeReadsSql } from './sql'
+import { closeWritesSql, dropForwardSyncSql, dropSatelliteSql, fq, hostLadderObjects, ladderNames, revokeReadsSql } from './sql'
 
 export interface RollbackAction {
   action: 'close_writes' | 'revoke_reads' | 'drop_forward_sync' | 'drop_satellite' | 'withdraw_consent'
@@ -91,7 +91,10 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   if (!host) return { status: 'refused', reason: `${spec.host} no longer exists`, actions }
   const sat = await readTableFacts(schema, spec.satellite)
   const ours = isOurSatellite(sat, spec)
-  const forwardLive = host.triggers.some(t => t.name === n.forward || t.name === n.cascadeMark)
+  const hostObjects = hostLadderObjects(spec)
+  const onHost = (f: TableFacts) =>
+    f.triggers.some(t => hostObjects.triggers.includes(t.name)) || f.policies.some(p => hostObjects.policies.includes(p.name))
+  const forwardLive = onHost(host)
 
   if (sat && !ours) {
     return { status: 'refused', reason: `${spec.satellite} exists but was not created by this extraction`, actions }
@@ -148,6 +151,8 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     const facts = await readTableFacts(schema, spec.host)
     if (!facts) return `${spec.host} no longer exists`
     const r = await reconcileExtraction(projectId, facts, spec)
+    // A partial view proves nothing either way.
+    if (!r.complete) return `${r.summary}; Backenly cannot show that dropping ${spec.satellite} would lose nothing`
     return r.orphaned > 0 || r.mismatched > 0
       ? `${spec.satellite} holds data ${spec.host} does not (${r.orphaned} orphaned, ${r.mismatched} different; ` +
           `keys ${[...r.samples.orphaned, ...r.samples.mismatched].join(', ')}). Dropping it would lose that; reconcile by hand first.`
@@ -212,8 +217,10 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
       'drop_forward_sync',
       forwardLive,
       dropForwardSyncSql(spec, target),
-      async () =>
-        !((await readTableFacts(schema, spec.host))?.triggers.some(t => t.name === n.forward || t.name === n.cascadeMark) ?? false),
+      async () => {
+        const h = await readTableFacts(schema, spec.host)
+        return !!h && !onHost(h)
+      },
       `${spec.host} no longer mirrors into ${spec.satellite}`,
     )) &&
     (await step(

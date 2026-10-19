@@ -21,7 +21,7 @@
  *   - the backfill meeting a row being written: it never waits, retries, and
  *     gives up to the job queue rather than queueing writers behind it
  *   - integer keys across several batches (the cursor used to sort as text)
- *   - a parent's key changing (ON UPDATE CASCADE), a client moving a refund to
+ *   - a parent's key changing (the forward sync re-keys its row), a client moving a refund to
  *     another order, a host trigger rewriting a value written through the
  *     satellite, a savepoint rolled back mid-sync, TRUNCATE, and the satellite
  *     dropped by hand
@@ -452,7 +452,7 @@ describe('the forward mirror is fail-closed', () => {
 })
 
 describe('edges of the sync', () => {
-  it("follows a parent's key changing (ON UPDATE CASCADE) instead of refusing it", async () => {
+  it("follows a parent's key changing instead of refusing it", async () => {
     const k = refundKey()
     const moved = 1_000_000 + k
     await expect(q(`UPDATE ${t('orders')} SET id = $1 WHERE id = $2`, moved, k)).resolves.toBe(1)
@@ -537,11 +537,12 @@ describe('edges of the sync', () => {
       expect(err?.code).toBe('42501')
     })
 
-    it('is not excused by a parent delete an earlier statement counted', async () => {
+    it('is not excused by a parent delete earlier in the transaction', async () => {
       // A parent carrying the concern whose satellite row is already gone (a
-      // write that bypassed the triggers): deleting it is counted and no
-      // cascade consumes the count. A later statement in the same transaction
-      // must not be able to spend it.
+      // write that bypassed the triggers) is deleted. Older versions counted
+      // such deletes to tell a cascade from a client's delete, and a later
+      // statement could spend the count; nothing is counted now, and a later
+      // client delete must still reach its own parent.
       const orphanParent = refundKey()
       const victim = refundKey()
       const before = await valuesOf(victim)
@@ -558,7 +559,7 @@ describe('edges of the sync', () => {
       expect(await valuesOf(victim)).toEqual(before)
     })
 
-    it('still lets a parent\'s own delete cascade, in the same statement', async () => {
+    it('a parent\'s own delete still removes its satellite row, in the same statement', async () => {
       const k = refundKey()
       await expect(q(`DELETE FROM ${t('orders')} WHERE id = $1`, k)).resolves.toBe(1)
       expect(await valuesOf(k)).toEqual({ host: '(missing)', sat: null })

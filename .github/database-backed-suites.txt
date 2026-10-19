@@ -686,7 +686,8 @@ tests/integration/maintenance-backfill-chain.spec.ts
 tests/integration/structural-evolution.spec.ts
 
 # The dual representation is fail-closed under concurrency: each interleaving of
-# writers, the backfill and cascades is forced with real sessions and locks.
+# writers, the backfill and parent deletes and re-keys is forced with real
+# sessions and locks.
 tests/integration/structural-evolution-concurrency.spec.ts
 
 # Who may read and write the new table is rehearsed identity by identity
@@ -709,3 +710,9 @@ tests/integration/evolution-engine-recovery.spec.ts
 # NOBYPASSRLS platform role, as in production. Closed until opened, then exactly
 # the host's visibility claim by claim; a hand-set echo guard bypasses nothing.
 tests/integration/structural-evolution-runtime-role.spec.ts
+
+# What the dual representation must preserve, with the workspace owned by a
+# NOSUPERUSER platform role: the host's own triggers decide the value, its
+# constraints keep their exact meaning, rows hidden from Backenly are never
+# reconciled from a partial view, TRUNCATE, and forged settings.
+tests/integration/structural-evolution-semantics.spec.ts

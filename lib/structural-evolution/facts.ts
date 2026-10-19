@@ -155,6 +155,25 @@ export interface TableFacts {
   dependents: ColumnDependent[]
   /** Null when the statistics collector has nothing for this table. */
   stats: TableStats | null
+  /** The role these facts were read as (the platform's), and whether row security binds it at all. */
+  reader?: { role: string; bypassRls: boolean }
+}
+
+/**
+ * Restrictive row-level policies on the table that bind the reader's role
+ * for reads or row locks. Permissive policies are OR-ed, so Backenly's own
+ * read policy adds the rows they hide; restrictive ones are AND-ed, and
+ * nothing Backenly adds can see past them. Roles the reader merely belongs
+ * to are checked at run time (reconcile.ts, hostVisibility).
+ */
+export function restrictivePoliciesBindingReader(f: TableFacts): string[] {
+  if (!f.rowSecurity || !f.reader || f.reader.bypassRls) return []
+  if (f.owner === f.reader.role && !f.forceRowSecurity) return []
+  const me = f.reader.role
+  return f.policies
+    .filter(p => !p.permissive && ['r', 'w', '*'].includes(p.command))
+    .filter(p => p.roles.some(r => r.toLowerCase() === 'public' || r === me))
+    .map(p => p.name)
 }
 
 const REL = `to_regclass(format('%I.%I', $1::text, $2::text))`
@@ -207,6 +226,11 @@ export async function readTableFacts(schema: string, table: string): Promise<Tab
   )
   const r = rel[0]
   if (!r || !['r', 'p'].includes(r.relkind)) return null
+  const reader = (
+    await q<{ role: string; bypass: boolean }>(
+      `SELECT current_user::text AS role, (rolsuper OR rolbypassrls) AS bypass FROM pg_roles WHERE rolname = current_user`,
+    )
+  )[0]
 
   const [columns, constraints, inbound, indexes, policies, triggers, grants, dependents, stats] =
     await Promise.all([
@@ -461,6 +485,7 @@ export async function readTableFacts(schema: string, table: string): Promise<Tab
           idxScans: num(s.idx),
         }
       : null,
+    ...(reader ? { reader: { role: String(reader.role), bypassRls: reader.bypass === true } } : {}),
   }
 }
 

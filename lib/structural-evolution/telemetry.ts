@@ -549,7 +549,9 @@ export async function observeExtraction(
         consistency = { name: CONSISTENCY_SIGNAL, status: 'regressed', detail: `${host} no longer exists` }
       } else {
         const r = await reconcileExtraction(projectId, facts, plan.spec)
-        consistency = { name: CONSISTENCY_SIGNAL, status: r.consistent ? 'ok' : 'regressed', detail: r.summary }
+        // A partial view proves neither agreement nor disagreement: watched on,
+        // never called stable (that needs a passing check on the latest pass).
+        consistency = { name: CONSISTENCY_SIGNAL, status: !r.complete ? 'unavailable' : r.consistent ? 'ok' : 'regressed', detail: r.summary }
       }
     } catch (err) {
       consistency = { name: CONSISTENCY_SIGNAL, status: 'unavailable', detail: `reconciliation could not run: ${errText(err)}` }

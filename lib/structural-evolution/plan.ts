@@ -40,7 +40,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { basisFingerprint, granteesWith, type TableFacts } from './facts'
+import { basisFingerprint, granteesWith, restrictivePoliciesBindingReader, type TableFacts } from './facts'
 import { readName } from './lexicon'
 import {
   carriedObjects,
@@ -192,6 +192,17 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
   const separability = assessSeparability(facts, spec.members, input.consumers ?? [])
   invalid.push(...separability.expandBlockers)
 
+  // Every row must be copied and every row compared. Backenly's own read
+  // policy adds the rows permissive policies hide from it; a restrictive one
+  // binding its role hides rows nothing can add back (see hostVisibility).
+  const hiding = restrictivePoliciesBindingReader(facts)
+  if (hiding.length > 0) {
+    blocked.push(
+      `a restrictive row-level policy on ${spec.host} (${hiding.join(', ')}) also binds Backenly's own database role, ` +
+        'so it could never show that a copy of every row is complete',
+    )
+  }
+
   // A list squeezed into numbered columns is a real proposal with the wrong
   // ladder: it wants one ROW per number, which is an unpivot, not a split.
   // Planned, shown, and honestly blocked until that rung exists.
@@ -233,7 +244,7 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
   }
 
   const names = ladderNames(spec)
-  const carried = carriedObjects(facts, spec, names, target, { includeForeignKeys: true })
+  const carried = carriedObjects(facts, spec, names, target)
   const sat = `${spec.satellite}`
   const cols = spec.members.join(', ')
   const verifyStep = (why: string): Omit<ExtractionStep, 'ordinal' | 'idempotencyKey'> => ({
@@ -244,7 +255,10 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
     why,
     sql: [reconcileSql(facts, spec, target)],
     preconditions: [`${sat} exists`],
-    postconditions: ['no host row is missing its satellite row, no satellite row is orphaned, no values differ'],
+    postconditions: [
+      'every host row was visible to the check',
+      'no host row is missing its satellite row, no satellite row is orphaned, no values differ',
+    ],
     rollback: { strategy: 'none_required', description: 'Reads only.', sql: [] },
   })
 
@@ -255,7 +269,7 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       capability: capabilityOf('rehearse'),
       title: 'Rehearse on a copy of real rows',
       why:
-        'Runs steps 1–4 and 6 against a sample of this table copied into a scratch schema, exercises inserts, ' +
+        'Runs every step Backenly would run here (1–7) against a sample of this table copied into a scratch schema, exercises inserts, ' +
         'updates, clears, deletes and writes through the new table, and reconciles after each — all inside one ' +
         'transaction that is always rolled back. Nothing it does is ever visible.',
       sql: [],
@@ -270,15 +284,16 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       title: `Create ${sat}`,
       why:
         `A new table for the ${spec.label} concern: ${cols}, plus a unique reference to ${spec.host}. ` +
-        'It starts closed — row-level security forced, every grant revoked — so creating it changes nothing anybody can see.',
+        'It starts closed — row-level security forced, every grant revoked, and Backenly\'s own access limited to its own ' +
+        'migration work — so creating it changes nothing anybody can see.',
       sql: createSatelliteSql(facts, spec, target, carried, planId),
       preconditions: [`no relation named ${sat} exists`, `${spec.host} has a single-column primary key`],
       postconditions: [`${sat} exists with ${spec.members.length} member column(s)`, 'row-level security is forced', 'no role but the owner holds a grant'],
       rollback: {
         strategy: 'drop_satellite',
         description:
-          `Drop ${sat}. Refused unless reconciliation first shows it holds nothing ${spec.host} does not also hold, ` +
-          'so undoing it can never lose a write.',
+          `Drop ${sat}, after the mirroring on ${spec.host} is removed. Refused unless reconciliation of every row first ` +
+          `shows ${sat} holds nothing ${spec.host} does not also hold, so undoing it can never lose a write.`,
         sql: dropSatelliteSql(spec, target),
       },
     },
@@ -288,12 +303,18 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       capability: capabilityOf('sync_forward'),
       title: `Mirror every write to ${spec.host} into ${sat}`,
       why:
-        'An AFTER trigger in the same transaction as the write. It cannot abort the customer\'s write: an error ' +
-        'inside it is recorded and swallowed, and reconciliation is what proves it never happened.',
+        `Triggers in the same transaction as each write to ${spec.host} copy what ${spec.host} actually stored, after its ` +
+        'own triggers, into the new table. If the copy cannot be written, the write itself does not commit: the two ' +
+        'never disagree after a commit. Backenly also gets a read and a share lock of every row it copies, usable only ' +
+        `by its own migration work. While both tables exist, TRUNCATE of ${spec.host} needs CASCADE.`,
       sql: forwardSyncSql(facts, spec, target),
       preconditions: [`${sat} exists`],
       postconditions: [`a trigger on ${spec.host} keeps ${sat} in step`],
-      rollback: { strategy: 'drop_forward_sync', description: 'Drop the trigger and its function.', sql: dropForwardSyncSql(spec, target) },
+      rollback: {
+        strategy: 'drop_forward_sync',
+        description: `Drop the triggers, their functions and Backenly's own read and lock policies on ${spec.host}.`,
+        sql: dropForwardSyncSql(spec, target),
+      },
     },
     {
       kind: 'backfill',
@@ -302,7 +323,8 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       title: `Copy existing ${spec.label} data into ${sat}`,
       why:
         `Batches of ${BACKFILL_BATCH_ROWS} rows in key order, each holding a share lock on its own rows only, ` +
-        'resumable from the last key, retried by the job queue.',
+        'resumable from the last key, retried by the job queue. It stops rather than copy part of the table if ' +
+        'Backenly cannot see every row.',
       sql: [backfillBatchSql(facts, spec, target, BACKFILL_BATCH_ROWS)],
       preconditions: ['the forward sync is installed'],
       postconditions: ['every pre-existing row is represented'],
@@ -338,6 +360,7 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       why:
         `Every write to ${sat} is applied to ${spec.host} in the same statement, as the caller, so ${spec.host}'s ` +
         'update policy still decides who may change it, and clients still reading the old columns see the change. ' +
+        `If ${spec.host}'s own rules store something other than what was written, both tables keep what ${spec.host} stored. ` +
         `Granted to ${writers.length ? writers.join(', ') : 'no role'} — the roles that can update ${spec.host}.`,
       sql: openWritesSql(facts, spec, target, writers),
       preconditions: ['reads are exposed', 'reconciliation passed'],
@@ -385,7 +408,11 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
     steps,
     validity: blocked.length > 0 ? 'blocked_by_capability' : 'executable',
     blockedReasons: blocked,
-    caveats: [...separability.caveats, ...carried.notCarried],
+    caveats: [
+      ...separability.caveats,
+      ...carried.notCarried,
+      `While both tables exist, TRUNCATE ${spec.host} needs CASCADE (it then empties both), and ${sat} cannot be truncated on its own.`,
+    ],
   }
 }
 

@@ -38,6 +38,7 @@ import { backfillBatchSql, ladderAccessSql, type ExtractionSpec } from './sql'
 import { BACKFILL_BATCH_ROWS } from './plan'
 import { LOCK_TIMEOUT_MS } from './primitives'
 import { readLiveEvolutionApproval } from './consent'
+import { hostVisibility } from './reconcile'
 
 /** A batch that met a row being written is retried this many times, after these waits. */
 export const LOCKED_ROW_RETRY_MS = [100, 400, 1_600] as const
@@ -74,6 +75,12 @@ export interface EvolutionBackfillResult {
   refusal?: string
 }
 
+class IncompleteView extends Error {
+  constructor(public reason: string) {
+    super(`incomplete view: ${reason}`)
+  }
+}
+
 export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPayload): Promise<EvolutionBackfillResult> {
   const batches = (payload.batches ?? 0) + 1
   const stop = (refusal: string): EvolutionBackfillResult => ({
@@ -107,8 +114,12 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
         rlsSessionSql(1),
         ...rlsSessionParams({ userId: '', isServiceRole: true, userRole: 'service' }),
       )
-      // The ladder's own context: the satellite's owner policy admits the copy.
+      // The ladder's own context: the satellite's owner policy admits the copy,
+      // and Backenly's own read policy on the host shows every row to it.
       await tx.$executeRawUnsafe(ladderAccessSql(payload.spec))
+      // A copy of what the platform happens to see is not a backfill.
+      const view = await hostVisibility(tx, payload.spec, { schema })
+      if (!view.complete) throw new IncompleteView(view.reason ?? 'unknown')
       // Same transaction, same connection: SET LOCAL bounds the batch below it.
       // NOWAIT covers the host rows; this bounds the satellite side.
       await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`)
@@ -120,6 +131,9 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
       rows = await batch()
       break
     } catch (err) {
+      if (err instanceof IncompleteView) {
+        return stop(`Backenly cannot see every row of ${payload.spec.host}: ${err.reason}; the backfill stopped rather than copy part of it`)
+      }
       // Anything else, and a row still locked after the last wait, goes to
       // BackgroundJob's own retry with backoff.
       if (!isLockNotAvailable(err) || attempt >= LOCKED_ROW_RETRY_MS.length) throw err

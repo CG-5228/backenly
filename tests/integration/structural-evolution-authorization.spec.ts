@@ -653,10 +653,10 @@ describe('a host whose policies ignore the service-role claim', () => {
    * the parent" for "the parent is gone".
    *
    * Now the satellite's client-facing policies are the parent's visibility and
-   * nothing else, its one unconditional policy is for the role that creates it
-   * (the platform, which the forward sync runs as), and the reverse sync
-   * accepts a cascade only when the parent's own row trigger counted it in the
-   * same statement. So a caller holding the claim gets exactly what the host
+   * nothing else, its owner's policy admits the platform only inside the
+   * ladder's own context, and the reverse sync lets nothing past the parent's
+   * update policy but the forward sync itself, running as the owner from
+   * inside a trigger. So a caller holding the claim gets exactly what the host
    * gives it — here, nothing beyond its own bookings.
    */
 
