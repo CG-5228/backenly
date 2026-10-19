@@ -16,7 +16,6 @@ import { executeAction } from '../minimal-executor'
 import type { AIAction } from '../minimal-executor'
 import { collectProof, formatProof } from '../proof-system'
 import { AiError, generate } from '../llm'
-import { answererPrompt } from './prompts'
 import { kickReconciler, shouldKickFor } from '@/lib/autonomy/event-trigger'
 import { WEBHOOK_EVENT_TYPES } from '@/lib/webhooks/events'
 import { publicOrigin } from '@/lib/branches/preview'
@@ -197,7 +196,7 @@ export type ToolName =
  * exactly as issued, for a human to approve. No message can authorise one.
  * The executor also has its own approval-gate as defence-in-depth.
  */
-const DESTRUCTIVE_TOOLS = new Set<ToolName>([
+export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>([
   // Data loss
   'drop_table',
   'truncate_table',
@@ -2590,6 +2589,10 @@ export async function dispatchTool(
     if (name === 'answer_question') {
       const question = String(args.question ?? ctx.userMessage ?? '').trim()
       try {
+        // Imported here, not at the top: prompts.ts reads DESTRUCTIVE_TOOLS from
+        // this module, and two modules importing each other at load hand one of
+        // them a half-initialised copy of the other.
+        const { answererPrompt } = await import('./prompts')
         const result = await generate({
           purpose: 'brain.answer',
           system: answererPrompt(),
