@@ -22,7 +22,13 @@
  *     [--job-wait-minutes 15] [--repair-wait-minutes 6] [--freshness-seconds 30] \
  *     [--member <a developer or viewer of the probe project, by email>] \
  *     [--kill-command '<kills the process serving the control plane>'] [--kill-after-seconds 8] \
- *     [--settle-wait-minutes 30] [--skip-deletion-drill]
+ *     [--settle-wait-minutes 30] [--skip-deletion-drill] \
+ *     [--foreign <a project of another region>@<its region>,...]
+ *
+ * --foreign names projects that live in other regions (the home region's probe
+ * project, another region's): the region's host must refuse each of them. No
+ * key of theirs is needed, since the refusal comes before any key is read.
+ * Without it, that check is reported as not run.
  *
  * The member's password comes from BACKENLY_QUALIFY_MEMBER_PASSWORD (and its
  * current two-factor code, if it has two-factor sign-in, from
@@ -48,7 +54,9 @@
  * What it checks, in order:
  *   region     the region's host answers health; it serves no console path;
  *              the home host refuses the project with 421 WRONG_REGION, naming
- *              the region and its address
+ *              the region and its address; and the region's host refuses every
+ *              --foreign project the same way, on /api/v1 and /api/v2, naming
+ *              that project's region and an address that is not its own
  *   operator   the probe project's owner signs in at the home host
  *   fixtures   over MCP: the key is the probe project's; a table, an owner-only
  *              policy installed as exact SQL, end-user auth, realtime on the
@@ -84,7 +92,10 @@
  *              rows back. A restore is refused, changing nothing, while a later
  *              change depends on what it would undo. PostgREST at the region
  *              serves a new table, stops serving a restored one and serves a
- *              reapplied one within --freshness-seconds, each timed
+ *              reapplied one within --freshness-seconds, each timed, and so does
+ *              read_backend_state's schema section, what a coding agent reads
+ *              to learn the backend (it lagged a restore by 12 minutes once).
+ *              The rollback check above is held to the same bound
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -129,7 +140,7 @@ import { Readable } from 'node:stream'
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 
 import { BackenlyClient } from '@/packages/sdk/src/index'
-import { findRegion } from '@/lib/regions'
+import { HOME_REGION, findRegion } from '@/lib/regions'
 
 // ── Arguments ────────────────────────────────────────────────────────────────
 
@@ -171,6 +182,8 @@ export interface QualifyArgs {
   killAfterSeconds: number
   /** How long the region's scheduler is given to settle a change whose process died. */
   settleWaitMinutes: number
+  /** Projects of other regions, which the region's host must refuse. Empty: that check is not run. */
+  foreign: Array<{ project: string; region: string }>
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -199,7 +212,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   const known = [
     '--project', '--region', '--api', '--home', '--connect', '--report', '--approval-wait-minutes', '--job-wait-minutes',
     '--repair-wait-minutes', '--operator', '--freshness-seconds', '--member', '--kill-command', '--kill-after-seconds',
-    '--settle-wait-minutes',
+    '--settle-wait-minutes', '--foreign',
   ]
   for (const f of flags.keys()) if (!known.includes(f)) throw new Error(`unknown option: ${f}`)
 
@@ -284,6 +297,17 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   const settleWait = Number(flags.get('--settle-wait-minutes') ?? '30')
   if (!Number.isFinite(settleWait) || settleWait <= 0 || settleWait > 120) throw new Error('--settle-wait-minutes must be between 0 and 120')
 
+  const foreign: QualifyArgs['foreign'] = []
+  for (const item of (flags.get('--foreign') ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [id, other, extra] = item.split('@')
+    if (!id || !UUID.test(id) || !other || extra !== undefined) throw new Error(`--foreign takes <project id>@<region> pairs, not "${item}"`)
+    const known = findRegion(other)
+    if (!known) throw new Error(`--foreign names "${other}", which is not a Backenly Cloud region`)
+    if (known.id === region) throw new Error(`--foreign ${id} is in ${region}, the region being qualified: name a project of another region`)
+    if (id.toLowerCase() === project.toLowerCase()) throw new Error('--foreign must not name the probe project')
+    foreign.push({ project: id, region: known.id })
+  }
+
   return {
     project,
     region,
@@ -306,6 +330,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     killCommand,
     killAfterSeconds: killAfter,
     settleWaitMinutes: settleWait,
+    foreign,
   }
 }
 
@@ -642,6 +667,29 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
   const snapshotsPath = `/api/projects/${args.project}/backup`
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
+  /**
+   * Milliseconds from `since` until read_backend_state's schema section lists
+   * `table`, or stops listing it, within --freshness-seconds. That section is
+   * what a coding agent reads to learn the backend, and it answers from the
+   * platform's record of the schema, which a change or a restore refreshes when
+   * it settles: once, it went on describing a restored table for 12 minutes.
+   */
+  async function untilDescribed(table: string, want: 'listed' | 'gone', since: number): Promise<number> {
+    const named = new RegExp(`\\b${table}\\b`)
+    const bound = since + args.freshnessSeconds * 1_000
+    for (;;) {
+      const listed = named.test((await mcp!.call('read_backend_state', { section: 'schema' })).text)
+      if (want === 'listed' ? listed : !listed) return Date.now() - since
+      if (Date.now() > bound) {
+        throw new Error(
+          `read_backend_state's schema section ${want === 'listed' ? 'still did not list' : 'still listed'} ${table} ` +
+            `${args.freshnessSeconds} s after it was asked for`,
+        )
+      }
+      await new Promise((r) => setTimeout(r, 1_000))
+    }
+  }
+
   /** Wait for a snapshot or restore the home host queued, until its region has done it. */
   async function untilRegionDone(jobId: string, what: string): Promise<void> {
     const deadline = Date.now() + args.jobWaitMinutes * 60_000
@@ -721,6 +769,36 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(typeof body.apiUrl === 'string' && body.apiUrl.startsWith(args.api.origin), `the refusal points to ${body.apiUrl}, not the region's host`)
       return `421 WRONG_REGION, pointing to ${body.apiUrl}`
     })
+    // The other direction: this region's host serves only its own projects. A
+    // project of another region is refused before anything about it, its key
+    // included, is read here, so no key of it is needed.
+    if (args.foreign.length === 0) {
+      notRun.push('cross-region isolation at the region host: --foreign named no project of another region')
+    }
+    for (const other of args.foreign) {
+      await check('region', `refuses-${other.region}-project`, [], async () => {
+        const answers: string[] = []
+        for (const path of [`/api/v1/${other.project}/healthz`, `/api/v2/${other.project}/${TABLE}?select=*&limit=1`]) {
+          const res = await theFetch(apiUrl(path))
+          const body = await json(res)
+          const route = path.split('/').slice(0, 3).join('/')
+          must(res.status === 421, `${route} at the ${args.region} host answered ${res.status} for a ${other.region} project, not 421`)
+          must(
+            body.code === 'WRONG_REGION' && body.region === other.region,
+            `the refusal on ${route} names ${body.code}/${body.region}, not WRONG_REGION/${other.region}`,
+          )
+          must(
+            typeof body.apiUrl === 'string' && body.apiUrl.includes(other.project) && !body.apiUrl.startsWith(args.api.origin),
+            `the refusal on ${route} points to ${body.apiUrl}, not the project's own region`,
+          )
+          if (other.region === HOME_REGION) {
+            must(body.apiUrl.startsWith(args.home.origin), `the refusal on ${route} points to ${body.apiUrl}, not the home host`)
+          }
+          answers.push(`${route} 421 to ${body.apiUrl}`)
+        }
+        return `the ${args.region} host refuses ${other.region} project ${other.project.slice(0, 8)}: ${answers.join('; ')}`
+      })
+    }
 
     // ── operator ─────────────────────────────────────────────────────────────
     log('\n── operator (control plane, signed in)')
@@ -1040,7 +1118,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       restorable = { id: made.id, seq: made.seq }
       return `${rollbackTable} created over MCP as change #${made.seq}, applied and verified`
     })
+    let undoneAt = 0
     await check('rollback', 'undone', ['change', 'insert-a'], async () => {
+      undoneAt = Date.now()
       const restored = await restoreFromConsole(restorable!)
       // The region's live catalog: the restore runs on the region's database.
       const gone = await mcp!.call('get_table_schema', { tableName: rollbackTable }).then((o) => o.text, (err: unknown) => describeError(err))
@@ -1050,6 +1130,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const rows: Array<{ body: string }> = await users.a!.client[TABLE].list({ limit: 100 })
       must(rows.some((r) => r.body === `${run}-a`), `user a no longer sees its row in ${TABLE} after the restore`)
       return `restored the state before #${restorable!.seq} (${restored}): ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
+    })
+    await check('rollback', 'described-after-undo', ['undone'], async () => {
+      const ms = await untilDescribed(rollbackTable, 'gone', undoneAt)
+      return `read_backend_state's schema section stopped describing ${rollbackTable} ${seconds(ms)} after the restore was asked for`
     })
 
     // ── autonomy: a fault the region repairs on its own ──────────────────────
@@ -1258,15 +1342,22 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
 
     const keptTable = `qualify_kept_${run}`
     let kept: { id: string; seq: number } | null = null
+    /** When the drill's change, its acknowledged restore and the reapply were each asked for. */
+    const keptAt = { applied: 0, restored: 0, reapplied: 0 }
     await check('rollback-drills', 'served-after-a-change', ['nothing-waiting'], async () => {
       const started = Date.now()
       await fixture('apply_migration', { sql: `CREATE TABLE ${keptTable} (note text)` })
       const applied = Date.now()
+      keptAt.applied = applied
       const made = await changeTouching(keptTable, seqBeforeDrills)
       must(made.outcome.state === 'healthy', `the change that created ${keptTable} is ${made.outcome.state}, not applied and verified`)
       kept = { id: made.id, seq: made.seq }
       const ms = await untilServed(keptTable, 'served', applied)
       return `change #${made.seq} applied and verified in ${seconds(applied - started)}; PostgREST at the region served ${keptTable} ${seconds(ms)} later`
+    })
+    await check('rollback-drills', 'described-after-a-change', ['served-after-a-change'], async () => {
+      const ms = await untilDescribed(keptTable, 'listed', keptAt.applied)
+      return `read_backend_state's schema section described ${keptTable} ${seconds(ms)} after the change applied`
     })
 
     await check('rollback-drills', 'agent-asks-a-person-decides', ['served-after-a-change'], async () => {
@@ -1308,6 +1399,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     let recoveryRecord: string | null = null
     await check('rollback-drills', 'restored-with-acknowledgement', ['restore-needs-a-person'], async () => {
       const asked = Date.now()
+      keptAt.restored = asked
       const res = await changeCall(args.project, kept!.id, 'restore', { seq: kept!.seq, acknowledged: acknowledgement })
       must(res.status === 200 && res.body.status === 'restored', `the acknowledged restore answered ${res.status}: ${String(res.body.error ?? '').slice(0, 200)}`)
       must(res.body.verification?.outcome === 'confirmed', `#${kept!.seq} was restored but not verified against its restore point`)
@@ -1315,6 +1407,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must((await columnsOf(keptTable)) === null, `${keptTable} is still in the region's schema after the restore`)
       const ms = await untilServed(keptTable, 'gone', asked)
       return `restored as #${res.body.recoverySeq} and verified, its 3 rows kept aside; PostgREST at the region stopped serving ${keptTable} ${seconds(ms)} after the restore was asked for`
+    })
+    await check('rollback-drills', 'described-after-acknowledged-restore', ['restored-with-acknowledgement'], async () => {
+      const ms = await untilDescribed(keptTable, 'gone', keptAt.restored)
+      return `read_backend_state's schema section stopped describing ${keptTable} ${seconds(ms)} after the restore was asked for`
     })
 
     await check('rollback-drills', 'reapplied-and-served', ['restored-with-acknowledgement'], async () => {
@@ -1326,12 +1422,17 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         `reapplying #${kept!.seq} is ${preview?.safety ?? 'not previewed'}: ${String(preview?.reason ?? '').slice(0, 200)}`,
       )
       const asked = Date.now()
+      keptAt.reapplied = asked
       const res = await changeCall(args.project, recoveryRecord!, 'restore', { seq: preview.seq })
       must(res.status === 200 && res.body.verification?.outcome === 'confirmed', `the reapply answered ${res.status}: ${String(res.body.error ?? '').slice(0, 200)}`)
       const ms = await untilServed(keptTable, 'served', asked)
       const rows = toolData<{ rows?: unknown[] }>(await mcp!.call('db_query', { table: keptTable, limit: 10 }))?.rows ?? []
       must(rows.length === 3, `${keptTable} came back with ${rows.length} rows, not its 3`)
       return `reapplied and verified, with its 3 rows; PostgREST at the region served ${keptTable} again ${seconds(ms)} after the reapply was asked for`
+    })
+    await check('rollback-drills', 'described-after-reapply', ['reapplied-and-served'], async () => {
+      const ms = await untilDescribed(keptTable, 'listed', keptAt.reapplied)
+      return `read_backend_state's schema section described ${keptTable} again ${seconds(ms)} after the reapply was asked for`
     })
 
     const parentTable = `qualify_parent_${run}`

@@ -111,6 +111,23 @@ describe('arguments', () => {
     expect(() => parseArgs([...ARGV, '--kill-after-seconds', '0'], ENV)).toThrow(/--kill-after-seconds/)
     expect(() => parseArgs([...ARGV, '--settle-wait-minutes', '0'], ENV)).toThrow(/--settle-wait-minutes/)
   })
+
+  it('names projects of other regions for the region host to refuse, and nothing else', () => {
+    const HOME_PROBE = '1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f'
+    const OREGON_PROBE = '2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a'
+    // Without --foreign the check is not run, and the report says so.
+    expect(parseArgs(ARGV, ENV).foreign).toEqual([])
+    expect(parseArgs([...ARGV, '--foreign', `${HOME_PROBE}@ap-south-1, ${OREGON_PROBE}@us-west-2`], ENV).foreign).toEqual([
+      { project: HOME_PROBE, region: 'ap-south-1' },
+      { project: OREGON_PROBE, region: 'us-west-2' },
+    ])
+    expect(() => parseArgs([...ARGV, '--foreign', HOME_PROBE], ENV)).toThrow(/<project id>@<region>/)
+    expect(() => parseArgs([...ARGV, '--foreign', `not-a-uuid@ap-south-1`], ENV)).toThrow(/<project id>@<region>/)
+    expect(() => parseArgs([...ARGV, '--foreign', `${HOME_PROBE}@mars-north-1`], ENV)).toThrow(/not a Backenly Cloud region/)
+    // A project of the region being qualified would prove nothing about isolation.
+    expect(() => parseArgs([...ARGV, '--foreign', `${HOME_PROBE}@us-east-1`], ENV)).toThrow(/the region being qualified/)
+    expect(() => parseArgs([...ARGV, '--foreign', `${PROJECT}@ap-south-1`], ENV)).toThrow(/must not name the probe project/)
+  })
 })
 
 describe('the transport', () => {
@@ -250,6 +267,8 @@ describe('a region that cannot be reached', () => {
       'nothing-waiting', 'recovered-after-failing-part-way', 'recovered-after-failing-verification', 'served-after-a-change',
       'agent-asks-a-person-decides', 'restore-needs-a-person', 'restored-with-acknowledgement', 'reapplied-and-served',
       'restore-refused-under-a-later-change', 'drill-tables-removed', 'deleted-with-its-history',
+      // What a coding agent reads of the schema, after each of them.
+      'described-after-undo', 'described-after-a-change', 'described-after-acknowledged-restore', 'described-after-reapply',
     ]) {
       expect([check, status(check)]).toEqual([check, 'skip'])
     }
@@ -257,7 +276,37 @@ describe('a region that cannot be reached', () => {
     expect(lines.join('\n')).toContain('REGION NOT QUALIFIED')
     // The drills a run was not given what they need for are named, not passed.
     expect(lines.join('\n')).toMatch(/Not run here: .*--member not given.*--kill-command not given/)
+    expect(lines.join('\n')).toMatch(/Not run here: .*cross-region isolation at the region host: --foreign named no project/)
     // No key or password ever reaches the output.
     expect(lines.join('\n')).not.toMatch(/mcp_live_test|proj_live_test|not-a-real-operator-password/)
+  }, 60_000)
+
+  it('fails, never passes, the refusal of another region\'s project it could not ask for', async () => {
+    const closed = await new Promise<number>((resolve) => {
+      const s = http.createServer()
+      s.listen(0, '127.0.0.1', () => {
+        const p = (s.address() as AddressInfo).port
+        s.close(() => resolve(p))
+      })
+    })
+    const HOME_PROBE = '1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f'
+    const args = parseArgs(
+      [
+        '--project', PROJECT,
+        '--region', 'us-east-1',
+        '--api', `https://us-east-1.api.staging.example.com:${closed}`,
+        '--home', `https://staging.example.com:${closed}`,
+        '--connect', 'us-east-1.api.staging.example.com=127.0.0.1,staging.example.com=127.0.0.1',
+        '--operator', 'qualify-operator@example.com',
+        '--foreign', `${HOME_PROBE}@ap-south-1`,
+        '--skip-revocation', '--skip-deletion-drill',
+      ],
+      ENV,
+    )
+    const lines: string[] = []
+    const { ok, results } = await qualify(args, (line) => lines.push(line))
+    expect(ok).toBe(false)
+    expect(results.find((r) => r.check === 'refuses-ap-south-1-project')?.status).toBe('fail')
+    expect(lines.join('\n')).not.toContain('cross-region isolation at the region host')
   }, 60_000)
 })
