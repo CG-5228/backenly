@@ -551,6 +551,8 @@ export async function runBrain(
     sessionToken: input.sessionToken,
     userMessage: input.message,
     understandingBlock,
+    // The turns the classifier is given, so an answer can place a follow-up.
+    recentHistory: recent,
     // A coding agent over MCP: the protected-production gate applies.
     agentSurface: isAgentDoor(input.door),
     // A failed action is reported to the agent as it failed. The loop does not

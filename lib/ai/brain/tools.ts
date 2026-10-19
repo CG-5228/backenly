@@ -14,6 +14,8 @@
 
 import { executeAction } from '../minimal-executor'
 import type { AIAction } from '../minimal-executor'
+import { conversationFor } from './model'
+import type { ConversationTurn } from './memory'
 import { collectProof, formatProof } from '../proof-system'
 import { AiError, generate } from '../llm'
 import { answererPrompt } from './prompts'
@@ -314,6 +316,12 @@ export interface ToolDispatchContext {
   sessionToken?: string
   /** The user's most recent message — needed for answer_question. */
   userMessage?: string
+  /**
+   * The conversation before this turn: the turns the classifier is given.
+   * answer_question sends the last of them with the question, so a follow-up
+   * ("why the first one?") reaches the model with what it follows.
+   */
+  recentHistory?: ConversationTurn[]
   /** Pre-formatted project understanding block (from memory.formatUnderstanding). */
   understandingBlock?: string
   /**
@@ -2589,12 +2597,19 @@ export async function dispatchTool(
     // ── Control: answer_question ──────────────────────────────────────────
     if (name === 'answer_question') {
       const question = String(args.question ?? ctx.userMessage ?? '').trim()
+      // The turns before this one, clipped as the classifier clips them. With
+      // the question alone, "why the first one?" reached the model with no
+      // first one in it.
+      const recent = (ctx.recentHistory ?? []).slice(-4).map((turn) => ({
+        role: turn.role,
+        content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content,
+      }))
       try {
         const result = await generate({
           purpose: 'brain.answer',
           system: answererPrompt(),
           ...(ctx.understandingBlock ? { context: `THIS PROJECT:\n${ctx.understandingBlock}` } : {}),
-          messages: [{ role: 'user', content: question || 'Can you help me?' }],
+          messages: conversationFor(recent, question || 'Can you help me?'),
           billing: { projectId: ctx.projectId },
           label: 'brain-answer',
         })
