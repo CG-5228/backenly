@@ -152,6 +152,11 @@ beforeAll(async () => {
      )`,
   )
   await prisma.table.create({ data: { name: TABLE, projectId } })
+  // Soft-deletable without "updatedAt", as a table an agent created by its own SQL can be.
+  await prisma.$executeRawUnsafe(
+    `CREATE TABLE "${schema()}".notes (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), title text NOT NULL, deleted_at timestamptz)`,
+  )
+  await prisma.table.create({ data: { name: 'notes', projectId } })
 
   // A server-side key, as a server-rendered app would hold.
   const minted = mintKey({ keyType: 'public', serviceRole: true })
@@ -265,6 +270,55 @@ describe.each([
       }
     }
     expect(await snapshot()).toEqual(before)
+  })
+
+  // The SDK wrote each filter over the one before it on the same column, so
+  // this range sent only its last bound and the update or delete reached every
+  // row on one side of it.
+  it('a range on one column applies both bounds, in a select, an update and a delete', async () => {
+    expect(titles(await tasks().select().gte('qty', 2).lt('qty', 5))).toEqual(['unowned'])
+    expect(await tasks().update({ done: true }).gte('qty', 2).lt('qty', 5).execute()).toMatchObject({ updated: 1 })
+    expect(await tasks().delete().gt('qty', 1).lte('qty', 3).execute()).toEqual({ success: true, deleted: 1 })
+    expect(await snapshot()).toEqual([
+      { title: 'owned early', qty: 1, done: false },
+      { title: 'owned late', qty: 5, done: true },
+    ])
+  })
+
+  it('two filters that cannot be sent together on one column are refused, and nothing changes', async () => {
+    const before = await snapshot()
+    await expect(tasks().delete().eq('qty', 3).gt('qty', 0).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(tasks().update({ qty: 99 }).gt('qty', 0).gt('qty', 2).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(tasks().select().isNull('owner_id').neq('owner_id', OWNER)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(await snapshot()).toEqual(before)
+  })
+
+  it('an update with no condition is refused, and changes nothing', async () => {
+    const before = await snapshot()
+    await expect(tasks().update({ qty: 99 }).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    for (const body of [{ table: TABLE, data: { qty: 99 } }, { table: TABLE, where: {}, data: { qty: 99 } }]) {
+      const res = await post(base(), '/database/update', body)
+      expect({ body, status: res.status, code: (await res.json()).error?.code }).toEqual({
+        body, status: 400, code: 'VALIDATION_ERROR',
+      })
+    }
+    expect(await snapshot()).toEqual(before)
+  })
+})
+
+describe('the Next delete route on a table with deleted_at and no "updatedAt"', () => {
+  it('soft-deletes the row instead of failing on the missing column', async () => {
+    await prisma.$executeRawUnsafe(`TRUNCATE "${schema()}".notes`)
+    await prisma.$executeRawUnsafe(`INSERT INTO "${schema()}".notes (title) VALUES ('keep'), ('drop')`)
+    globalThis.fetch = nextFetch
+    try {
+      expect(await sdk(NEXT).from('notes').delete().eq('title', 'drop').execute()).toEqual({ success: true, deleted: 1 })
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(
+      await prisma.$queryRawUnsafe(`SELECT title, deleted_at IS NOT NULL AS deleted FROM "${schema()}".notes ORDER BY title`),
+    ).toEqual([{ title: 'drop', deleted: true }, { title: 'keep', deleted: false }])
   })
 })
 

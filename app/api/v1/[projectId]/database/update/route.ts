@@ -94,9 +94,13 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     const setParts = setCols.map(c => `"${c}" = ${bound.bind(c, data[c])}`)
 
     // The filter's conditions, with the operators the SDK sends (lib/api/v1/where.ts).
+    // Required, as for delete: `where: {}` updated every row the key can reach.
     const whereParts = whereConditions(where, bound, types)
+    if (whereParts.length === 0) {
+      return createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'A WHERE condition is required for update', 400)
+    }
 
-    const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : ''
+    const whereClause = `WHERE ${whereParts.join(' AND ')}`
     const sql = `UPDATE "${schemaName}"."${tableName}" SET ${setParts.join(', ')} ${whereClause} RETURNING *`
     const result = await executeWithUserContext(
       context.projectId,

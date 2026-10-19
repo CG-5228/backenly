@@ -300,8 +300,14 @@ router.post('/:projectId/database/update', asyncRoute(v1AuthMiddleware), asyncRo
     refusal = bound.context(tableName)
     const setParts = setCols.map(c => `"${c}" = ${bound.bind(c, data[c])}`)
 
-    // WHERE params follow the SET params in the same sequence.
+    // WHERE params follow the SET params in the same sequence. Required, as for
+    // delete and on the Next route: with none, every row the key can reach was
+    // updated (an SDK update() with no filter sends no `where` at all).
     const whereClause = whereSql(where, bound, types)
+    if (!whereClause) {
+      sendError(res, ErrorCodes.VALIDATION_ERROR, 'A WHERE condition is required for update', 400)
+      return
+    }
 
     const sql = `UPDATE "${schemaName}"."${tableName}" SET ${setParts.join(', ')} ${whereClause} RETURNING *`
     const result = await executeWithUserContext<any>(ctx.projectId, rls.userId, rls.isServiceRole, sql, bound.values, rls.role)

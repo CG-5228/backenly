@@ -77,16 +77,21 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     // the fail-soft catch below, which reads any failure as "no deleted_at
     // column" and so as a HARD delete.
     const db = await workspaceRawClient(context.projectId)
-    const hasSoftDelete = await db.$queryRawUnsafe<{ count: number }[]>(
-      `SELECT COUNT(*)::int AS count FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = $2 AND column_name = 'deleted_at'`,
+    const softColumns = await db.$queryRawUnsafe<{ column_name: string }[]>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = $2 AND column_name IN ('deleted_at', 'updatedAt')`,
       schemaName, tableName
-    ).then(r => Number(r[0]?.count ?? 0) > 0).catch(() => false)
+    ).then(r => new Set(r.map(c => c.column_name))).catch(() => new Set<string>())
+    const hasSoftDelete = softColumns.has('deleted_at')
 
     if (hasSoftDelete) {
-      // Soft delete: set deleted_at = NOW(), only on rows not already deleted
+      // Soft delete: set deleted_at = NOW(), and "updatedAt" where the table
+      // has one, only on rows not already deleted. A table made with deleted_at
+      // and no "updatedAt" (one an agent created by its own SQL) failed every
+      // delete: column "updatedAt" does not exist.
+      const touch = softColumns.has('updatedAt') ? ', "updatedAt" = NOW()' : ''
       const softSql = `UPDATE "${schemaName}"."${tableName}"
-                       SET deleted_at = NOW(), "updatedAt" = NOW()
+                       SET deleted_at = NOW()${touch}
                        ${whereClause} AND deleted_at IS NULL RETURNING id`
       result = await executeWithUserContext(
         context.projectId,

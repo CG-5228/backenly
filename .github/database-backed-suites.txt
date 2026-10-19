@@ -1372,3 +1372,9 @@ tests/integration/postgrest-reload-on-drop.spec.ts
 # a duplicate 409, and a filter neither can apply 400 with no row changed.
 # What PostgreSQL accepts is the property, so it needs a real Postgres.
 tests/integration/sdk-filters-both-servers.spec.ts
+# The MCP data tools' filters (db_query, db_update, db_delete) build through the
+# same builder: an invalid column name, an unknown operator, an operator object
+# naming nothing or an $in that is not a list is refused with no row changed,
+# where skipping it widened a service-role update or delete. What PostgreSQL
+# matches is the property, so it needs a real Postgres.
+tests/integration/mcp-filters-never-widen.spec.ts
