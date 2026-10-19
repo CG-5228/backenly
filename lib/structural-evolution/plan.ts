@@ -292,9 +292,10 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       rollback: {
         strategy: 'drop_satellite',
         description:
-          `Drop ${sat}, after the mirroring on ${spec.host} is removed. Refused unless reconciliation of every row first ` +
-          `shows ${sat} holds nothing ${spec.host} does not also hold, so undoing it can never lose a write.`,
-        sql: dropSatelliteSql(spec, target),
+          `Drop ${sat}, together with everything step 2 put on ${spec.host}, in one transaction: both go or neither does. ` +
+          `Refused unless reconciliation of every row first shows ${sat} holds nothing ${spec.host} does not also hold, ` +
+          'so undoing it can never lose a write.',
+        sql: [...dropForwardSyncSql(spec, target), ...dropSatelliteSql(spec, target)],
       },
     },
     {
@@ -312,7 +313,9 @@ export function buildExtractionPlan(input: PlanInput): ExtractionPlan {
       postconditions: [`a trigger on ${spec.host} keeps ${sat} in step`],
       rollback: {
         strategy: 'drop_forward_sync',
-        description: `Drop the triggers, their functions and Backenly's own read and lock policies on ${spec.host}.`,
+        description:
+          `Dropped in the same transaction as ${sat} (see step 1): the triggers, their functions and Backenly's own ` +
+          `read and lock policies on ${spec.host}.`,
         sql: dropForwardSyncSql(spec, target),
       },
     },

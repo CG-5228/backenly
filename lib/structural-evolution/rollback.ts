@@ -49,7 +49,7 @@ import { isOurSatellite, reloadDataPlane, runStatements, unregisterTable } from 
 import { closeWritesSql, dropForwardSyncSql, dropSatelliteSql, fq, hostLadderObjects, ladderNames, revokeReadsSql } from './sql'
 
 export interface RollbackAction {
-  action: 'close_writes' | 'revoke_reads' | 'drop_forward_sync' | 'drop_satellite' | 'withdraw_consent'
+  action: 'close_writes' | 'revoke_reads' | 'remove' | 'withdraw_consent'
   outcome: 'done' | 'not_needed' | 'failed'
   detail: string
 }
@@ -213,22 +213,19 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
       },
       `reads of ${spec.satellite} closed; ${readers.length} role grant(s) revoked`,
     )) &&
+    // The last step is ONE transaction: the host stops mirroring and the
+    // satellite goes together, or neither does. Split in two, a failure in
+    // between left a satellite nothing kept current, which every later
+    // lossless check then refused to drop.
     (await step(
-      'drop_forward_sync',
-      forwardLive,
-      dropForwardSyncSql(spec, target),
+      'remove',
+      forwardLive || !!sat,
+      [...dropForwardSyncSql(spec, target), ...(sat ? dropSatelliteSql(spec, target) : [])],
       async () => {
         const h = await readTableFacts(schema, spec.host)
-        return !!h && !onHost(h)
+        return !!h && !onHost(h) && (await satNow()) === null
       },
-      `${spec.host} no longer mirrors into ${spec.satellite}`,
-    )) &&
-    (await step(
-      'drop_satellite',
-      !!sat,
-      dropSatelliteSql(spec, target),
-      async () => (await satNow()) === null,
-      `${spec.satellite} dropped; ${spec.host} is as it was before the extraction`,
+      `${spec.host} no longer mirrors into ${spec.satellite}, and ${spec.satellite} is dropped; ${spec.host} is as it was before the extraction`,
     ))
 
   if (!okSoFar) {

@@ -460,7 +460,7 @@ describe('an undo that stops part-way', () => {
       actions: [
         { action: 'close_writes', outcome: 'done', detail: 'writes to order_refunds closed; 1 role grant(s) revoked' },
         { action: 'revoke_reads', outcome: 'done', detail: 'reads of order_refunds closed; 1 role grant(s) revoked' },
-        { action: 'drop_satellite', outcome: 'failed', detail: 'cannot drop table order_refunds because other objects depend on it' },
+        { action: 'remove', outcome: 'failed', detail: 'cannot drop table order_refunds because other objects depend on it' },
       ],
     }
     jest.spyOn(structuralExtraction, 'rollback').mockResolvedValueOnce(partial)

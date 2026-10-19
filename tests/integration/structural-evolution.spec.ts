@@ -525,15 +525,55 @@ describe('rollback', () => {
     })
   })
 
+  it('removes the sync and the new table together, or neither, and can be asked again', async () => {
+    // The last step fails at its very end, after every DROP in it ran: an
+    // event trigger raises as the satellite is dropped. One transaction, so
+    // nothing it did may remain: orders still mirrors into a satellite that is
+    // still there and still identical.
+    const tripwire = `bkn_test_trip_${randomBytes(4).toString('hex')}`
+    await prisma.$executeRawUnsafe(
+      `CREATE FUNCTION public.${tripwire}() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+       BEGIN
+         IF EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects()
+                     WHERE object_type = 'table' AND schema_name = '${schema}' AND object_name = 'order_refunds') THEN
+           RAISE EXCEPTION 'tripwire: the drop failed after everything before it ran';
+         END IF;
+       END $f$`,
+    )
+    await prisma.$executeRawUnsafe(`CREATE EVENT TRIGGER ${tripwire} ON sql_drop EXECUTE FUNCTION public.${tripwire}()`)
+    try {
+      const out = await rollbackExtraction({ projectId, planId, requestedBy: ownerId })
+      expect(out.status).toBe('failed')
+      expect(out.actions.map(a => [a.action, a.outcome])).toEqual([
+        ['close_writes', 'done'],
+        ['revoke_reads', 'done'],
+        ['remove', 'failed'],
+      ])
+      expect(out.reason).toMatch(/tripwire/)
+    } finally {
+      await prisma.$executeRawUnsafe(`DROP EVENT TRIGGER IF EXISTS ${tripwire}`)
+      await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public.${tripwire}()`)
+    }
+    expect(await readTableFacts(schema, 'order_refunds')).not.toBeNull()
+    expect((await readTableFacts(schema, 'orders'))!.triggers.length).toBeGreaterThan(0)
+
+    const fk = ladderNames(SPEC).fkColumn
+    const id = await bareOrder(USER_A, 4)
+    await asUser(USER_A, run => run(`UPDATE ${t('orders')} SET refund_amount = 9, refund_reason = 'kept in step' WHERE id = $1::uuid`, id))
+    expect(await asService(`SELECT refund_reason AS r FROM ${t('order_refunds')} WHERE ${fk} = $1::uuid`, id)).toEqual([{ r: 'kept in step' }])
+    const r = await reconcileExtraction(projectId, (await readTableFacts(schema, 'orders'))!, SPEC)
+    expect(r).toMatchObject({ consistent: true, complete: true })
+  })
+
   it('removes everything it added and leaves the host exactly as it was', async () => {
     const before = await hostSnapshot()
     const out = await rollbackExtraction({ projectId, planId, requestedBy: ownerId })
     expect(out.status).toBe('rolled_back')
+    // Writes and reads were already closed by the attempt that failed.
     expect(out.actions.map(a => [a.action, a.outcome])).toEqual([
-      ['close_writes', 'done'],
-      ['revoke_reads', 'done'],
-      ['drop_forward_sync', 'done'],
-      ['drop_satellite', 'done'],
+      ['close_writes', 'not_needed'],
+      ['revoke_reads', 'not_needed'],
+      ['remove', 'done'],
       ['withdraw_consent', 'done'],
     ])
     expect(await readTableFacts(schema, 'order_refunds')).toBeNull()
