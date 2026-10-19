@@ -314,6 +314,9 @@ export function isReadOnlyTool(name: string): boolean {
 const READ_ONLY_WHEN: Partial<Record<ToolName, (args: Record<string, unknown>) => boolean>> = {
   // A dry run reports the rows it would touch and changes nothing.
   run_data_migration: (a) => TOOL_TO_ACTION.run_data_migration(a).params.dryRun === true,
+  // Readiness changes nothing unless fixing is asked for, and then it can
+  // install RLS policies, generate the JWT secret and switch functions off.
+  get_readiness: (a) => TOOL_TO_ACTION.get_readiness(a).params.autoFix !== true,
 }
 
 /** Whether one call changes nothing: by its tool's rule above, else by READ_ONLY_TOOLS. */
@@ -3719,7 +3722,7 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'rollback_deploy': return args.version ? `Rolling back to v${args.version}` : 'Rolling back deployment'
     case 'list_schema_changes': return 'Reading the change history'
     case 'revert_schema_change': return 'Restoring the state before a change'
-    case 'get_readiness': return 'Reading deploy readiness'
+    case 'get_readiness': return isReadOnlyCall(name, args) ? 'Reading deploy readiness' : 'Applying the safe readiness fixes'
     case 'set_env_var': return `Saving env var ${args.key ?? ''}`.trim()
     case 'list_env_vars': return 'Listing project env vars'
     case 'delete_env_var': return `Deleting env var ${args.key ?? ''}`.trim()

@@ -6,12 +6,14 @@
  * sends a later finish back for a verification pass. A read counted that way
  * was reported as a change that never happened and verified for nothing: a
  * list_synced_columns read and a dry-run data migration both came back in
- * `applied` (#229).
+ * `applied` (#229). The other way round, a readiness call that applied fixes
+ * was counted as a read, so its changes were missing from `applied` and never
+ * verified (#240).
  *
- * Real database: the project, its workspace schema and the rows a dry run must
- * leave as they were. Only the model is scripted, as in brain-on-gateway.spec.ts,
- * and spend reservations go to the gateway's in-memory ledger for the reason
- * given there.
+ * Real database: the project, its workspace schema, the rows a dry run must
+ * leave as they were and the JWT secret a readiness fix generates. Only the
+ * model is scripted, as in brain-on-gateway.spec.ts, and spend reservations go
+ * to the gateway's in-memory ledger for the reason given there.
  */
 
 import crypto from 'crypto'
@@ -46,6 +48,12 @@ async function statuses(): Promise<Array<string | null>> {
     `SELECT status FROM "${schema}"."accounts" ORDER BY id`,
   )
   return rows.map((r) => r.status)
+}
+
+/** The project's own JWT secret, which a readiness fix generates when it is missing. */
+async function jwtSecret(): Promise<string | null> {
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId }, select: { jwtSecret: true } })
+  return project.jwtSecret
 }
 
 beforeAll(async () => {
@@ -130,4 +138,47 @@ describe('what a turn reports as applied', () => {
     expect(result.refused).toBeUndefined()
     expect(provider.calls).toHaveLength(3)
   }, 60_000)
+
+  it('does not report reading the readiness scorecard as a change, and the read fixes nothing', async () => {
+    await prisma.project.update({ where: { id: projectId }, data: { jwtSecret: null } })
+    const provider = scriptedProvider([
+      classified('QUESTION'),
+      scriptedMessage({ toolUse: [{ id: 'toolu_ready', name: 'get_readiness', input: {} }] }),
+      scriptedMessage({ toolUse: [{ id: 'toolu_finish', name: 'finish', input: { summary: 'Not ready yet: see the blockers.' } }] }),
+    ])
+
+    const result = await turn(provider, 'is my backend ready to deploy?')
+
+    expect(answerTo(provider, 2, 'toolu_ready')).toMatchObject({ ok: true })
+    expect(await jwtSecret()).toBeNull()
+    expect(result).toMatchObject({ success: true, toolsRun: ['get_readiness', 'finish'], applied: [] })
+    expect(provider.calls).toHaveLength(3)
+  }, 120_000)
+
+  it('reports a readiness call that applies the safe fixes as a change, and verifies it', async () => {
+    await prisma.project.update({ where: { id: projectId }, data: { jwtSecret: null } })
+    const provider = scriptedProvider([
+      classified('FIX'),
+      scriptedMessage({ toolUse: [{ id: 'toolu_fix', name: 'get_readiness', input: { autoFix: true } }] }),
+      scriptedMessage({ toolUse: [{ id: 'toolu_finish', name: 'finish', input: { summary: 'Applied the safe fixes.' } }] }),
+      scriptedMessage({ toolUse: [{ id: 'toolu_verify', name: 'read_backend_state', input: {} }] }),
+      scriptedMessage({ toolUse: [{ id: 'toolu_done', name: 'finish', input: { summary: 'Applied the safe fixes and read the state back.' } }] }),
+    ])
+
+    const result = await turn(provider, 'apply the safe readiness fixes')
+
+    // The fix landed: the project has its own JWT secret now.
+    expect(await jwtSecret()).toEqual(expect.any(String))
+    expect(result).toMatchObject({
+      success: true,
+      summary: 'Applied the safe fixes and read the state back.',
+      toolsRun: ['get_readiness', 'finish', 'read_backend_state', 'finish'],
+      applied: ['Applying the safe readiness fixes'],
+    })
+    // The first finish was sent back for the verification pass a change needs.
+    expect(provider.calls).toHaveLength(5)
+    expect(provider.calls[3].params.messages.at(-1)!.content).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'text', text: expect.stringContaining('did not verify') })]),
+    )
+  }, 120_000)
 })
