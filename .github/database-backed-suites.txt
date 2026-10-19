@@ -1284,3 +1284,11 @@ tests/integration/project-creation-order.spec.ts
 # runtime's. Each server's insert answer is pinned. Real tables behind both
 # servers are the property, so it needs a real Postgres.
 tests/integration/sdk-data-routes.spec.ts
+
+# The SDK's filters mean the same on both servers that answer the data routes:
+# isNull, isNotNull, eq, neq, gt and in on uuid, timestamp, integer and boolean
+# columns, get, update and delete by a uuid id, an update or delete through
+# isNull and in. A value its column cannot take answers 400 naming the column,
+# a duplicate 409, and a filter neither can apply 400 with no row changed.
+# What PostgreSQL accepts is the property, so it needs a real Postgres.
+tests/integration/sdk-filters-both-servers.spec.ts
