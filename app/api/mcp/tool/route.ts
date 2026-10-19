@@ -41,24 +41,33 @@ import { createHash } from 'crypto'
 import { DOCS_MAX_CHARS } from '@/lib/mcp/docs-limit'
 import { AGENT_DOCS_URL, AGENT_DOC_TOPICS, agentDocPublicPath, resolveDocTopic } from '@/lib/mcp/agent-docs'
 import { readOnlyView, resolveDomainAction, type DomainResolution } from '@/lib/mcp/domains'
+import { withChangeAttribution } from '@/lib/changes/ledger'
 
 /**
- * Tools on this route that spend Backenly's model budget. See the gate in POST
- * for how this set was derived and why everything else stays ungated.
+ * Tools on this route that are model work from their first step, refused up
+ * front with a structured 402 when the month's credits are spent.
  *
- * Membership means BOTH halves apply: the pre-gate below refuses the call when
- * the month's credits are spent, and the token scope around dispatch debits
- * what the call actually burned. A tool that gates without charging is not a
- * cheaper tool — it is an unlimited one, because a meter that never moves never
- * reaches the cap. That was the live state of `generate_function` until the
- * charge below was added.
+ * This set is a courtesy, not the billing boundary. Every customer-paid model
+ * call made while any tool runs holds the account's credits before it is sent
+ * and is charged after: the token scope around dispatch names the project, and
+ * the AI gateway bills each call to it (lib/ai/token-meter.ts). This set used
+ * to BE the boundary, gating and charging only its members, and it drifted:
+ * `create_cron_job` (functions.schedule) writes its job with Backenly's model
+ * and was never refused or charged, and neither were the functions
+ * `store_integration_key` (integrations.connect) wires (FN-12, FN-19, INT-15).
+ * A model-backed tool missing from here is still gated and charged; it is only
+ * refused later, by its first model call, with that call's own message.
+ *
+ * `store_integration_key` is deliberately absent: storing a key needs no model,
+ * so an account with no credits left can still connect a provider, and the
+ * receipt names each function that could not be wired, and why.
  *
  * `answer_question` is currently unreachable here — MCP_EXCLUDE in
  * lib/mcp/catalog.ts keeps the brain's control-loop tools off this surface, so
- * the 404 fires before either half runs. It stays listed deliberately: if it is
- * ever exposed, it arrives already metered rather than repeating this bug.
+ * the 404 fires before the gate runs. It stays listed deliberately: if it is
+ * ever exposed, it arrives already gated.
  */
-const MODEL_BACKED_TOOLS = new Set(['answer_question', 'generate_function'])
+const MODEL_BACKED_TOOLS = new Set(['answer_question', 'generate_function', 'create_cron_job'])
 
 const ENDPOINT = '/api/mcp/tool'
 
@@ -82,6 +91,15 @@ export async function POST(request: NextRequest) {
   if (guard.response) return withCors(guard.response)
   const auth = guard.auth!
 
+  // Every schema change this call makes is recorded as this agent's, on its
+  // owner's authority, in the change ledger the owner rolls back from.
+  return withChangeAttribution(
+    { source: 'mcp', actorUserId: auth.userId, apiKeyId: auth.keyId },
+    () => handleCall(request, auth, startedAt),
+  )
+}
+
+async function handleCall(request: NextRequest, auth: McpGuardAuth, startedAt: number): Promise<NextResponse> {
   // Parse + validate body.
   let parsed: z.infer<typeof RequestSchema>
   try {
@@ -158,25 +176,26 @@ export async function POST(request: NextRequest) {
     return withCors(await parkForApproval(auth, resolved, domainArgs!, startedAt))
   }
 
-  // ── Credit gate for the model-backed tools ────────────────────────────────
+  // ── Early credit refusal for the tools that are model work ─────────────────
   //
   // Most of this route is deterministic — the typed tools compile to SQL via
   // executeAction and cost us no model spend, so they stay open even for a user
-  // with no credits left. Two do call OpenAI on our key and must be gated, or
-  // an exhausted agent could simply route around /api/mcp/chat and keep
-  // spending through here:
+  // with no credits left. The tools in MODEL_BACKED_TOOLS are model work from
+  // their first step, so an exhausted account is refused here, before anything
+  // runs, with a structured 402 an agent can branch on.
   //
-  //   • answer_question   — direct completion (lib/ai/brain/tools.ts)
-  //   • generate_function — executeAction → lib/ai/function-generator +
-  //                         lib/services/ai-functions/generator
-  //
-  // Derived by tracing every dynamic import reachable from executeAction; those
-  // two modules are the only OpenAI callers on the path. GENERATE_API, by
-  // contrast, is pure SQL generation and is deliberately NOT gated. Keep this
-  // set in sync when a new model-backed tool lands.
+  // This used to be the only gate, kept in sync by hand from a trace that said
+  // two modules were the only model callers on the path. They were not
+  // (FN-12, FN-19, INT-15). Every other model call a tool makes is now gated by
+  // its own credit hold when it is sent, and charged below, so a model-backed
+  // tool missing from the set is still never free.
   if (MODEL_BACKED_TOOLS.has(effectiveTool)) {
     const { enforceAiCredits } = await import('@/lib/entitlements/policy')
-    const credits = await enforceAiCredits(auth.userId)
+    const { creditAccountOf } = await import('@/lib/usage/account')
+    // The project's billing account's credits, not the caller's own. An
+    // account that cannot be read is not blocked: the gate is fail-open.
+    const account = await creditAccountOf(auth.projectId)
+    const credits = account ? await enforceAiCredits(account) : true
     if (credits !== true) {
       recordMcpCall(
         { ...auth, endpoint: ENDPOINT, startedAt },
@@ -192,7 +211,7 @@ export async function POST(request: NextRequest) {
           upgradeRequired: true,
           remedy:
             `\`${callLabel}\` uses Backenly's model budget and this month's credits are spent. ` +
-            `Every other tool on this route is deterministic and still works. ` +
+            `Tools that do not call Backenly's model still work. ` +
             `Credits reset on the 1st, or upgrade the plan.`,
           retryable: false,
         },
@@ -262,9 +281,16 @@ export async function POST(request: NextRequest) {
 
     let source = types.source
     let filename = 'backenly.types.ts'
+    // Where the generated code calls: the project's own API address, its
+    // region's for a project outside the home region.
+    const apiOrigin = async () =>
+      (await import('@/lib/data-plane/regional')).projectApiOrigin(
+        auth.projectId,
+        process.env.NEXT_PUBLIC_APP_URL || 'https://backenly.com',
+      )
     if (format === 'client') {
       const { generateTypedClient } = await import('@/lib/typegen/client-generator')
-      source = generateTypedClient(schema, types, { projectId: auth.projectId }).source
+      source = generateTypedClient(schema, types, { projectId: auth.projectId, apiUrl: await apiOrigin() }).source
       filename = 'backenly.client.ts'
     } else if (format === 'openapi') {
       const { generateOpenApiSpec } = await import('@/lib/typegen/openapi-generator')
@@ -275,7 +301,7 @@ export async function POST(request: NextRequest) {
       source = JSON.stringify(
         generateOpenApiSpec(schema, {
           title: `Backenly API — ${project?.name ?? auth.projectId}`,
-          serverUrl: process.env.NEXT_PUBLIC_APP_URL || 'https://backenly.com',
+          serverUrl: await apiOrigin(),
         }),
         null,
         2,
@@ -376,8 +402,13 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       ))
     }
-    const { getApprovalForProject } = await import('@/lib/mcp/approvals')
-    const approval = await getApprovalForProject(auth.projectId, id)
+    const { getApprovalForProject, getParkedActionForProject } = await import('@/lib/mcp/approvals')
+    // Two kinds of parked request answer here: destructive-gate approvals
+    // (agentApprovalRequest) and executor-gated actions queued as Review
+    // Queue findings. Both ids come back from the refusal that parked them.
+    const approval =
+      (await getApprovalForProject(auth.projectId, id)) ??
+      (await getParkedActionForProject(auth.projectId, id))
     recordMcpCall(
       { ...auth, endpoint: ENDPOINT, startedAt },
       { statusCode: approval ? 200 : 404, tool, mutation: false, summary: approval ? `approval ${approval.status}` : 'approval missing' },
@@ -390,12 +421,14 @@ export async function POST(request: NextRequest) {
     }
     const guidance: Record<string, string> = {
       pending: 'Still waiting for the human. Poll again in 15-30s, or remind them to open the Review Queue.',
+      approved: 'Approved and running now. Poll again in a few seconds for the outcome.',
       executed: 'Approved and executed — the resultSummary describes what changed. Verify with read tools if needed.',
-      // `failed` now means NOTHING was applied, which is what makes it safe to
-      // act on. A run that applied some of its plan and then stopped reports
-      // `partial` instead — treating that as `failed` and replaying is how a
-      // half-finished destructive plan gets double-applied.
-      failed: 'Approved but execution failed and NOTHING was applied — the backend is unchanged. Read resultSummary and report it to the human.',
+      // `failed` does not promise the backend is unchanged. Approval runs one
+      // exact call, and a deploy, merge or data migration can stop part-way
+      // without saying which steps took effect, so replaying blind can apply a
+      // half-finished change twice.
+      failed: 'Approved, but the call did not complete. resultSummary says what it reported. Check the current state with read tools before raising it again, because a call that stops part-way can leave some of its work applied.',
+      // Written only by the approval path this one replaced; older rows keep it.
       partial: 'Approved, and SOME changes were applied before the run stopped. Do NOT replay the original request. resultSummary lists exactly what landed; verify with get_table_schema / read_backend_state and ask only for what is still missing.',
       rejected: 'The human rejected this operation. Do not retry it; ask what they want instead.',
       expired: 'The request expired unapproved (24h). Ask the human whether to raise it again.',
@@ -454,7 +487,7 @@ export async function POST(request: NextRequest) {
         {
           statusCode: 400,
           tool,
-          mutation: fail.code === 'MIGRATION_FAILED',
+          mutation: fail.code === 'MIGRATION_FAILED' || fail.code === 'VERIFICATION_FAILED',
           error: fail.code,
           ...('detail' in fail ? { summary: fail.detail } : {}),
         },
@@ -477,11 +510,15 @@ export async function POST(request: NextRequest) {
     )
     return withCors(NextResponse.json(jsonSafe({
       ok: true,
-      summary: success.summary,
+      summary: success.change
+        ? `${success.summary} Recorded as change #${success.change.seq}: checkpointed, applied and ${success.change.verified ? 'verified' : 'not verified (a check could not run)'}.`
+        : success.summary,
       data: {
         applied: success.applied,
         ...(success.notes.length ? { notes: success.notes } : {}),
         ...(success.branch ? { branch: success.branch, recorded: success.recorded ?? [] } : {}),
+        // The id a restore is requested by: deploy { action: "revert_change", changeId }.
+        ...(success.change ? { change: success.change } : {}),
       },
       needsUser: false,
       timing: { ms: Date.now() - startedAt, heavy: true },
@@ -695,16 +732,20 @@ export async function POST(request: NextRequest) {
 
   // ── Charge half of the credit contract ────────────────────────────────────
   //
-  // Opened only for the model-backed tools, and only around dispatch. Every
-  // completion issued underneath — the generator's write pass, its repair pass,
-  // any model call a future model-backed tool makes — lands in `scope.tokens`
-  // without that code knowing billing exists (lib/ai/token-meter.ts).
+  // Opened around every dispatch, naming the project that pays. Every
+  // customer-paid model call issued underneath — the generator's write pass,
+  // its repair pass, the functions integrations.connect wires, any model call a
+  // future tool makes — holds the account's credits before it is sent and
+  // lands in `scope.tokens` after, without that code knowing billing exists
+  // (lib/ai/token-meter.ts). This used to be opened for every tool but charged
+  // only for MODEL_BACKED_TOOLS, so a tool missing from that list burned
+  // tokens the scope counted and the charge then dropped (FN-12, FN-19). A
+  // deterministic tool calls no model and is charged nothing.
   //
   // Billed in `finally` because a dispatch that threw still burned the tokens
   // it burned. Fire-and-forget, mirroring the chat route: a billing write must
   // never turn a completed backend change into an error response.
-  const metered = MODEL_BACKED_TOOLS.has(effectiveTool)
-  const tokenScope = createTokenScope()
+  const tokenScope = createTokenScope({ projectId: auth.projectId })
 
   try {
     const result = await runInTokenScope(tokenScope, () => dispatchTool(dispatchName, dispatchArgs, {
@@ -778,9 +819,13 @@ export async function POST(request: NextRequest) {
       { status: 500 },
     ))
   } finally {
-    if (metered && tokenScope.tokens > 0) {
-      import('@/lib/entitlements/policy')
-        .then(({ chargeAiCredits }) => chargeAiCredits(auth.userId, tokenScope.tokens))
+    // Charge what the dispatch's customer-paid model calls burned, then close
+    // their credit holds. A tool that called no model has neither.
+    if (tokenScope.tokens > 0 || tokenScope.holds.length > 0) {
+      Promise.all([import('@/lib/entitlements/credit-holds'), import('@/lib/usage/account')])
+        .then(async ([{ closeCreditTurn }, { creditAccountOf }]) =>
+          closeCreditTurn(await creditAccountOf(auth.projectId), tokenScope, tokenScope.tokens),
+        )
         .catch(() => {})
     }
   }
@@ -905,6 +950,23 @@ function describeCall(resolution: Extract<DomainResolution, { kind: 'ok' }>, arg
   return text.length > 280 ? text.slice(0, 277) + '…' : text
 }
 
+/**
+ * A project-wide realtime disable parked as bare "Realtime: disable" asked
+ * the human to approve a blast radius the card never named. Resolve it at
+ * park time: every table that would stop streaming, by name.
+ */
+async function describeRealtimeDisableScope(projectId: string, args: Record<string, unknown>): Promise<string> {
+  if (args.tableName || args.table) return ''
+  try {
+    const { listTablesWithRealtimeTriggers } = await import('@/lib/services/realtimeTriggers')
+    const streaming = await listTablesWithRealtimeTriggers(projectId)
+    if (streaming.length === 0) return ' — no table is currently streaming, so nothing disconnects'
+    return ` — EVERY streaming table stops (${streaming.length}: ${streaming.join(', ')}) and their live subscribers disconnect`
+  } catch {
+    return ' — every streaming table stops and its live subscribers disconnect'
+  }
+}
+
 async function parkForApproval(
   auth: McpGuardAuth,
   resolution: Extract<DomainResolution, { kind: 'ok' }>,
@@ -912,7 +974,37 @@ async function parkForApproval(
   startedAt: number,
 ): Promise<NextResponse> {
   const callLabel = `${resolution.domain.name}.${resolution.action}`
-  const described = describeCall(resolution, args)
+  const scopeNote =
+    resolution.target === 'disable_realtime' ? await describeRealtimeDisableScope(auth.projectId, args) : ''
+  let described = describeCall(resolution, args) + scopeNote
+  let reversible = false
+  let rowCount: number | null = null
+  let toolArgs: Record<string, unknown> = args
+  let restore: import('@/lib/changes/recovery').RestoreRequest | undefined
+  // A restore request names the change and exactly what restoring it would do,
+  // measured by Backenly now; one that cannot happen (unknown id, already
+  // restored, a later change in the way, expired) is answered now rather than
+  // parked for a person to approve into a failure. The parked call carries
+  // only what Backenly computed: nothing else the agent sent reaches it.
+  if (resolution.target === 'revert_schema_change') {
+    const { describeRestoreRequest } = await import('@/lib/changes/recovery')
+    const d = await describeRestoreRequest(auth.projectId, String(args.changeId ?? '').trim())
+    if (!d.ok) {
+      const refused = d as Extract<typeof d, { ok: false }>
+      recordMcpCall({ ...auth, endpoint: ENDPOINT, startedAt }, { statusCode: refused.status, tool: callLabel, error: refused.code })
+      return NextResponse.json(
+        { ok: false, error: refused.error, code: refused.code, hint: 'deploy { action: "changes" } lists each change with its changeId and whether its previous state can be restored.' },
+        { status: refused.status },
+      )
+    }
+    const ok = d as Extract<typeof d, { ok: true }>
+    restore = { target: ok.target, rowCount: ok.rowCount, toolArgs: ok.toolArgs }
+    described = ok.target
+    rowCount = ok.rowCount
+    toolArgs = { ...ok.toolArgs }
+    // A restore keeps what it removes and is itself recorded: it can be reapplied.
+    reversible = true
+  }
   try {
     const { createApprovalRequest } = await import('@/lib/mcp/approvals')
     const row = await createApprovalRequest({
@@ -920,8 +1012,9 @@ async function parkForApproval(
       userId: auth.userId,
       apiKeyId: auth.keyId,
       message: `Requested by an agent over MCP: ${described}`,
-      danger: { tool: resolution.target, target: described, rowCount: null, reversible: false },
-      toolArgs: args,
+      danger: { tool: resolution.target, target: described, rowCount, reversible },
+      toolArgs,
+      restore,
     })
     recordMcpCall(
       { ...auth, endpoint: ENDPOINT, startedAt },
@@ -938,7 +1031,10 @@ async function parkForApproval(
         status: 'pending',
         poll: `check_approval with { "id": "${row.id}" }`,
         note:
-          'The exact call you sent runs verbatim once a human approves it. Tell your human it is waiting, ' +
+          (resolution.target === 'revert_schema_change'
+            ? 'Backenly recorded the restore with what it measured it would do; a person approves exactly that, ' +
+              'and it runs only if the data still matches. Tell your human it is waiting, '
+            : 'The exact call you sent runs verbatim once a human approves it. Tell your human it is waiting, ') +
           'then poll check_approval every 15-30s until it is executed, rejected, failed or expired (24h).',
       },
       needsUser: true,
@@ -996,7 +1092,9 @@ async function parkBranchMerge(auth: McpGuardAuth, branchId: string, startedAt: 
       apiKeyId: auth.keyId,
       message: `Requested by an agent over MCP: ${target}. These statements will be applied to production, in order:\n${statements}`,
       danger: { tool: 'merge_branch', target, rowCount: null, reversible: false },
-      toolArgs: { branchId },
+      // The replay is held to exactly these statements (MERGE_STALE otherwise):
+      // the card's text and the executed DDL are the same list by construction.
+      toolArgs: { branchId, approvedMigrations: d.migrations },
     })
     recordMcpCall({ ...auth, endpoint: ENDPOINT, startedAt }, { statusCode: 200, tool: callLabel, mutation: false, summary: `awaiting approval ${row.id}` })
     return NextResponse.json({

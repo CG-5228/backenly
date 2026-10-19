@@ -17,17 +17,18 @@
  *   - Routed through `executeAction → mutate.ts` governance kernel.
  *
  * Bounds:
- *   - Model:   gpt-4o (AUTONOMY_FIX_MODEL to override)
+ *   - Model:   the gateway's build.fix_author route (Claude Opus 4.6 on Cloud;
+ *              AI_MODEL_BUILD_FIX_AUTHOR, or AUTONOMY_FIX_MODEL on OpenAI)
  *   - Budget:  ≤ MAX_AUTHORED_FIXES_PER_BUILD novel fixes per build run
- *   - Timeout: 12s (non-critical; loop continues if author times out)
+ *   - Timeout: 60s, cancelled not abandoned (loop continues if author times out)
  *
  * Gated by ENABLE_AGENTIC_FIX_AUTHOR. When the flag is off this module is
  * never called.
  */
 
 import { z } from 'zod'
-import { getOpenAIClient, trackCompletionCost } from './openai-service'
-import { withTimeout } from './with-timeout'
+import { AiError } from './llm'
+import { chat } from './llm/chat'
 import type { BehavioralCheck } from './behavioral-verifier'
 import type { FixCandidate } from './behavioral-check-to-fixes'
 import type { AIAction } from './minimal-executor'
@@ -36,11 +37,12 @@ import type { AIAction } from './minimal-executor'
 
 // Self-healing runs on the strong model (founder decision 2026-07-18): fix
 // authoring is the one reasoning step where a wrong answer wastes a healing
-// window, and volume is tiny (≤5/build), so the cost delta is negligible.
-// AUTONOMY_FIX_MODEL overrides for rollback without a deploy.
-const AUTHOR_MODEL = process.env.AUTONOMY_FIX_MODEL || 'gpt-4o'
-const AUTHOR_TIMEOUT_MS = 12_000
-const AUTHOR_TEMPERATURE = 0.15
+// window, and volume is tiny (≤5/build), so the cost delta is negligible. The
+// gateway's build.fix_author route picks it (thinking on); AI_MODEL_BUILD_FIX_AUTHOR,
+// or AUTONOMY_FIX_MODEL on OpenAI, overrides it without a deploy.
+//
+// A build waits on the author, so it gets a minute, not the route's three.
+const AUTHOR_TIMEOUT_MS = 60_000
 export const MAX_AUTHORED_FIXES_PER_BUILD = 5
 const MAX_REASON_LEN = 220
 
@@ -138,60 +140,56 @@ export async function authorFixForCheck(args: AuthorFixArgs): Promise<AuthorFixR
     return {
       candidate: null,
       reason: `author cap (${MAX_AUTHORED_FIXES_PER_BUILD}) reached for this build`,
-      telemetry: { model: AUTHOR_MODEL, durationMs: 0 },
+      telemetry: { model: 'not called', durationMs: 0 },
     }
   }
 
-  let raw: string
+  let parsed: unknown
+  let model = 'not called'
   let promptTokens: number | undefined
   let completionTokens: number | undefined
 
+  const timeout = AbortSignal.timeout(AUTHOR_TIMEOUT_MS)
   try {
-    const client = getOpenAIClient()
-    const completion = await withTimeout(
-      client.chat.completions.create({
-        model: AUTHOR_MODEL,
-        temperature: AUTHOR_TEMPERATURE,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: buildUserPrompt(args) },
-        ],
-      }, { signal: args.signal }),
-      AUTHOR_TIMEOUT_MS,
-      'fix-author',
-    )
-
-    trackCompletionCost(completion, args.projectId, 'fix-author')
-    promptTokens = completion.usage?.prompt_tokens
-    completionTokens = completion.usage?.completion_tokens
-    raw = completion.choices[0]?.message?.content ?? ''
-    if (!raw) {
-      return done(null, 'author returned empty response', startedAt, promptTokens, completionTokens)
+    const reply = await chat({
+      purpose: 'build.fix_author',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: buildUserPrompt(args) },
+      ],
+      json: true,
+      signal: args.signal ? AbortSignal.any([args.signal, timeout]) : timeout,
+      billing: { projectId: args.projectId },
+      label: 'fix-author',
+    })
+    model = reply.result.model
+    promptTokens = reply.result.usage.promptTokens
+    completionTokens = reply.result.usage.outputTokens
+    parsed = reply.json
+  } catch (err) {
+    if (err instanceof AiError && err.usage) {
+      promptTokens = err.usage.promptTokens
+      completionTokens = err.usage.outputTokens
     }
-  } catch (err: any) {
-    const reason = err?.message?.includes('timed out')
-      ? 'author timed out'
-      : `author call failed: ${err?.message ?? String(err)}`
-    return done(null, reason, startedAt)
+    const reason =
+      err instanceof AiError && err.kind === 'output_invalid'
+        ? 'author returned invalid JSON'
+        : timeout.aborted
+          ? 'author timed out'
+          : `author call failed: ${err instanceof Error ? err.message : String(err)}`
+    return done(null, reason, startedAt, promptTokens, completionTokens, err instanceof AiError ? err.model : undefined)
   }
 
-  // ── Parse + validate ──────────────────────────────────────────────────────
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return done(null, 'author returned invalid JSON', startedAt, promptTokens, completionTokens)
-  }
+  // ── Validate ──────────────────────────────────────────────────────────────
 
   const result = ProposedFixResponseSchema.safeParse(parsed)
   if (!result.success) {
     const issues = result.error.issues.slice(0, 2).map(i => `${i.path.join('.')}: ${i.message}`).join('; ')
-    return done(null, `author output failed schema validation: ${issues}`, startedAt, promptTokens, completionTokens)
+    return done(null, `author output failed schema validation: ${issues}`, startedAt, promptTokens, completionTokens, model)
   }
 
   if (!result.data.fix) {
-    return done(null, result.data.noFixReason ?? 'author declined to propose a fix', startedAt, promptTokens, completionTokens)
+    return done(null, result.data.noFixReason ?? 'author declined to propose a fix', startedAt, promptTokens, completionTokens, model)
   }
 
   // ── Build a FixCandidate routable through the existing executor ──────────
@@ -212,7 +210,7 @@ export async function authorFixForCheck(args: AuthorFixArgs): Promise<AuthorFixR
     candidate,
     reason: 'authored',
     telemetry: {
-      model: AUTHOR_MODEL,
+      model,
       durationMs: Date.now() - startedAt,
       promptTokens,
       completionTokens,
@@ -222,7 +220,7 @@ export async function authorFixForCheck(args: AuthorFixArgs): Promise<AuthorFixR
 
 // ── Prompt construction ──────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are the Fix Author inside an AI Backend-as-a-Service platform.
+const SYSTEM_PROMPT = `You are the Fix Author inside an autonomous backend platform.
 
 A behavioral check on a generated backend has FAILED, and the curated fix
 registry has no entry for it. You may propose ONE fix using only the
@@ -300,12 +298,13 @@ function done(
   startedAt: number,
   promptTokens?: number,
   completionTokens?: number,
+  model = 'not called',
 ): AuthorFixResult {
   return {
     candidate,
     reason,
     telemetry: {
-      model: AUTHOR_MODEL,
+      model,
       durationMs: Date.now() - startedAt,
       promptTokens,
       completionTokens,

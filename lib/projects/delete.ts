@@ -29,6 +29,16 @@
  * continuing would produce precisely the silent partial deletion this module
  * exists to end.
  *
+ * ── A PROJECT IN ANOTHER REGION ─────────────────────────────────────────────
+ *
+ * Its schemas and its logins live in its region's database cluster, which no
+ * transaction on the platform database can reach. They are dropped first, in
+ * their region, in a transaction of their own (dropRegionalProjectData); the
+ * platform transaction follows. Two databases cannot commit as one, so the order
+ * is chosen to leave only a retryable state: a failure between the two leaves a
+ * project row with nothing behind it in its region, never regional data with no
+ * row pointing at it.
+ *
  * ── WHY AN OUTBOX ───────────────────────────────────────────────────────────
  *
  * Backups and storage objects cannot join that transaction. The job row that
@@ -45,6 +55,9 @@
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
+import { projectRegion, regionOfRecord, regionRawClient } from '@/lib/data-plane/regional'
+import { serviceRegion } from '@/lib/data-plane/serving'
+import { HOME_REGION, type CloudRegionId } from '@/lib/regions'
 import {
   assertValidProjectId,
   isProjectOwnedSchema,
@@ -52,8 +65,11 @@ import {
   quoteIdent,
   workspaceSchemaName,
 } from '@/lib/security/workspace-schema'
+import { functionRoleName } from '@/lib/services/ai-functions/function-db-role'
 import { purgeProjectExternals } from '@/lib/projects/purge'
 import { PURGE_JOB_TYPE, PURGE_STATUS } from '@/lib/queue'
+import { purgeAccountState } from '@/lib/usage/account'
+import { confirmPropagation, type Propagation } from '@/lib/auth-projection/confirm'
 
 export { PURGE_JOB_TYPE, PURGE_STATUS }
 
@@ -77,6 +93,13 @@ export class TooManyProjectsError extends Error {
   }
 }
 
+export class ProjectCreatedDuringDeletionError extends Error {
+  constructor(projectId: string) {
+    super(`Project ${projectId} was created in another region while its account was being deleted; retry the deletion`)
+    this.name = 'ProjectCreatedDuringDeletionError'
+  }
+}
+
 export class UnknownProjectSchemaError extends Error {
   constructor(schemaName: string) {
     super(`Refusing to delete: unrecognised schema in project namespace: ${schemaName.slice(0, 80)}`)
@@ -92,6 +115,12 @@ export interface DeletionResult {
   purgeJobIds: string[]
   /** False when the post-commit purge attempt failed and was left to the worker. */
   externalPurgeCompleted: boolean
+  /**
+   * Whether the project's region has the deletion yet, for a single project
+   * kept outside the home region (lib/auth-projection/confirm.ts). Unset for an
+   * account deletion, whose projects' deletions are delivered all the same.
+   */
+  propagation?: Propagation
 }
 
 type Tx = Prisma.TransactionClient
@@ -140,6 +169,173 @@ async function resolveProjectSchemas(tx: Tx, projectId: string): Promise<string[
   return schemas
 }
 
+// ── Rows the Project cascade cannot reach ────────────────────────────────────
+//
+// Dozens of models carry a bare `projectId` column with no relation to
+// Project, so `project.delete` left them behind: full DDL snapshots (rawDdl
+// that can recreate the schema), PITR/state graph snapshots, MCP OAuth codes
+// and access tokens, security events — after a deletion whose Settings copy
+// says "every receipt". The list is DERIVED from the Prisma schema at module
+// load, so a future model with a bare projectId is swept automatically instead
+// of quietly joining the orphan class.
+//
+// Deliberately NOT swept:
+const SWEEP_EXCLUDED: Record<string, string> = {
+  // A session belongs to the USER; projectId only records which project was
+  // open. Deleting the row would log the owner out mid-deletion — the pointer
+  // is nulled instead.
+  Session: 'nulled, not deleted',
+  // Billed usage happened and is owed by the billing ACCOUNT. The ledger rows
+  // must survive the project so the month still closes truthfully.
+  UsageDaily: 'billing ledger',
+  UsageMetric: 'billing ledger',
+  // Platform telemetry about Backenly itself, not customer content.
+  ProductEvent: 'platform telemetry',
+  // The deletion itself, on its way to the project's region. The delete
+  // trigger records it in this same transaction, and the region removes the
+  // project and its keys from its authorization copy only when this row is
+  // delivered (lib/auth-projection/deliver.ts). Swept here, the region would
+  // never hear of the deletion while its copy stayed fresh, and the deleted
+  // project's keys would keep working there. Delivered rows are pruned a day
+  // later; they hold ids only.
+  AuthProjectionChange: 'carries the deletion to its region',
+}
+
+/** Exported for the deletion test, which seeds and sweeps this exact list. */
+export const ORPHANED_PROJECT_MODELS: string[] = Prisma.dmmf.datamodel.models
+  .filter(
+    (m) =>
+      m.fields.some((f) => f.name === 'projectId' && f.kind === 'scalar') &&
+      !m.fields.some((f) => f.kind === 'object' && f.type === 'Project') &&
+      !(m.name in SWEEP_EXCLUDED),
+  )
+  .map((m) => m.name)
+
+/**
+ * Remove every row the cascade left behind. Runs AFTER the project (or user)
+ * row is deleted, inside the same transaction: by then every cascade-covered
+ * table is already empty, intra-model children (ApiUsageLog,
+ * MaintenanceStepExecution) are gone with their parents, and whatever still
+ * carries this projectId is precisely the orphan class being removed.
+ */
+async function sweepOrphanedProjectRows(tx: Tx, projectId: string): Promise<void> {
+  await tx.session.updateMany({ where: { projectId }, data: { projectId: null } })
+  for (const model of ORPHANED_PROJECT_MODELS) {
+    const delegate = (tx as any)[model.charAt(0).toLowerCase() + model.slice(1)]
+    await delegate.deleteMany({ where: { projectId } })
+  }
+}
+
+/**
+ * Drop the project's own PostgreSQL LOGIN roles.
+ *
+ * run_query provisions bkn_ro_<hex> for any project an agent queries, the
+ * owner may have enabled bkn_rw_<hex>, and the function runtime derives
+ * bkn_fn_<hex> per schema. None of these died with the project: the roles are
+ * cluster-level, pg_hba admits their group remotely, and the encrypted
+ * passwords sat in DatabaseCredential rows the cascade could not reach — so a
+ * contractor's psql kept logging in to the production cluster after the
+ * project was "permanently" deleted.
+ */
+async function dropProjectDatabaseRoles(tx: Tx, projectId: string, schemas: string[]): Promise<void> {
+  await dropRoles(tx, projectRoleNames(await credentialRoleNames(tx, projectId), schemas))
+}
+
+/** The login roles the project's credentials name, read from the platform database. */
+async function credentialRoleNames(db: Pick<Tx, 'databaseCredential'>, projectId: string): Promise<string[]> {
+  return (await db.databaseCredential.findMany({ where: { projectId }, select: { roleName: true } })).map(
+    (r) => r.roleName,
+  )
+}
+
+/** Every login the project may own: its credentials' roles, and one function role per schema. */
+function projectRoleNames(credentialRoles: string[], schemas: string[]): string[] {
+  const fnRoles = schemas.map((schema) => functionRoleName(schema))
+  return [...new Set([...credentialRoles, ...fnRoles])].filter((name) => /^bkn_(ro|rw|fn)_[0-9a-f]{12}$/.test(name))
+}
+
+/**
+ * Drop these login roles in the cluster `tx` is connected to.
+ *
+ * Uses public.backenly_direct_drop_role (terminates sessions, strips
+ * policies, reassigns, drops) where the installer created it; otherwise a
+ * guarded manual drop. Existence is CHECKED rather than caught: an error
+ * inside the transaction would abort the whole deletion.
+ */
+async function dropRoles(tx: Tx, candidates: string[]): Promise<void> {
+  if (candidates.length === 0) return
+
+  const helper = await tx.$queryRaw<{ n: number }[]>`
+    SELECT count(*)::int AS n FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public' AND p.proname = 'backenly_direct_drop_role'`
+  const hasHelper = Number(helper[0]?.n ?? 0) > 0
+
+  for (const role of candidates) {
+    const exists = await tx.$queryRaw<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM pg_roles WHERE rolname = ${role}`
+    if (Number(exists[0]?.n ?? 0) === 0) continue
+
+    // The installer's helper validates its argument against the direct-access
+    // role shapes (bkn_ro_/bkn_rw_) and refuses bkn_fn_ — those take the
+    // manual path even where the helper exists.
+    if (hasHelper && /^bkn_(ro|rw)_/.test(role)) {
+      await tx.$queryRaw`SELECT public.backenly_direct_drop_role(${role})`
+    } else {
+      // The schemas are already dropped in this transaction, so the role's
+      // grants on them are gone; DROP OWNED clears anything else it holds.
+      await tx.$executeRawUnsafe(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '${role}'`,
+      )
+      await tx.$executeRawUnsafe(`DROP OWNED BY ${quoteIdent(role)}`)
+      await tx.$executeRawUnsafe(`DROP ROLE IF EXISTS ${quoteIdent(role)}`)
+    }
+  }
+}
+
+/**
+ * A project outside the home region keeps its schemas, and its logins, in its
+ * region's database cluster, which the platform transaction cannot reach: the
+ * drops there find nothing, so the project's data and its direct-access logins
+ * would outlive the project. They are dropped first, in their region, in a
+ * transaction of their own on that region's database.
+ *
+ * Before the platform transaction, not after. If the platform step then fails,
+ * the project's row survives with nothing left in its region, and the user's
+ * retry finishes the deletion: this step is idempotent and finds nothing to
+ * drop the second time. The other order could commit the deletion and leave the
+ * regional data with no row pointing at it, the failure this module ends.
+ *
+ * Returns the schemas dropped. Home-region projects return none: their
+ * schemas and roles are dropped inside the platform transaction, as before.
+ */
+async function dropRegionalProjectData(projectId: string, region: CloudRegionId): Promise<string[]> {
+  if (region === HOME_REGION) return []
+
+  // The credentials are platform rows: read them here, drop their roles there.
+  const credentialRoles = await credentialRoleNames(prisma, projectId)
+  return regionRawClient(region, projectId).$transaction(
+    async (rtx) => {
+      await rtx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`)
+      await rtx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT}'`)
+      const schemas = await resolveProjectSchemas(rtx, projectId)
+      for (const schema of schemas) {
+        await rtx.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`)
+      }
+      // The project's customer data kept off its platform rows
+      // (lib/data-plane/regional-bodies.ts) goes with it, not 30 days later.
+      // A database the procedure has not given the table yet holds none.
+      const [{ present }] = await rtx.$queryRaw<{ present: boolean }[]>`
+        SELECT to_regclass('public.regional_bodies') IS NOT NULL AS present`
+      if (present) await rtx.$executeRaw`DELETE FROM public.regional_bodies WHERE "projectId" = ${projectId}`
+      // After the schemas, so the roles hold no grants that would block the drop.
+      await dropRoles(rtx, projectRoleNames(credentialRoles, schemas))
+      return schemas
+    },
+    { timeout: TRANSACTION_TIMEOUT_MS, maxWait: TRANSACTION_MAX_WAIT_MS },
+  )
+}
+
 /**
  * Drop every schema for one project and record the external work.
  *
@@ -150,6 +346,7 @@ async function resolveProjectSchemas(tx: Tx, projectId: string): Promise<string[
 async function purgeProjectInTransaction(
   tx: Tx,
   projectId: string,
+  region: CloudRegionId,
 ): Promise<{ schemas: string[]; jobId: string }> {
   const schemas = await resolveProjectSchemas(tx, projectId)
 
@@ -158,6 +355,9 @@ async function purgeProjectInTransaction(
     // identifier cannot come from a request body: it came from pg_namespace.
     await tx.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`)
   }
+
+  // After the schemas, so the roles hold no grants that would block the drop.
+  await dropProjectDatabaseRoles(tx, projectId, schemas)
 
   // Written inside the transaction: this is the outbox record, and it must
   // commit with the drops or not at all. Payload carries the project id and
@@ -172,9 +372,11 @@ async function purgeProjectInTransaction(
       status: PURGE_STATUS.pending,
       // projectId identifies the target; storageDriver records WHICH backend
       // held the files, so a retry after an operator changes STORAGE_DRIVER
-      // still purges the backend the project actually used. Nothing else: no
-      // paths, no credentials, no user identifiers.
-      payload: { projectId, storageDriver: process.env.STORAGE_DRIVER || 'local' },
+      // still purges the backend the project actually used; region records
+      // where they live, which no later read can recover once the project's
+      // row is gone. Nothing else: no paths, no credentials, no user
+      // identifiers.
+      payload: { projectId, storageDriver: process.env.STORAGE_DRIVER || 'local', region },
       attempts: 0,
       maxAttempts: 5,
       runAt: new Date(),
@@ -205,14 +407,22 @@ async function purgeProjectInTransaction(
  * on disk.
  */
 async function attemptImmediatePurge(
-  targets: { projectId: string; jobId: string }[],
+  targets: { projectId: string; jobId: string; region: CloudRegionId }[],
 ): Promise<boolean> {
   let allSucceeded = true
 
-  for (const { projectId, jobId } of targets) {
+  for (const { projectId, jobId, region } of targets) {
+    // A project kept in another region is purged there, by that region's
+    // scheduler (lib/queue/worker.ts processPurgeJobs): its bucket and disks
+    // are not this process's. The job stays pending until it does.
+    if (region !== serviceRegion()) {
+      allSucceeded = false
+      continue
+    }
     try {
       const report = await purgeProjectExternals(projectId, {
         storageDriver: process.env.STORAGE_DRIVER || 'local',
+        region,
       })
 
       await prisma.backgroundJob
@@ -261,16 +471,25 @@ async function attemptImmediatePurge(
 export async function deleteProjectCompletely(projectId: string): Promise<DeletionResult> {
   assertValidProjectId(projectId)
 
+  // Read while the row exists; a region error stops the deletion here, before
+  // anything is dropped anywhere.
+  const region = await projectRegion(projectId)
+  const regionalSchemas = await dropRegionalProjectData(projectId, region)
+
   const { schemas, jobId } = await prisma.$transaction(
     async (tx) => {
       await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`)
       await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT}'`)
 
-      const result = await purgeProjectInTransaction(tx, projectId)
+      const result = await purgeProjectInTransaction(tx, projectId, region)
+      result.schemas.unshift(...regionalSchemas)
 
       // Cascades every dependent Prisma table, including WorkspaceBranch and
-      // WorkspaceBackup. Last, so a constraint failure rolls back the drops.
+      // WorkspaceBackup — so a constraint failure rolls back the drops.
       await tx.project.delete({ where: { id: projectId } })
+
+      // After the cascade: whatever still carries this projectId is an orphan.
+      await sweepOrphanedProjectRows(tx, projectId)
 
       return result
     },
@@ -281,13 +500,17 @@ export async function deleteProjectCompletely(projectId: string): Promise<Deleti
     `[ProjectDelete] project=${projectId} schemas=${schemas.length} purgeJob=${jobId}`,
   )
 
-  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId }])
+  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId, region }])
+  // Its keys stop working in its region once the region has the deletion
+  // (lib/auth-projection/confirm.ts); `pending` says it is still in flight.
+  const propagation = await confirmPropagation({ entity: 'project', entityId: projectId })
 
   return {
     projectIds: [projectId],
     schemasDropped: schemas,
     purgeJobIds: [jobId],
     externalPurgeCompleted,
+    propagation,
   }
 }
 
@@ -308,6 +531,24 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
     throw new Error('deleteAccountCompletely requires a userId')
   }
 
+  // Projects outside the home region first, each in its region, before the
+  // platform transaction (dropRegionalProjectData explains the order).
+  const owned = await prisma.project.findMany({
+    where: { userId },
+    select: { id: true, region: true },
+    orderBy: { id: 'asc' },
+  })
+  if (owned.length > ACCOUNT_DELETE_INLINE_MAX) {
+    throw new TooManyProjectsError(owned.length)
+  }
+  const regions = new Map<string, CloudRegionId>()
+  const regionalSchemas: string[] = []
+  for (const project of owned) {
+    const region = regionOfRecord(project.id, project.region)
+    regions.set(project.id, region)
+    regionalSchemas.push(...(await dropRegionalProjectData(project.id, region)))
+  }
+
   const { projectIds, schemas, jobIds } = await prisma.$transaction(
     async (tx) => {
       await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`)
@@ -316,7 +557,7 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
       // Read before the cascade destroys the list.
       const projects = await tx.project.findMany({
         where: { userId },
-        select: { id: true },
+        select: { id: true, region: true },
         orderBy: { id: 'asc' },
       })
 
@@ -324,17 +565,31 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
         throw new TooManyProjectsError(projects.length)
       }
 
-      const allSchemas: string[] = []
+      const allSchemas: string[] = [...regionalSchemas]
       const allJobIds: string[] = []
 
       for (const project of projects) {
-        const result = await purgeProjectInTransaction(tx, project.id)
+        const region = regions.get(project.id) ?? regionOfRecord(project.id, project.region)
+        // A project created in another region after the regional drops above
+        // still has its data there: refuse, and the retry drops it too.
+        if (!regions.has(project.id) && region !== HOME_REGION) {
+          throw new ProjectCreatedDuringDeletionError(project.id)
+        }
+        const result = await purgeProjectInTransaction(tx, project.id, region)
         allSchemas.push(...result.schemas)
         allJobIds.push(result.jobId)
       }
 
+      // The account's own AI usage and credit balances, which do not cascade.
+      await purgeAccountState(tx, userId)
+
       // Cascades the projects and everything under them.
       await tx.user.delete({ where: { id: userId } })
+
+      // After the cascade: sweep each project's orphaned rows.
+      for (const project of projects) {
+        await sweepOrphanedProjectRows(tx, project.id)
+      }
 
       return {
         projectIds: projects.map((p) => p.id),
@@ -350,7 +605,7 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
   )
 
   const externalPurgeCompleted = await attemptImmediatePurge(
-    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i] })),
+    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i], region: regions.get(projectId) ?? HOME_REGION })),
   )
 
   return {

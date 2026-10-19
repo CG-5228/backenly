@@ -33,6 +33,7 @@ import {
   type StatusTone,
 } from '@/components/inspector/kit'
 import { EDGE, FOCUS, PAGE_GUTTER, PAGE_WIDTH, RULE } from '@/components/console/tokens'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 type ProjectStatus = 'PRIVATE' | 'DEPLOYING' | 'LIVE' | 'FAILED'
 
@@ -79,6 +80,8 @@ interface ReadinessCheck {
 export default function PublishPage() {
   const params = useParams()
   const projectId = params.id as string
+  // Nothing to publish is the agent's next job: offer Connect only until it is connected.
+  const agent = useAgentConnection(projectId)
 
   const [project, setProject] = useState<ProjectData | null>(null)
   const [publishedVersions, setPublishedVersions] = useState<PublishedVersion[]>([])
@@ -90,6 +93,34 @@ export default function PublishPage() {
   const [error, setError] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
   const [rollingBackId, setRollingBackId] = useState<string | null>(null)
+  const [applyingFixes, setApplyingFixes] = useState(false)
+  const [fixNote, setFixNote] = useState<string | null>(null)
+
+  /**
+   * Applying fixes is a deliberate act, never a side effect of looking: it can
+   * enable row-level security with an owner policy (rows other users could
+   * read stop appearing to them), generate the project JWT secret, set the
+   * auth flag, and switch off placeholder functions that have live triggers.
+   */
+  const applySafeFixes = async () => {
+    setApplyingFixes(true)
+    setFixNote(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/readiness`, { method: 'POST', credentials: 'include' })
+      const r = await res.json().catch(() => ({}))
+      if (res.ok) {
+        setReadinessChecks(r.report?.checks ?? [])
+        const applied: ReadinessCheck[] = r.report?.autoFixed ?? []
+        setFixNote(applied.length > 0 ? `Applied: ${applied.map(c => c.name).join(', ')}.` : 'Nothing needed fixing.')
+      } else {
+        setFixNote(r.error || 'The fixes could not be applied.')
+      }
+    } catch {
+      setFixNote('The fixes could not be applied.')
+    } finally {
+      setApplyingFixes(false)
+    }
+  }
 
   const fetchAll = async () => {
     try {
@@ -120,11 +151,12 @@ export default function PublishPage() {
       const hasRealContent = (state?.hasContent ?? false) || hasAuth
       if (hasRealContent) {
         try {
-          // POST → run auto-fixes (RLS, JWT secret, etc.) BEFORE rendering the
-          // score, so the page shows the post-repair state rather than a stale
-          // snapshot. Same logic the autonomy runtime applies in the background.
+          // GET: a read that changes nothing. This used to POST, which ran the
+          // auto-fixes on every page load: enabling RLS with an owner policy on
+          // tables an agent had left open on purpose, generating secrets and
+          // switching functions off, with no click and no record on the page.
+          // Fixes are the explicit "Apply safe fixes" action in the panel.
           const readinessRes = await fetch(`/api/projects/${projectId}/readiness`, {
-            method: 'POST',
             credentials: 'include',
           })
           if (readinessRes.ok) {
@@ -247,7 +279,7 @@ export default function PublishPage() {
   if (loading) {
     return (
       <div className={`${PAGE_WIDTH} ${PAGE_GUTTER} pb-16`}>
-        <PageHeader className="!px-0" title="Deploy" description="Production changes only when you publish." />
+        <PageHeader className="!px-0" title="Deploy" description="Publishing records a version of your backend. The API serves changes as they are made." />
         <div className="space-y-4" aria-hidden>
           <Skeleton className="h-[76px] w-full rounded-[10px]" />
           <Skeleton className="h-[200px] w-full rounded-[10px]" />
@@ -276,10 +308,17 @@ export default function PublishPage() {
   const endpointCount = backendState?.endpointCount ?? (backendState?.apis.length ?? 0) * 5
   const tableCount = backendState?.entities.length ?? 0
   const apiResourceCount = backendState?.apis.length ?? 0
+  // What the publish ENGINE will accept (lib/deployment/go-live.ts refuses
+  // when tables, exposed APIs and auth are all absent). hasContent is wider —
+  // functions, buckets or realtime alone flip it — and offering Publish on
+  // that wider set meant the button led straight to a refusal.
+  const publishable = tableCount > 0 || apiResourceCount > 0 || hasAuth
 
   const passingChecks = readinessChecks.filter(c => c.status === 'pass').length
   const blockingChecks = readinessChecks.filter(c => c.status === 'fail' && c.severity === 'blocking')
   const warningChecks = readinessChecks.filter(c => c.status === 'fail' && c.severity !== 'blocking')
+  // What "Apply safe fixes" would change: failing checks the engine can fix.
+  const fixableChecks = readinessChecks.filter(c => c.status === 'fail' && c.severity === 'auto-fixable' && !c.fixApplied)
 
   /**
    * What the readiness card actually draws: anything that FAILED, then the
@@ -307,11 +346,13 @@ export default function PublishPage() {
   })()
 
   const runtimeTagline = (() => {
-    if (status === 'LIVE' && hasRealBackend) return 'Your production endpoint is serving. Every change is governed, snapshotted and reversible.'
-    if (status === 'DEPLOYING') return 'Creating a stable production snapshot. The runtime stays locked until activation completes.'
-    if (status === 'FAILED') return 'The last publish failed. Production is unchanged, and the previous version is still serving.'
-    if (hasRealBackend) return 'Your backend is built. Publish it to get a stable, versioned endpoint your app can rely on.'
-    return 'Production changes only when you publish. Connect your coding agent to start building.'
+    if (status === 'LIVE' && hasRealBackend) return 'Your endpoint is serving. Every change is governed and recorded; publishing snapshots a version you can compare and report against.'
+    if (status === 'DEPLOYING') return 'Recording a versioned snapshot of the backend. The API keeps serving while it completes.'
+    if (status === 'FAILED') return 'The last publish failed, so no new version was recorded. The API keeps serving the backend as it is.'
+    if (hasRealBackend) return 'Your backend is built and its API is already answering. Publish to record version one and mark the project live.'
+    return agent.connected
+      ? 'The API serves changes as your agent makes them. Ask your agent to start building.'
+      : 'The API serves changes as they are made. Connect your coding agent to start building.'
   })()
 
   const publishButton = (label: string) => (
@@ -364,6 +405,21 @@ export default function PublishPage() {
             </li>
           )}
         </ul>
+        {(fixableChecks.length > 0 || fixNote) && (
+          <div className={`flex flex-wrap items-center justify-between gap-3 border-t ${RULE} px-4 py-2.5`}>
+            <p className="min-w-0 flex-1 text-[12.5px] leading-[18px] text-zinc-500">
+              {fixNote ??
+                `${fixableChecks.length} ${fixableChecks.length === 1 ? 'item' : 'items'} Backenly can fix: ` +
+                  `${fixableChecks.map(c => c.name).join(', ')}. This can turn on row-level security for tables ` +
+                  'it can find an owner for, so check what each table should show before applying.'}
+            </p>
+            {fixableChecks.length > 0 && (
+              <KitButton onClick={applySafeFixes} loading={applyingFixes}>
+                {applyingFixes ? 'Applying…' : 'Apply safe fixes'}
+              </KitButton>
+            )}
+          </div>
+        )}
         {blockingChecks.length > 0 && (
           <div className={`border-t ${RULE} px-4 py-2.5`}>
             <Link
@@ -573,10 +629,12 @@ export default function PublishPage() {
               action={
                 <div className="flex w-full flex-col items-center gap-3">
                   <AgentPrompt prompt="Build the backend for a task tracker: projects, tasks with a status and a due date, and email sign-in. Only a task's owner can edit it." />
-                  <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.primary}`}>
-                    <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
-                    Connect your agent
-                  </Link>
+                  {agent.needsConnect && (
+                    <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.primary}`}>
+                      <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
+                      Connect your agent
+                    </Link>
+                  )}
                 </div>
               }
             />
@@ -588,8 +646,12 @@ export default function PublishPage() {
           <KitColumns
             main={
               <SettingsCard
-                title="Ready to go live"
-                description="Publishing snapshots the backend as version one and gives your app a stable endpoint. Later changes stay in development until you publish again."
+                title={publishable ? 'Ready to go live' : 'Serving, not yet publishable'}
+                description={
+                  publishable
+                    ? 'Publishing snapshots the backend as version one and marks the project live. The API is already answering, and keeps serving later changes as they are made; publish again to record the next version.'
+                    : 'Functions, storage and realtime are already serving. Publishing records a schema snapshot, so it needs at least one table, a generated API or enabled auth first.'
+                }
                 footer={
                   <span className="flex flex-wrap items-center gap-x-4 gap-y-1 tabular-nums">
                     {tableCount > 0 && <span>{tableCount} {tableCount === 1 ? 'table' : 'tables'}</span>}
@@ -598,7 +660,7 @@ export default function PublishPage() {
                     {hasStorage && <span>Storage</span>}
                   </span>
                 }
-                actions={publishButton('Publish backend')}
+                actions={publishable ? publishButton('Publish backend') : undefined}
               />
             }
             side={readinessPanel('Before you publish')}
@@ -636,7 +698,7 @@ export default function PublishPage() {
             <EmptyState
               icon={AlertCircle}
               title="The publish did not complete"
-              description={project.deploymentError || 'Production is unchanged and the previous version is still serving. Try again, or ask your agent to look at the error.'}
+              description={project.deploymentError || 'No new version was recorded; the API keeps serving the backend as it is. Try again, or ask your agent to look at the error.'}
               action={publishButton('Try again')}
             />
           </KitCard>
@@ -648,12 +710,18 @@ export default function PublishPage() {
             <EmptyState
               icon={AlertCircle}
               title="Live, but empty"
-              description="This project is published, but there is nothing to serve yet. Connect your coding agent and build the backend first."
+              description={
+                agent.connected
+                  ? 'This project is published, but there is nothing to serve yet. Ask your agent to build the backend first.'
+                  : 'This project is published, but there is nothing to serve yet. Connect your coding agent and build the backend first.'
+              }
               action={
-                <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.secondary}`}>
-                  <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
-                  Connect your agent
-                </Link>
+                agent.needsConnect ? (
+                  <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.secondary}`}>
+                    <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
+                    Connect your agent
+                  </Link>
+                ) : undefined
               }
             />
           </KitCard>

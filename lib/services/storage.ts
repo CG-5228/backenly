@@ -3,7 +3,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { S3StorageService } from './s3Storage'
-import { clampIsPublic } from '@/lib/storage/access-policy'
+import { clampIsPublic, policyAllowsPublic } from '@/lib/storage/access-policy'
 import { requireStorageSecret } from '@/lib/auth/jwt-secret'
 import { StorageUnavailableError } from '@/lib/storage/errors'
 import { signExportToken } from '@/lib/storage/export-token'
@@ -13,7 +13,7 @@ import { UploadRejectedError, assertFileAllowed, assertFileSize } from '@/lib/st
 export interface StorageService {
   // Bucket operations
   createBucket(name: string, projectId: string, isPublic?: boolean): Promise<{ id: string; name: string; isPublic: boolean }>
-  listBuckets(projectId: string): Promise<Array<{ id: string; name: string; isPublic: boolean; fileCount: number; totalSize: bigint }>>
+  listBuckets(projectId: string): Promise<Array<{ id: string; name: string; isPublic: boolean; accessPolicy: string; fileCount: number; totalSize: bigint }>>
   deleteBucket(bucketId: string, projectId: string): Promise<void>
   getBucket(bucketId: string, projectId: string): Promise<{ id: string; name: string; isPublic: boolean } | null>
 
@@ -29,10 +29,17 @@ export interface StorageService {
     size: bigint
     mimeType: string | null
     isPublic: boolean
+    uploadedBy: string | null
     bucket: string
     createdAt: Date
     url: string
   }>>
+  /**
+   * How many active files match the same WHERE listFiles uses, so a console
+   * page can say "N of M" instead of presenting one page as everything.
+   * Counts the metadata DB, so it is identical across blob drivers.
+   */
+  countFiles(bucketId: string | undefined, projectId: string, search?: string): Promise<number>
   getFile(fileId: string, projectId: string): Promise<{ path: string; buffer: Buffer; mimeType: string | null; name: string } | null>
   getFileUrl(fileId: string, projectId: string, expiresIn?: number): Promise<string>
   /**
@@ -103,6 +110,10 @@ class LocalStorageService implements StorageService {
         name,
         projectId, // Required for tenant isolation
         isPublic,
+        // The enforced field. Serving (mayRead), upload clamping and the
+        // console all read accessPolicy; isPublic alone is a label. Deriving
+        // it here keeps the two in agreement from birth.
+        accessPolicy: isPublic ? 'public_read' : 'private',
       },
     })
 
@@ -140,6 +151,9 @@ class LocalStorageService implements StorageService {
       id: bucket.id,
       name: bucket.name,
       isPublic: bucket.isPublic,
+      // The enforced visibility. isPublic is a label; readers deciding what to
+      // DISPLAY or PROMISE must use this.
+      accessPolicy: bucket.accessPolicy,
       fileCount: bucket.files.length,
       totalSize: bucket.files.reduce((sum, file) => sum + file.size, BigInt(0)), // Keep as BigInt
     }))
@@ -498,12 +512,28 @@ class LocalStorageService implements StorageService {
       size: file.size, // Keep as BigInt
       mimeType: file.mimeType,
       isPublic: file.isPublic,
+      uploadedBy: file.uploadedBy ?? null,
       bucket: file.bucket.name,
       createdAt: file.createdAt,
       url: file.isPublic
         ? `${baseUrl}/${file.id}/download`
         : `${baseUrl}/${file.id}/download?token=${this.generateAccessTokenSync(file.id)}`,
     }))
+  }
+
+  /**
+   * How many active files match — the same WHERE as listFiles, so the
+   * console can say "N of M loaded" instead of presenting one page as the
+   * whole project.
+   */
+  async countFiles(bucketId: string | undefined, projectId: string, search?: string): Promise<number> {
+    if (!projectId) {
+      throw new Error('Project ID is required for tenant isolation')
+    }
+    const where: any = { projectId, deletedAt: null }
+    if (bucketId) where.bucketId = bucketId
+    if (search) where.name = { contains: search, mode: 'insensitive' }
+    return prisma.storageFile.count({ where })
   }
 
   async getFile(fileId: string, projectId: string) {
@@ -555,6 +585,7 @@ class LocalStorageService implements StorageService {
 
     const file = await prisma.storageFile.findUnique({
       where: { id: fileId },
+      include: { bucket: { select: { accessPolicy: true } } },
     })
 
     if (!file) {
@@ -572,7 +603,12 @@ class LocalStorageService implements StorageService {
     }
 
     const baseUrl = process.env.STORAGE_BASE_URL || '/api/storage/files'
-    if (file.isPublic) {
+    // Public only when the bucket's CURRENT policy permits public objects AND
+    // the file is marked public, the rule the download route enforces
+    // (mayRead). The file's own flag outlives a policy change: a bucket
+    // tightened to private keeps isPublic=true on its files, and a token-less
+    // URL for one of them is a link the download route refuses.
+    if (policyAllowsPublic(file.bucket.accessPolicy) && file.isPublic) {
       return `${baseUrl}/${fileId}/download`
     }
 

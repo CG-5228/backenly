@@ -18,6 +18,7 @@
 import { loadProjectMemory, saveProjectMemory } from './project-memory'
 import type { BuildResponse } from './build-runtime/types'
 
+import { chat } from '@/lib/ai/llm/chat'
 // ── Evolution Types ───────────────────────────────────────────────────────────
 
 export interface EvolutionPhase {
@@ -267,15 +268,11 @@ export async function analyzeProjectEvolution(projectId: string): Promise<Evolut
   if (ev.buildsCount === 0) return ev
 
   try {
-    const OpenAI = (await import('openai')).default
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
     const context = buildEvolutionContext(ev, memory.builtSoFar, memory.decisions ?? [])
 
-    const response = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
-      temperature: 0.3,
-      max_tokens: 2000,
+    const response = await chat({
+      purpose: 'insight.explain',
       messages: [
         {
           role: 'system',
@@ -311,9 +308,12 @@ Return ONLY valid JSON — no markdown, no explanation.`,
           content: context,
         },
       ],
+      maxTokens: 2000,
+      json: true,
+      label: 'evolution',
     })
 
-    const raw = response.choices[0]?.message?.content?.trim() ?? '{}'
+    const raw = response.text?.trim() ?? '{}'
     const parsed = JSON.parse(raw)
 
     // Merge roadmap items

@@ -112,6 +112,9 @@ describe('importing an AI module without a credential', () => {
     // No top-level `const <name> = new OpenAI(` -- the construction must be
     // indented inside a function body.
     expect(code).not.toMatch(/^const\s+\w+\s*=\s*new OpenAI\(/m)
-    expect(code).toMatch(/function getOpenAIClient\(\)/)
+    // Since the AI gateway, it builds no provider client at all: lib/ai/llm
+    // constructs one on first use, when a call is actually made.
+    expect(code).not.toMatch(/new OpenAI\(/)
+    expect(code).toMatch(/from '@\/lib\/ai\/llm\/chat'/)
   })
 })

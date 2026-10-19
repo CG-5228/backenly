@@ -4,13 +4,14 @@ import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { Toast } from '@/components/ui/Toast'
+import { getProject } from '@/lib/api/projects'
 import { Mail, Shield, ExternalLink, KeyRound, ArrowRight } from 'lucide-react'
 import {
   CopyField, KitButton, KitChecklist, KitField, KitInput, KitModal, KitNote, SettingsCard, Stat, StatStrip,
   StatusDot,
 } from '@/components/inspector/kit'
 
-type ProviderId = 'google' | 'github'
+type ProviderId = 'google' | 'github' | 'discord' | 'facebook'
 
 interface AuthStats {
   totalUsers: number
@@ -52,6 +53,22 @@ function GitHubMark({ className = '' }: { className?: string }) {
   )
 }
 
+function DiscordMark({ className = '' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden>
+      <path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286ZM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189Zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z" />
+    </svg>
+  )
+}
+
+function FacebookMark({ className = '' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden>
+      <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073Z" />
+    </svg>
+  )
+}
+
 const PROVIDER_META: Record<ProviderId, {
   name: string
   Mark: typeof GoogleMark
@@ -75,6 +92,26 @@ const PROVIDER_META: Record<ProviderId, {
     console: 'https://github.com/settings/developers',
     consoleName: 'GitHub Developer Settings',
     tagline: 'OAuth sign-in built for developer apps',
+  },
+  // The runtime serves these (server/routes/oauth.ts) and the agent configures
+  // them (add_oauth_provider) — the page only knew Google and GitHub, so a
+  // Discord sign-in worked for end users while the owner's console showed no
+  // row to see or disable it.
+  discord: {
+    name: 'Discord',
+    Mark: DiscordMark,
+    markClass: 'w-[18px] h-[18px] text-indigo-300',
+    console: 'https://discord.com/developers/applications',
+    consoleName: 'Discord Developer Portal',
+    tagline: 'OAuth sign-in for community apps',
+  },
+  facebook: {
+    name: 'Facebook',
+    Mark: FacebookMark,
+    markClass: 'w-[18px] h-[18px] text-blue-300',
+    console: 'https://developers.facebook.com/apps',
+    consoleName: 'Meta for Developers',
+    tagline: 'OAuth sign-in with a Facebook account',
   },
 }
 
@@ -122,12 +159,12 @@ export function AuthConfiguration() {
   const [stats, setStats] = useState<AuthStats | null>(null)
   const [statsLoading, setStatsLoading] = useState(true)
   const [recent, setRecent] = useState<RecentUser[]>([])
-  const [origin, setOrigin] = useState('')
+  // The project's API base in its own region ({origin}/api/v1/{id}), from the
+  // server. This page's origin is the console's, which is not where a project
+  // in another region is served, and the redirect URI below is registered with
+  // the provider and kept.
+  const [apiBaseUrl, setApiBaseUrl] = useState<string | null>(null)
   const [loadError, setLoadError] = useState(false)
-
-  useEffect(() => {
-    setOrigin(window.location.origin)
-  }, [])
 
   const authHeaders = useCallback((projectId: string): HeadersInit => {
     const token = localStorage.getItem('auth-token')
@@ -199,13 +236,23 @@ export function AuthConfiguration() {
     } catch { setLoadError(true) }
   }, [authHeaders])
 
+  const fetchApiBaseUrl = useCallback(async (projectId: string) => {
+    try {
+      const project = await getProject(projectId)
+      setApiBaseUrl(project.apiBaseUrl ?? null)
+    } catch {
+      setApiBaseUrl(null)
+    }
+  }, [])
+
   const loadAll = useCallback((projectId: string) => {
     setLoadError(false)
+    fetchApiBaseUrl(projectId)
     fetchEnabledProviders(projectId)
     fetchEmailAuthStatus(projectId)
     fetchStats(projectId)
     fetchRecent(projectId)
-  }, [fetchEnabledProviders, fetchEmailAuthStatus, fetchStats, fetchRecent])
+  }, [fetchApiBaseUrl, fetchEnabledProviders, fetchEmailAuthStatus, fetchStats, fetchRecent])
 
   useEffect(() => {
     const projectId = localStorage.getItem('current-project-id')
@@ -259,6 +306,8 @@ export function AuthConfiguration() {
       const envKeys: Record<ProviderId, Record<string, string>> = {
         google: { GOOGLE_CLIENT_ID: clientId, GOOGLE_CLIENT_SECRET: clientSecret },
         github: { GITHUB_CLIENT_ID: clientId, GITHUB_CLIENT_SECRET: clientSecret },
+        discord: { DISCORD_CLIENT_ID: clientId, DISCORD_CLIENT_SECRET: clientSecret },
+        facebook: { FACEBOOK_CLIENT_ID: clientId, FACEBOOK_CLIENT_SECRET: clientSecret },
       }
       const response = await fetch(`/api/projects/${currentProjectId}/credentials`, {
         method: 'POST',
@@ -297,7 +346,7 @@ export function AuthConfiguration() {
   }
 
   const callbackUrl = (provider: ProviderId) =>
-    `${origin || 'https://backenly.com'}/api/v1/${currentProjectId ?? '{projectId}'}/auth/${provider}/callback`
+    apiBaseUrl ? `${apiBaseUrl}/auth/${provider}/callback` : ''
 
 
   const emailActive = emailProviderEnabled || (stats?.totalUsers ?? 0) > 0
@@ -372,7 +421,7 @@ export function AuthConfiguration() {
               <StatusDot tone={emailActive ? 'operational' : 'neutral'} label={emailActive ? 'Active' : 'Not set up'} />
             </li>
 
-            {(['google', 'github'] as ProviderId[]).map((pid) => {
+            {(['google', 'github', 'discord', 'facebook'] as ProviderId[]).map((pid) => {
               const meta = PROVIDER_META[pid]
               const enabled = enabledProviders.has(pid)
               const Mark = meta.Mark
@@ -492,7 +541,11 @@ export function AuthConfiguration() {
             } />
             {/* The redirect URI is where most OAuth setups fail; hand it over ready to paste. */}
             <OAuthStep n={2} title="Add this authorized redirect URI">
-              <CopyField value={callbackUrl(modalProvider)} />
+              {apiBaseUrl ? (
+                <CopyField value={callbackUrl(modalProvider)} />
+              ) : (
+                <span className="text-zinc-500">The project&apos;s address is not available. Reload the page to try again.</span>
+              )}
             </OAuthStep>
             <OAuthStep n={3} title={`Paste the credentials ${modalMeta.name} gives you`}>
               <div className="space-y-3">

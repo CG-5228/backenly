@@ -9,9 +9,9 @@
  * User Prompt → SEMANTIC UNDERSTANDING → Entity Inference → Normalization → Validation
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 
+import { chat } from '@/lib/ai/llm/chat'
 /**
  * Structured interpretation of user intent
  */
@@ -62,10 +62,8 @@ export async function understandSemanticIntent(
       promptLength: userMessage.length,
     })
     
-    const openai = getOpenAIClient()
-    
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -126,11 +124,12 @@ Return ONLY valid JSON, no markdown.`
           content: `Analyze this prompt and extract semantic understanding:\n\n"${userMessage}"`
         }
       ],
-      temperature: 0.3,
-      max_tokens: 1500,
+      maxTokens: 1500,
+      json: true,
+      label: 'semantic-understanding',
     })
 
-    const content = response.choices[0]?.message?.content
+    const content = response.text
     if (!content) {
       throw new Error('No response from AI')
     }

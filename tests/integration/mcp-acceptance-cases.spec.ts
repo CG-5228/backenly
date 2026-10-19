@@ -96,6 +96,11 @@ afterAll(async () => {
   else process.env.ENGINE_MODE = originalEngineMode
   await forgetFunctionDbClient(projectId).catch(() => {})
   await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {})
+  // FAIL-PARTIAL's automatic rollback keeps what it removed in a change vault.
+  const vaults = await prisma.$queryRawUnsafe<Array<{ nspname: string }>>(
+    `SELECT nspname FROM pg_namespace WHERE left(nspname, length($1)) = $1`, `workspace_${projectId}_r`,
+  ).catch(() => [])
+  for (const v of vaults) await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${v.nspname}" CASCADE`).catch(() => {})
   const role = functionRoleName(schema)
   await prisma.$executeRawUnsafe(`DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
     EXECUTE 'DROP OWNED BY ${role}'; EXECUTE 'DROP ROLE ${role}'; END IF; END $$`).catch(() => {})
@@ -149,15 +154,21 @@ describe('approvals', () => {
   }, 60_000)
 
   it('CONNECT-DISCONNECT-GOVERNED: disconnecting a frontend waits for a human, and nothing runs', async () => {
-    // Connecting one needs a deployed backend (it says so, which is its own
-    // honest refusal); the governance under test is that a disconnect parks.
-    const parked = await call(RW, 'connect', { action: 'disconnect_frontend', url: 'https://app.example.test' })
+    // Connecting needs no publish (DEP-14), so the frontend really is
+    // connected first; the governance under test is that the disconnect parks
+    // and the connection survives until a human decides.
+    const origin = 'https://app.example.test'
+    const isActive = async () =>
+      (await prisma.connectedApp.findUnique({ where: { projectId_origin: { projectId, origin } } }))?.isActive
+    const connected = await call(RW, 'connect', { action: 'connect_frontend', url: origin })
+    expect(connected.body.ok).toBe(true)
+    expect(await isActive()).toBe(true)
+    const parked = await call(RW, 'connect', { action: 'disconnect_frontend', url: origin })
     expect(parked.body.approval?.id).toBeTruthy()
     const row = await prisma.agentApprovalRequest.findUnique({ where: { id: parked.body.approval.id } })
-    expect(row).toMatchObject({ tool: 'disconnect_frontend', toolArgs: { url: 'https://app.example.test' }, status: 'pending', executedAt: null })
-    const refused = await call(RW, 'connect', { action: 'connect_frontend', url: 'https://app.example.test' })
-    expect(refused.body.ok).toBe(false)
-    expect(refused.body.summary).toMatch(/deploy/i)
+    expect(row).toMatchObject({ tool: 'disconnect_frontend', toolArgs: { url: origin }, status: 'pending', executedAt: null })
+    // Nothing ran: the frontend is still connected.
+    expect(await isActive()).toBe(true)
   }, 60_000)
 })
 
@@ -218,18 +229,25 @@ describe('row-level security under a real end-user', () => {
 })
 
 describe('failure recovery', () => {
-  it('FAIL-PARTIAL: a migration that stops part-way says what applied and what remains', async () => {
+  it('FAIL-PARTIAL: a migration that stops part-way is rolled back, and says what ran, what failed and what remains', async () => {
     // A statement that passes every check before running and fails in
     // Postgres: a CHECK the row already in notes ('alice note') violates.
+    //
+    // This used to leave partial_first in production and tell the agent not
+    // to replay it. A migration on main is now one recorded change, and a
+    // failure part-way rolls it back to its restore point, so production gets
+    // all of a migration or none of it.
     const sql = "CREATE TABLE partial_first (x text);\nALTER TABLE notes ADD CONSTRAINT notes_body_short CHECK (length(body) < 3);\nCREATE TABLE partial_never (z text)"
     const r = await call(RW, 'apply_migration', { sql })
     const t = await prisma.$queryRaw<Array<{ table_name: string }>>`
       SELECT table_name FROM information_schema.tables WHERE table_schema = ${schema} AND table_name LIKE 'partial_%'`
     expect({ body: JSON.stringify(r.body).slice(0, 1500), tables: t.map((x) => x.table_name) })
-      .toEqual({ body: expect.stringContaining('"code":"MIGRATION_FAILED"'), tables: ['partial_first'] })
-    expect(r.body.applied.map((a: any) => a.statement)).toEqual(['CREATE TABLE partial_first (x text)'])
+      .toEqual({ body: expect.stringContaining('"code":"MIGRATION_FAILED"'), tables: [] })
+    expect(r.body.applied).toEqual([])
+    expect(r.body.rolledBack.map((a: any) => a.statement)).toEqual(['CREATE TABLE partial_first (x text)'])
     expect(r.body.remaining).toEqual(['CREATE TABLE partial_never (z text)'])
-    expect(r.body.hint).toMatch(/do not replay them/)
+    expect(r.body.change).toMatchObject({ status: 'recovered' })
+    expect(r.body.hint).toMatch(/Nothing was applied/)
   }, 120_000)
 
   it('FAIL-MISSING-TABLE: a statement on a table that does not exist is refused before anything runs', async () => {

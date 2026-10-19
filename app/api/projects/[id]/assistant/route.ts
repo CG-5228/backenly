@@ -14,15 +14,16 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectValidation } from '@/lib/middleware/projectValidation'
 import { enforceAiChatRateLimit, getRateLimitHeaders } from '@/lib/middleware/rateLimiter'
-import { chatCompletionStream, isAIEnabled } from '@/lib/openai/client'
+import { AiError, aiAvailability } from '@/lib/ai/llm'
+import { chat } from '@/lib/ai/llm/chat'
 import { assistantPrompt } from '@/lib/ai/brain/prompts'
 import { buildConnectManifest } from '@/lib/services/connect-manifest'
 import { resolvePublicBaseUrl } from '@/lib/services/public-url'
+import { agentConnectionFor } from '@/lib/mcp/agent-connection'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
-const ASSISTANT_MODEL = process.env.OPENAI_MODEL_FAST || 'gpt-4o-mini'
 const MAX_TURNS = 12
 const MAX_MESSAGE_CHARS = 4_000
 
@@ -49,9 +50,13 @@ function parseMessages(body: unknown): ClientMessage[] | null {
  * Compact per-project grounding: names + ready snippets, deliberately NOT the
  * full column/row detail — the assistant guides, it doesn't inspect data.
  */
-async function buildProjectContext(projectId: string, projectName: string, origin: string): Promise<string> {
+async function buildProjectContext(projectId: string, projectName: string, origin: string, userId: string): Promise<string> {
   try {
-    const manifest = await buildConnectManifest(projectId, origin)
+    const [manifest, agent] = await Promise.all([
+      buildConnectManifest(projectId, origin),
+      // Best effort: unknown reads as not connected, the line it replaced.
+      agentConnectionFor(projectId, userId).catch(() => null),
+    ])
     const tableNames = manifest.tables.map((t) => t.name)
     const authMethods = manifest.auth.enabled ? manifest.auth.methods.join(', ') : 'not enabled yet'
     return [
@@ -60,7 +65,11 @@ async function buildProjectContext(projectId: string, projectName: string, origi
       `- Tables (${tableNames.length}): ${tableNames.length ? tableNames.join(', ') : 'none yet'}`,
       `- End-user auth: ${authMethods} · Storage buckets: ${manifest.storage.buckets.length} · Realtime: ${manifest.realtime.enabled ? 'available' : 'available (no subscriptions yet)'}`,
       `- Frontend SDK: \`${manifest.sdk.importLine}\` then \`${manifest.sdk.initLine}\``,
-      `- Coding agent (MCP): the Connect section generates the exact per-agent setup (Claude Code, Cursor, any MCP host) with a scoped key.`,
+      // The client's name stays out: an OAuth client registers its own, and
+      // that is not text to put in a system prompt.
+      agent?.connected
+        ? `- Coding agent (MCP): CONNECTED for this user, last call ${agent.lastSeenAt?.toISOString() ?? 'unknown'}. To build or change something they ask that agent directly; do not walk them through connecting it again.`
+        : `- Coding agent (MCP): not connected for this user yet. The Connect section generates the exact per-agent setup (Claude Code, Cursor, any MCP host) with a scoped key.`,
     ].join('\n')
   } catch {
     // Grounding is best-effort — a manifest failure must not take down Q&A.
@@ -70,7 +79,7 @@ async function buildProjectContext(projectId: string, projectName: string, origi
 
 export async function POST(request: NextRequest) {
   return withProjectValidation(request, async ({ projectId, userId, project }) => {
-    if (!isAIEnabled()) {
+    if (!aiAvailability().available) {
       return NextResponse.json(
         { error: 'The assistant is not available right now.' },
         { status: 503 },
@@ -94,22 +103,27 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const projectContext = await buildProjectContext(projectId, project.name, resolvePublicBaseUrl(request))
+    const projectContext = await buildProjectContext(projectId, project.name, resolvePublicBaseUrl(request), userId)
 
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
-          const tokens = chatCompletionStream(
-            [{ role: 'system', content: assistantPrompt(projectContext) }, ...messages],
-            { model: ASSISTANT_MODEL, temperature: 0.4, maxTokens: 700 },
-          )
-          for await (const token of tokens) {
-            controller.enqueue(encoder.encode(token))
-          }
+          // Shown as it is written: the gateway streams the text out as Claude
+          // produces it (the OpenAI adapter sends it whole, at the end).
+          await chat({
+            purpose: 'brain.answer',
+            messages: [{ role: 'system', content: assistantPrompt(projectContext) }, ...messages],
+            maxTokens: 1024,
+            onText: (delta) => controller.enqueue(encoder.encode(delta)),
+            billing: { projectId },
+            label: 'assistant',
+          })
         } catch (err) {
           console.error('[assistant] stream failed:', err)
-          controller.enqueue(encoder.encode('Something went wrong answering that. Try again in a moment.'))
+          controller.enqueue(
+            encoder.encode(err instanceof AiError ? err.userMessage : 'Something went wrong answering that. Try again in a moment.'),
+          )
         } finally {
           controller.close()
         }

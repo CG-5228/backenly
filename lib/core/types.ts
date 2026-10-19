@@ -396,17 +396,21 @@ const PREFIX_MAP: ReadonlyArray<readonly [string, FindingType]> = [
   ['weak_rls', 'missing_rls'],
   ['unprotected_user_data', 'unprotected_user_data'],
   ['rls_expression_invalid', 'rls_expression_invalid'],
-  ['orphaned_fk', 'missing_fk'],
+  // `orphaned_fk_*`, `auth_gap_*` and `missing_realtime_triggers_*` are NOT
+  // aliased. They came from the retired agent orchestrator, and each alias sent
+  // an approval to a different repair than the finding described: "drop the
+  // broken foreign key" ran ADD_CONSTRAINT, "no auth table" ran FIX_AUTH on a
+  // project that had not asked for auth, and "no realtime triggers" ran
+  // FIX_REALTIME. Unaliased they normalise to null: no fix action, notify only.
+  // See docs/autonomy-orchestrator-parity.md.
   ['missing_fk', 'missing_fk'],
   ['missing_index', 'missing_fk_index'],
   ['n_plus_one_risk', 'missing_fk_index'],
   ['unbounded_pagination', 'missing_rate_limit'],
   ['missing_rate_limit', 'missing_rate_limit'],
-  ['missing_realtime_triggers', 'realtime_gap'],
   ['realtime_gap', 'realtime_gap'],
   ['auth_jwt', 'auth_jwt_missing'],
   ['auth_users_table', 'auth_users_table_missing'],
-  ['auth_gap', 'broken_auth'],
   ['auth_spike', 'auth_spike'],
   ['oauth_redirect_uri', 'oauth_redirect_uri_missing'],
   ['oauth_config', 'oauth_config_invalid'],

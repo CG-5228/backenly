@@ -198,10 +198,18 @@ export function CodeBlock({
   code,
   label,
   language = 'bash',
+  wrap = false,
 }: {
   code: string
   label?: string
   language?: string
+  /**
+   * Wrap long lines instead of scrolling them. For prose a reader copies, such
+   * as a request to give a coding agent, where a sentence cut off at the edge
+   * of the block hides half of what they are about to paste. Code keeps the
+   * default: wrapping it would break the line structure it is read by.
+   */
+  wrap?: boolean
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -249,7 +257,9 @@ export function CodeBlock({
           )}
         </button>
       </div>
-      <pre className="overflow-x-auto px-5 py-5 text-[13px] leading-[1.75]">
+      <pre
+        className={`${wrap ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'} px-5 py-5 text-[13px] leading-[1.75]`}
+      >
         <code className="font-mono text-[#d4d4d4] [font-variant-ligatures:none]">{rendered}</code>
       </pre>
     </div>

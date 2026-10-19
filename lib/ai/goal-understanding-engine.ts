@@ -18,8 +18,8 @@
  *   LLM   : Novel products → blueprint in < 3s   (fallback for unknown domains)
  */
 
-import { getOpenAIClient } from './openai-service'
-import { getModel } from './model-router'
+import { chat } from '@/lib/ai/llm/chat'
+
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1203,10 +1203,8 @@ async function generateBlueprintWithLLM(
   prompt: string,
   context: { existingTables?: string[] },
 ): Promise<ProductBlueprint> {
-  const openai = getOpenAIClient()
-
-  const response = await openai.chat.completions.create({
-    model: getModel('plan'),
+  const response = await chat({
+    purpose: 'build.plan',
     messages: [
       {
         role: 'system',
@@ -1244,12 +1242,12 @@ Rules:
         content: `Design a comprehensive backend blueprint for: "${prompt}"`,
       },
     ],
-    temperature: 0.1,
-    max_tokens: 3000,
-    response_format: { type: 'json_object' },
+    maxTokens: 3000,
+    json: true,
+    label: 'goal-understanding',
   })
 
-  const raw = response.choices[0].message.content || '{}'
+  const raw = response.text || '{}'
   const parsed = JSON.parse(raw)
 
   const blueprint: ProductBlueprint = {

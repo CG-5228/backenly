@@ -23,11 +23,10 @@ import type { BuildContext } from '../../lib/ai/build-runtime/types'
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
-jest.mock('@/lib/ai/openai-service', () => ({
-  getOpenAIClient: () => ({
-    chat: {
-      completions: {
-        create: jest.fn().mockImplementation(({ messages }: any) => {
+// The build runtime asks the AI gateway's chat() helper. These canned answers
+// are written in the provider's message shape and adapted below.
+jest.mock('@/lib/ai/llm/chat', () => {
+  const create = jest.fn().mockImplementation(({ messages }: any) => {
           // Route mock responses based on prompt content
           const userMsg: string = messages.find((m: any) => m.role === 'user')?.content ?? ''
 
@@ -87,15 +86,21 @@ jest.mock('@/lib/ai/openai-service', () => ({
           return Promise.resolve({
             choices: [{ message: { content: JSON.stringify({ subBehavior: 'EXECUTION', reason: 'mock' }) } }],
           })
-        }),
-      },
+  })
+  return {
+    chat: async (req: any) => {
+      const r = await create({ messages: req.messages })
+      const text: string = r.choices[0].message.content
+      let json: unknown
+      try {
+        json = JSON.parse(text)
+      } catch {
+        json = undefined
+      }
+      return { text, json, result: { model: 'scripted' } }
     },
-  }),
-}))
-
-jest.mock('@/lib/ai/model-router', () => ({
-  getModel: () => 'gpt-4o-mini',
-}))
+  }
+})
 
 jest.mock('@/lib/db/prisma', () => ({
   prisma: {

@@ -28,6 +28,7 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import type { RawFinding, FindingSeverity } from '@/lib/core/types'
 
 export interface RequestedColumn {
@@ -118,6 +119,53 @@ export async function recordSchemaIntent(
         err?.message,
       )
     }
+  }
+}
+
+export type SupersedingChange =
+  | { kind: 'drop_column'; tableName: string; columnName: string }
+  | { kind: 'drop_table'; tableName: string }
+  | { kind: 'rename_column'; tableName: string; from: string; to: string }
+
+/**
+ * A governed drop or rename is a later explicit request, so it supersedes what
+ * the ledger recorded for those columns, the same way a second create_table
+ * does. Without this, a column the developer removed on purpose stayed
+ * "requested" forever: the drift detector reported it missing, and an AI
+ * proposal would offer to put it back.
+ *
+ * Called with the request after its DDL succeeded, never from the catalog (see
+ * DESIGN RULE): a column dropped over a direct connection made no request, so it
+ * is still reported as drift. Best-effort like recordSchemaIntent, and loud on
+ * failure, because a stale entry here becomes a false finding.
+ */
+export async function supersedeSchemaIntent(projectId: string, change: SupersedingChange): Promise<void> {
+  const table = String(change.tableName || '').toLowerCase().trim()
+  if (!table) return
+  try {
+    if (change.kind === 'drop_table') {
+      await prisma.schemaIntent.deleteMany({ where: { projectId, tableName: table } })
+    } else if (change.kind === 'drop_column') {
+      const column = String(change.columnName || '').trim()
+      if (column) await prisma.schemaIntent.deleteMany({ where: { projectId, tableName: table, columnName: column } })
+    } else {
+      const from = String(change.from || '').trim()
+      const to = String(change.to || '').trim()
+      if (!from || !to || from === to) return
+      // The renamed column carries what was asked for under its old name. An
+      // entry already held under the new name was for a column that no longer
+      // existed (the rename could not have succeeded otherwise); the developer
+      // has now given that name to this column, which supersedes it.
+      await prisma.$transaction([
+        prisma.schemaIntent.deleteMany({ where: { projectId, tableName: table, columnName: to } }),
+        prisma.schemaIntent.updateMany({ where: { projectId, tableName: table, columnName: from }, data: { columnName: to } }),
+      ])
+    }
+  } catch (err: any) {
+    console.error(
+      `[IntentLedger] FAILED to apply ${change.kind} on ${table} — the ledger may now report a deliberate change as drift:`,
+      err?.message,
+    )
   }
 }
 
@@ -264,8 +312,11 @@ export async function checkIntentConformance(projectId: string): Promise<Conform
     return { checked: 0, findings: [], unverifiable: 0 }
   }
 
+  // The intents are platform rows; the columns they describe are in the
+  // project's region, resolved before the fail-soft foreign-key read below.
+  const db = await workspaceRawClient(projectId)
   const schema = `workspace_${projectId}`
-  const rows = await prisma.$queryRawUnsafe<Array<{
+  const rows = await db.$queryRawUnsafe<Array<{
     table_name: string; column_name: string; data_type: string; is_nullable: string
   }>>(
     `SELECT table_name, column_name, data_type, is_nullable
@@ -282,7 +333,7 @@ export async function checkIntentConformance(projectId: string): Promise<Conform
   }))
 
   // Foreign keys actually present, so a requested fkTo can be verified.
-  const fkRows = await prisma.$queryRawUnsafe<Array<{ table_name: string; column_name: string }>>(
+  const fkRows = await db.$queryRawUnsafe<Array<{ table_name: string; column_name: string }>>(
     `SELECT kcu.table_name, kcu.column_name
        FROM information_schema.table_constraints tc
        JOIN information_schema.key_column_usage kcu

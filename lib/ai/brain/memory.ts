@@ -13,6 +13,7 @@
 import { prisma } from '@/lib/db/prisma'
 import { loadHistory, saveMessages } from '@/app/api/ai/chat/pipeline/conversation-store'
 import { collectProof, type ProofBlock } from '@/lib/ai/proof-system'
+import { redactSecretsInText } from './redact'
 
 export interface ConversationTurn {
   role: 'user' | 'assistant'
@@ -87,7 +88,15 @@ export async function saveTurn(
   aiContent: string,
   requestId?: string | null,
 ): Promise<void> {
-  await saveMessages(projectId, userContent, aiContent, requestId).catch(err => {
+  // History outlives the turn, so credentials are redacted on the way in: a
+  // key the user pasted, or one a tool minted (create_api_key answers with it),
+  // was meant for the one live response, not for ConversationMessage.
+  await saveMessages(
+    projectId,
+    redactSecretsInText(userContent),
+    redactSecretsInText(aiContent),
+    requestId,
+  ).catch(err => {
     console.error('[BrainMemory] saveTurn failed (non-fatal):', err)
   })
 }

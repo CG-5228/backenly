@@ -37,9 +37,12 @@ import { checkBreaker } from './circuit-breaker'
 import { classifyFix } from '@/lib/core/fix-classifier'
 import { computeHealthSignal } from './telemetry'
 import { LOOP_TICK_ACTIONS } from './loop-tick'
+import { recordSensorState } from './sensor-state'
 import { runAutoFix } from '@/lib/core/auto-fix-engine'
 import { FLAGS } from '@/lib/config/flags'
 import { loopPrincipals, principalsToMetadata } from '@/lib/principal'
+import { canReach } from './region-skip'
+import { quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
 
 export type ReconcileAction =
   | 'WOULD_AUTO_APPLY'     // tier within dial + breaker budget available
@@ -175,6 +178,9 @@ export async function computeReconciliationPlan(projectId: string): Promise<Reco
 export async function runReconcilerShadow(projectId: string): Promise<ReconciliationPlan | null> {
   try {
     const plan = await computeReconciliationPlan(projectId)
+    // What this pass could and could not check, for surfaces that must not call
+    // a backend healthy when some checks were blind (lib/autonomy/sensor-state).
+    await recordSensorState(projectId, plan.report)
 
     // Skip the audit write entirely when there is nothing to decide — keeps
     // the ledger signal-dense for the precision analysis.
@@ -455,6 +461,9 @@ async function reopenIfRetryable(
   // Not an error and not a stall — the next tick re-reads whatever it became.
   if (!updated) return { findingId: null, skip: 'retry_backoff' }
 
+  // The failure is the executor's or PostgreSQL's own words, copied only as an
+  // error code for a project kept in another region (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
   await prisma.auditLog
     .create({
       data: {
@@ -469,7 +478,7 @@ async function reopenIfRetryable(
           attempt: decision.attempt,
           maxAttempts: ESCALATION_RETRY_BACKOFF_HOURS.length,
           priorFailure:
-            typeof escalation.reason === 'string' ? escalation.reason.slice(0, 300) : null,
+            typeof escalation.reason === 'string' ? quotedError(escalation.reason, quote).slice(0, 300) : null,
         }),
         timestamp: new Date(),
       },
@@ -736,6 +745,8 @@ export async function runReconcilerLive(projectId: string): Promise<LiveReconcil
   try {
     const plan = await computeReconciliationPlan(projectId)
     const base = { projectId, level: plan.level, plan }
+    // What this pass could and could not check (lib/autonomy/sensor-state).
+    await recordSensorState(projectId, plan.report)
 
     // Withdraw invariant findings the probes no longer support — the same tick
     // that can CREATE findings must also be able to CLOSE them, or a gap whose
@@ -1015,6 +1026,11 @@ export async function runReconciler(
   // asked. The schedulers already filtered on it; the kick did not, and
   // neither did anything that calls this directly.
   if (!(await isWatchableProject(projectId))) return null
+
+  // A project whose region this process cannot reach is skipped, and the skip
+  // recorded (lib/autonomy/region-skip.ts). Reconciling it here would read its
+  // failures as an empty or healthy backend.
+  if (!(await canReach(projectId, 'reconciler'))) return null
 
   // Plan-driven cadence gate. The "tick" is any prior reconciler audit row
   // — live, shadow, change-freeze, or the dispatcher-written TICK marker. The

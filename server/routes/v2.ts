@@ -46,11 +46,12 @@ import {
   profileForProject,
 } from '@/lib/postgrest/gateway'
 import { checkExposure, type Operation } from '@/lib/postgrest/exposure'
+import { projectPostgrest } from '@/lib/data-plane/regional'
 import { stripUpstreamError } from '@/lib/postgrest/translate'
 import { ensureSchemaRegistered } from '@/lib/postgrest/registration'
-import { getProjectIdFromAuth } from './dynamic'
+import { authRefusalStatus, getProjectIdFromAuth, refuseIfKeyLacksMethodPermission } from './dynamic'
 import { ENVIRONMENT_HEADER, environmentHeaderValue } from '@/lib/branches/key-scope'
-import { enforceRateLimitByKeyId } from '../lib/auth'
+import { enforceKeyRateLimit, enforceRateLimitByKeyId } from '../lib/auth'
 import { asyncRoute } from '../lib/async-route'
 import { touchProjectActivity } from '@/lib/projects/activity'
 import {
@@ -84,11 +85,6 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
     return res.status(404).json({ code: 'NOT_FOUND', message: 'No table in path.' })
   }
 
-  const baseUrl = process.env.POSTGREST_URL
-  const secret = process.env.POSTGREST_JWT_SECRET
-  if (!baseUrl || !secret) {
-    return res.status(503).json({ code: 'V2_UNAVAILABLE', message: 'PostgREST is not configured.' })
-  }
 
   // No per-project engine gate. This check existed while two data planes
   // coexisted: answering v2 for a project still served by the legacy executor
@@ -115,15 +111,16 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
 
   const auth = await getProjectIdFromAuth(req)
   if (!auth.success || auth.projectId !== projectId) {
-    // A service-role key refused because the request came from a browser is an
-    // AUTHORIZATION decision about a valid credential, not a failed one. 401
-    // would tell the developer their key is wrong and send them to re-issue it,
-    // which is the opposite of the fix — the key is fine, the place it is being
-    // used from is not.
-    const status = auth.code === 'SERVICE_ROLE_IN_BROWSER' ? 403 : 401
+    // A key refused for WHERE it was used (a service-role key from a browser, an
+    // MCP key on the runtime at all) is an AUTHORIZATION decision about a valid
+    // credential, not a failed one. 401 would tell the developer their key is
+    // wrong and send them to re-issue it, which is the opposite of the fix: the
+    // key is fine, the place it is being used from is not.
+    const status = auth.success ? 401 : authRefusalStatus(auth.code)
     return res.status(status).json({
       code: auth.success ? 'PROJECT_MISMATCH' : (auth.code ?? 'UNAUTHORIZED'),
       message: auth.success ? 'This key does not belong to that project.' : (auth.error ?? 'Unauthorized'),
+      ...(!auth.success && auth.hint ? { hint: auth.hint } : {}),
     })
   }
 
@@ -133,7 +130,7 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
   // lift it by changing one character in the URL. Rate limiting has to live on
   // every door the key opens, not on the one that happened to grow it first.
   if (auth.keyId) {
-    const rl = await enforceRateLimitByKeyId(auth.keyId)
+    const rl = auth.rateKey ? await enforceKeyRateLimit(auth.rateKey) : await enforceRateLimitByKeyId(auth.keyId)
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining))
     res.setHeader('X-RateLimit-Reset', String(Math.floor(rl.resetAt.getTime() / 1000)))
     if (!rl.allowed) {
@@ -144,6 +141,22 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
       })
     }
   }
+
+  // The key's own permission set gates the method — the same rule the legacy
+  // /db door applies, so narrowing a key narrows it on EVERY data door.
+  if (refuseIfKeyLacksMethodPermission(req, res, auth)) return
+
+  // Deployment configuration is judged AFTER the credential: a self-host
+  // without PostgREST still answers a bad key with the refusal it deserves,
+  // not with a 503 that hides the authorization result.
+  //
+  // The PostgREST serving the project's region; never another region's, which
+  // serves a database without this project's schema.
+  const postgrest = await projectPostgrest(projectId)
+  if (!postgrest) {
+    return res.status(503).json({ code: 'V2_UNAVAILABLE', message: 'PostgREST is not configured.' })
+  }
+  const { url: baseUrl, jwtSecret: secret } = postgrest
 
   // Authenticated, in quota, and past the serving gate: real use.
   void touchProjectActivity(projectId)

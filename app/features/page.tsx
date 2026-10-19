@@ -92,7 +92,7 @@ export default function FeaturesPage() {
           actions={
             <>
               <StartButton />
-              <ButtonLink href="/resources" variant="secondary">
+              <ButtonLink href="/docs" variant="secondary">
                 Read the docs
               </ButtonLink>
             </>

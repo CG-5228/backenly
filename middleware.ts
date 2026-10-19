@@ -73,11 +73,13 @@ const publicPathPrefixes = [
   '/comparisons',
   '/features',
   '/use-cases',
-  '/resources',
   '/docs',
+  '/resources',     // the docs moved to /docs and next.config redirects every
+                    // /resources URL there; the prefix stays public so an auth
+                    // wall can never win the race
   '/mcp',           // the page is gone and next.config redirects it, but the
                     // prefix stays public so an auth wall can never win the race
-  '/quickstart',    // same: the page was deleted and 301s to /resources. The
+  '/quickstart',    // same: the page was deleted and 301s to /docs/connect. The
                     // prefix stays public so the redirect always resolves for
                     // anonymous visitors following an indexed or npm link
   '/report/',       // shared change reports — access IS the revocable token, no session
@@ -111,13 +113,28 @@ const marketingPrefixes = [
   '/comparisons',
   '/features',
   '/use-cases',
+  '/docs',
   '/resources',
   '/mcp',
   '/quickstart',
   '/startups',
 ]
 
+// Served under a marketing prefix but not marketing. The published CLI and
+// older MCP setup prompts fetch /docs/llms.txt (rewritten to /llms.txt in
+// next.config.js), and an agent on a self-hosted install needs that answered
+// rather than bounced to /app. Middleware runs before rewrites, so the
+// exemption has to be by path here.
+//
+// /mcp/authorize is the OAuth CONSENT PAGE — the only place an authorization
+// code is minted. A self-hosted install serves the 401 challenge and the
+// OAuth metadata, the agent's host opens the browser at the consent URL, and
+// this redirect used to bounce it to /app: the dashboard opened, no code was
+// ever issued, and the host waited on a callback that never came.
+const marketingExemptions = ['/docs/llms.txt', '/mcp/authorize']
+
 function isMarketingPath(pathname: string): boolean {
+  if (marketingExemptions.includes(pathname)) return false
   if (marketingRoutes.includes(pathname)) return true
   return marketingPrefixes.some(prefix => pathname === prefix || pathname.startsWith(prefix + '/'))
 }
@@ -148,12 +165,21 @@ const publicApiRoutes = [
   '/api/cli/',                      // @backenly/cli — same scoped x-api-key auth (mcpGuard) at route level
   '/api/cron/',                     // Cron jobs — CRON_SECRET at route level
   '/api/billing/webhook',           // Paddle webhook — signature-verified
-  '/api/feedback/feature-request',  // Public form (rate limited at route)
-  '/api/feedback/support',          // Public form (rate limited at route)
+  // '/api/feedback/support' and '/api/feedback/feature-request' were allowed
+  // here, but no routes exist at those paths — the real support and
+  // feature-request routes authenticate. With startsWith matching, a future
+  // route under either prefix would have silently skipped auth, so the dead
+  // allowances are removed rather than kept.
   '/api/startups/',                 // Startup program (Cloud overlay): applying is anonymous, gated by
                                     // Turnstile, rate limits and an emailed code; the status and claim
                                     // routes authenticate the session themselves
   '/api/connect/',                  // Legacy provider handshake flow (routes self-authenticate; flagged for removal)
+]
+
+// ✅ PUBLIC API ROUTES matched exactly, not as prefixes, so a route added under
+// one later is not public by accident.
+const publicApiExactRoutes = [
+  '/api/regions',                   // The Cloud regions as served and which are open (app/api/regions); nothing per account
 ]
 
 // Production: strict allowlist. Development: also accept localhost via a
@@ -340,7 +366,7 @@ export async function middleware(request: NextRequest) {
   }
 
   // ✅ Public API routes
-  if (publicApiRoutes.some(route => pathname.startsWith(route))) {
+  if (publicApiRoutes.some(route => pathname.startsWith(route)) || publicApiExactRoutes.includes(pathname)) {
     return applyCorsHeaders(NextResponse.next())
   }
 

@@ -3,7 +3,7 @@
  * with its cursor until the host ends.
  *
  * Same contract as the maintenance backfill job (and read by the same
- * `inspectBackgroundJob`): `done` only on the last batch, `refusal` for a stop
+ * `backgroundJobState`): `done` only on the last batch, `refusal` for a stop
  * that waiting cannot fix, a throw for anything BackgroundJob should retry.
  *
  * ── The job re-checks the host before every batch ───────────────────────────
@@ -32,7 +32,7 @@
 
 import { prisma } from '@/lib/db'
 import { enqueue } from '@/lib/queue'
-import { inspectBackgroundJob } from '@/lib/autonomy/maintenance/execute'
+import { backgroundJobState } from '@/lib/autonomy/maintenance/execute'
 import { basisFingerprint, readTableFacts } from './facts'
 import { backfillBatchSql, ladderAccessSql, type ExtractionSpec } from './sql'
 import { BACKFILL_BATCH_ROWS } from './plan'
@@ -174,19 +174,21 @@ export interface ChainState {
  * `paused`, not failed: it carries the payload to continue from its cursor.
  */
 export async function inspectEvolutionChain(projectId: string, planVersion: string, firstJobId: string): Promise<ChainState> {
+  const fields = { id: true, status: true, payload: true, result: true, error: true, attempts: true } as const
   const newest = await prisma.backgroundJob
     .findFirst({
       where: { projectId, type: 'evolution_backfill', payload: { path: ['planVersion'], equals: planVersion } },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, status: true, payload: true, result: true },
+      select: fields,
     })
     .catch(() => null)
-  const jobId = newest?.id ?? firstJobId
-  const result = (newest?.result ?? null) as Partial<EvolutionBackfillResult> | null
-  if (newest?.status === 'completed' && typeof result?.refusal === 'string' && result.refusal.startsWith(PAUSED_REFUSAL)) {
-    return { jobId, state: 'paused', detail: result.refusal, resumeFrom: newest.payload as unknown as EvolutionBackfillPayload }
+  const job = newest ?? (await prisma.backgroundJob.findUnique({ where: { id: firstJobId }, select: fields }).catch(() => null))
+  const jobId = job?.id ?? firstJobId
+  const result = (job?.result ?? null) as Partial<EvolutionBackfillResult> | null
+  if (job?.status === 'completed' && typeof result?.refusal === 'string' && result.refusal.startsWith(PAUSED_REFUSAL)) {
+    return { jobId, state: 'paused', detail: result.refusal, resumeFrom: job.payload as unknown as EvolutionBackfillPayload }
   }
-  return { jobId, ...(await inspectBackgroundJob(jobId)) }
+  return { jobId, ...backgroundJobState(job, firstJobId) }
 }
 
 /** A chain for this plan version that is queued or running right now, if any. */

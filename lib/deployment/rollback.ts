@@ -13,7 +13,8 @@
 import { prisma } from '@/lib/db/prisma'
 import { emit } from '@/lib/events/bus'
 import { emitTrace } from '@/lib/ai/execution-tracer'
-import { getUserEntitlements } from '@/lib/entitlements'
+import { getAccountEntitlements } from '@/lib/entitlements'
+import { accountOf } from '@/lib/usage/account'
 import { recordRollbackMemory } from '@/lib/operational-memory/ledger'
 import { canAdministerProject } from '@/lib/edition/guard'
 
@@ -25,7 +26,8 @@ export interface RollbackOptions {
   /** Either a deployment id OR a version number — caller can pick. */
   deploymentId?: string
   version?: number
-  confirmedBy: 'CHAT' | 'UI' | 'API'
+  /** APPROVAL: a person approved an agent's exact call; `userId` is that person. */
+  confirmedBy: 'CHAT' | 'UI' | 'API' | 'APPROVAL'
   /** Skip the second-layer "Type ROLLBACK to confirm" prompt. */
   force?: boolean
 }
@@ -78,15 +80,15 @@ export async function rollbackDeploy(
 
   const project = await prisma.project.findUnique({
     where: { id: projectId },
-    select: { activeGraphId: true },
+    select: { activeGraphId: true, organizationId: true, userId: true },
   })
   if (!project) {
     return { kind: 'error', success: false, error: 'Project not found', code: 'NOT_FOUND' }
   }
 
-  // Plan gate
+  // Plan gate, on the plan of the account the project bills to
   if (!QUOTA_DISABLED) {
-    const entitlements = await getUserEntitlements(userId)
+    const entitlements = await getAccountEntitlements(accountOf(project) ?? userId)
     if (!entitlements?.allowDeploymentRollback) {
       return {
         kind: 'error',
@@ -151,10 +153,12 @@ export async function rollbackDeploy(
       fromVersion,
       toVersion,
       message:
-        `You're about to roll back:\n\n` +
+        `You're about to roll back the RECORDED version:\n\n` +
         `• From: v${fromVersion} (current)\n` +
         `• To:   v${toVersion} — ${target.changeSummary || 'Published'}\n\n` +
-        `Live consumers will start seeing the older schema and API shape immediately.\n\n` +
+        `This moves the version history's pointer. It does NOT change the live schema, ` +
+        `data, RLS or functions — the API keeps serving exactly what is there now. ` +
+        `To restore structure, use Database → Changes or restore a Snapshot.\n\n` +
         `Type ROLLBACK to confirm.`,
     }
   }
@@ -232,7 +236,10 @@ export async function rollbackDeploy(
   return {
     kind: 'rolled_back',
     success: true,
-    message: `Rolled back to v${toVersion}.`,
+    message:
+      `Recorded v${toVersion} as the current version. The live schema, data, RLS ` +
+      `and functions are unchanged — this is version bookkeeping, not a restore. ` +
+      `To restore structure, use Database → Changes or a Snapshot.`,
     fromVersion,
     toVersion,
   }

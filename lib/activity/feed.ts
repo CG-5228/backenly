@@ -155,7 +155,10 @@ function labelForAudit(
   // level updated" — a pre-existing labelling bug. Fix-event actions get the
   // "what because why" sentence; only LEVEL-CHANGE rows fall to the dial branch.
   if (a.includes('auto_fixed') || a.includes('auto_executed')) {
-    return { kind: 'auto_fix', label: explainAutonomyEvent(d).full }
+    // Only a recorded 'confirmed' outcome is a verified fix; anything else ran
+    // without confirmation and the feed says so rather than implying success.
+    const note = d.verification === 'confirmed' ? '' : ' (it ran, but could not be confirmed)'
+    return { kind: 'auto_fix', label: `${explainAutonomyEvent(d).full}${note}` }
   }
 
   // Autonomy dial — the owner changed how much Backenly may do on its own.
@@ -197,6 +200,14 @@ function labelForAudit(
     }
     if (a === 'agent_approval_rejected') {
       return { kind: 'general', label: target ? `You rejected the agent's change to ${target}` : "You rejected your coding agent's request" }
+    }
+    // Approved, but nothing ran (lib/mcp/approvals.ts): these must never read
+    // as a change the agent made.
+    if (a === 'agent_approval_unreadable_refused') {
+      return { kind: 'general', label: 'An agent request was not run: its exact call could not be read' }
+    }
+    if (a === 'agent_approval_unbound_refused') {
+      return { kind: 'general', label: 'An agent request was not run: it named no exact call' }
     }
     const summary = typeof d.summary === 'string' && d.summary.trim() ? d.summary.trim() : null
     return {

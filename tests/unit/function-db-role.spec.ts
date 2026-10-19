@@ -10,6 +10,13 @@ jest.mock('@/lib/db/prisma', () => ({ prisma: { $queryRaw: (...a: unknown[]) => 
 jest.mock('@/lib/services/workspace-pool', () => ({
   resolveWorkspaceSchema: async (id: string) => (id === 'bad' ? 'public' : `workspace_${id}`),
 }))
+// Every project here is in the home region: its raw client is the mocked
+// shared one and its database URL is DATABASE_URL. The regional routing itself
+// is proven against real databases in tests/integration/project-region.spec.ts.
+jest.mock('@/lib/data-plane/regional', () => ({
+  workspaceRawClient: async () => ({ $queryRaw: (...a: unknown[]) => mockQueryRaw(...a) }),
+  projectDatabaseUrl: async () => process.env.DATABASE_URL,
+}))
 
 import {
   functionRoleName,
@@ -59,14 +66,21 @@ describe('the password', () => {
 })
 
 describe('the connection string', () => {
-  it('is the app’s own, with the login swapped in and a small pool', () => {
-    const url = new URL(functionDatabaseUrl('bkn_fn_0123456789ab', 'pw'))
+  it('is the project database’s own, with the login swapped in and a small pool', () => {
+    const url = new URL(functionDatabaseUrl('bkn_fn_0123456789ab', 'pw', process.env.DATABASE_URL as string))
     expect(url.username).toBe('bkn_fn_0123456789ab')
     expect(url.password).toBe('pw')
     expect(url.host).toBe('db.internal:5432')
     expect(url.pathname).toBe('/backenly')
     expect(url.searchParams.get('sslmode')).toBe('require')
     expect(url.searchParams.get('connection_limit')).toBe('2')
+  })
+
+  it("turns Prisma's statement cache off, so a table whose columns changed does not fail a cached statement", () => {
+    // lib/data-plane/statement-cache.ts; the database side is
+    // tests/integration/workspace-sql-cached-plan.spec.ts.
+    const url = new URL(functionDatabaseUrl('bkn_fn_0123456789ab', 'pw', process.env.DATABASE_URL as string))
+    expect(url.searchParams.get('statement_cache_size')).toBe('0')
   })
 })
 

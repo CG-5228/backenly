@@ -12,10 +12,9 @@
  * plans and to fail fast on a misuse instead of timing out.
  */
 
-import { getOpenAIClient } from './openai-service'
+import { embed, embeddingAvailability, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from './llm/embeddings'
 
-export const EMBEDDING_MODEL = 'text-embedding-3-small'
-export const EMBEDDING_DIMENSIONS = 1536
+export { embeddingAvailability, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL }
 const MAX_BATCH = 96
 const MAX_INPUT_CHARS = 8000
 
@@ -47,19 +46,34 @@ export async function embedTexts(inputs: string[]): Promise<number[][]> {
     })
     if (nonEmpty.length === 0) continue
 
-    const openai = getOpenAIClient()
-    const resp = await openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: nonEmpty,
-    })
-
-    // OpenAI returns data[] in the same order as input[]
-    resp.data.forEach((row, k) => {
-      out[idxs[k]] = row.embedding
+    const vectors = await embed(nonEmpty)
+    vectors.forEach((vec, k) => {
+      out[idxs[k]] = vec
     })
   }
 
   return out
+}
+
+/**
+ * Why a table's stored vectors cannot be searched with the model configured
+ * now, or null when they can.
+ *
+ * A query vector from one model compared with row vectors from another returns
+ * confident nonsense, not an error, so the model and dimensions recorded when
+ * vector search was enabled must match before anything is embedded. A table
+ * enabled before they were recorded used text-embedding-3-small at 1536, the
+ * only model this has ever used.
+ */
+export function vectorConfigMismatch(recorded: { model?: unknown; dimensions?: unknown }): string | null {
+  const model = typeof recorded.model === 'string' ? recorded.model : 'text-embedding-3-small'
+  const dimensions = typeof recorded.dimensions === 'number' ? recorded.dimensions : 1536
+  if (model === EMBEDDING_MODEL && dimensions === EMBEDDING_DIMENSIONS) return null
+  return (
+    `This table's vectors were made with ${model} (${dimensions} dimensions), and this deployment embeds ` +
+    `with ${EMBEDDING_MODEL} (${EMBEDDING_DIMENSIONS}). Comparing the two would return meaningless matches, ` +
+    'so the search was not run. The stored vectors need to be made again with the current model.'
+  )
 }
 
 /** Embed a single string. Convenience wrapper. Returns [] on empty. */

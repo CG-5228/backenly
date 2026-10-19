@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { AlertCircle, Cable, LayoutGrid, RotateCw } from 'lucide-react'
 import { AgentPrompt, EmptyState as EmptyStateBlock, KitButton, Skeleton } from '@/components/inspector/kit'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 import { WorkspaceHome } from './WorkspaceHome'
 
@@ -14,22 +15,30 @@ interface MainWorkspaceProps {
 
 // ── Empty state ───────────────────────────────────────────────────────────────
 
-function EmptyState({ onConnect }: { onConnect: () => void }) {
+function EmptyState({ projectId, onConnect }: { projectId: string; onConnect: () => void }) {
   // Honest empty state. Nothing is "built" until the agent genuinely creates
   // it, so no tables, routes or auth are fabricated here. The one real next
-  // step is connecting an agent, and the most useful thing to hand over is
-  // the first sentence to send it.
+  // step is connecting an agent, or, once it is connected, asking it for
+  // something; either way the most useful thing to hand over is the first
+  // sentence to send it.
+  const agent = useAgentConnection(projectId)
   return (
     <div className="flex min-h-[70vh] flex-col items-center justify-center">
       <EmptyStateBlock
         icon={LayoutGrid}
-        title="Connect your coding agent"
-        description="This backend is empty. Point Claude Code, Codex, Cursor or any MCP client at it and Backenly builds your tables, APIs and auth here, then keeps them running."
+        title={agent.connected ? 'Your agent is connected' : 'Connect your coding agent'}
+        description={
+          agent.connected
+            ? 'This backend is empty. Ask your agent for what your app needs and Backenly builds the tables, APIs and auth here, then keeps them running.'
+            : 'This backend is empty. Point Claude Code, Codex, Cursor or any MCP client at it and Backenly builds your tables, APIs and auth here, then keeps them running.'
+        }
         action={
           <div className="flex w-full flex-col items-center gap-4">
-            <KitButton variant="primary" icon={Cable} onClick={onConnect}>
-              Connect your agent
-            </KitButton>
+            {agent.needsConnect && (
+              <KitButton variant="primary" icon={Cable} onClick={onConnect}>
+                Connect your agent
+              </KitButton>
+            )}
             <AgentPrompt prompt="Build a backend for my app: users, the tables it needs, and the APIs my frontend calls." />
           </div>
         }
@@ -132,6 +141,22 @@ export function MainWorkspace({ projectId, projectName }: MainWorkspaceProps) {
     }
   }, [fetchBackendState, fetchBuildStatus])
 
+  // Re-read /state when the user returns to the tab. The agent builds from a
+  // TERMINAL: the user connects Claude Code, asks for a backend, and tabs
+  // back — and this page kept saying "This backend is empty" until a hard
+  // reload, because the focus refresh lived only in WorkspaceHome, which is
+  // not even mounted while the empty state shows. No polling while hidden.
+  useEffect(() => {
+    const onVisible = () => { if (!document.hidden) { fetchBackendState(); fetchBuildStatus() } }
+    const onFocus = () => { fetchBackendState(); fetchBuildStatus() }
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [fetchBackendState, fetchBuildStatus])
+
   const retryBackendState = useCallback(() => {
     setStateStatus('loading')
     fetchBackendState()
@@ -155,7 +180,7 @@ export function MainWorkspace({ projectId, projectName }: MainWorkspaceProps) {
 
         {/* ── Empty state (confirmed empty, not failed) ───── */}
         {!hasContent && stateStatus === 'ready' && (
-          <EmptyState onConnect={() => router.push(`/app/projects/${projectId}/connect`)} />
+          <EmptyState projectId={projectId} onConnect={() => router.push(`/app/projects/${projectId}/connect`)} />
         )}
 
         {/* ── Backend overview ────────────────────────────── */}

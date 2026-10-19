@@ -54,8 +54,9 @@
  */
 
 import { prisma } from '@/lib/db'
-import { enqueue } from '@/lib/queue'
+import { REGIONAL_STATUS } from '@/lib/queue'
 import { FLAGS } from '@/lib/config/flags'
+import { queueBackfillJob } from './primitives/backfill-job'
 import { isTierAutoAllowed, type AutonomyLevel } from '../autonomy-level'
 import { approvalStillValid, isPlanStale, type MaintenancePlan } from './plan'
 import { computeCatalogFingerprint } from './resolve'
@@ -438,20 +439,19 @@ async function runLadder(
     // A rung that already dispatched work resumes from the job, never by
     // dispatching a second one.
     if (existing?.status === 'dispatched' && existing.backgroundJobId) {
-      const { jobId, progress } = await inspectBackfillChain(
+      const progress = await inspectBackgroundJob(existing.backgroundJobId, {
         projectId,
-        step.idempotencyKey,
-        existing.backgroundJobId,
-      )
+        idempotencyKey: step.idempotencyKey,
+      })
       if (progress.state === 'pending') {
         steps.push({
           ordinal: step.ordinal,
           kind: step.kind,
           status: 'dispatched',
-          detail: `background job ${jobId} is ${progress.detail}`,
+          detail: `background job ${existing.backgroundJobId} is ${progress.detail}`,
           backgroundJobId: existing.backgroundJobId,
         })
-        return awaiting(executionId, steps, `step ${step.ordinal} (${step.kind}) is waiting on job ${jobId}`)
+        return awaiting(executionId, steps, `step ${step.ordinal} (${step.kind}) is waiting on job ${existing.backgroundJobId}`)
       }
       if (progress.state === 'failed') {
         await prisma.maintenanceStepExecution.update({
@@ -660,23 +660,20 @@ async function runStep(
     case 'backfill': {
       // Dispatched, not run. BackgroundJob owns attempts, backoff and
       // dead-lettering; looping here would be a second retry lifecycle
-      // disagreeing with the first.
-      const job = await enqueue(
-        'maintenance_backfill',
-        {
-          projectId,
-          planVersion,
-          idempotencyKey: step.idempotencyKey,
-          table: binding.table,
-          sourceColumn: binding.sourceColumn,
-          targetColumn: binding.targetColumn,
-          transform: binding.transform,
-          batchRows: binding.batchRows,
-          lockTimeoutMs: binding.lockTimeoutMs,
-          cursor: null,
-        },
-        { projectId },
-      )
+      // disagreeing with the first. Queued where the project's data is: a
+      // regional project's batches run in its region (primitives/backfill-job.ts).
+      const job = await queueBackfillJob({
+        projectId,
+        planVersion,
+        idempotencyKey: step.idempotencyKey,
+        table: binding.table,
+        sourceColumn: binding.sourceColumn,
+        targetColumn: binding.targetColumn,
+        transform: binding.transform,
+        batchRows: binding.batchRows,
+        lockTimeoutMs: binding.lockTimeoutMs,
+        cursor: null,
+      })
       return { ...base, status: 'dispatched', detail: `backfill queued as job ${job.id}`, backgroundJobId: job.id }
     }
 
@@ -753,24 +750,43 @@ async function nextAttempt(planId: string): Promise<number> {
  * `maintenance_backfill` handler. A skipped job that reads as success would let
  * `verify` run against rows nothing had backfilled.
  *
- * Exported because structural evolution (lib/structural-evolution/execute.ts)
- * dispatches its backfill the same way and must read a job with exactly these
- * rules — a second reader would be a second definition of "the backfill
- * finished".
+ * Nor is the dispatched job the one to read. Each batch queues the next as a
+ * NEW job (primitives/backfill-job.ts), so the job dispatched is only the
+ * chain's first: once it has run, its result says that more remain however far
+ * the chain has got, and a ladder that read only it would wait on a finished
+ * backfill forever. The chain is where its newest job is. Every job in it
+ * carries the step's idempotency key, and no other step's does.
  */
 export async function inspectBackgroundJob(
   jobId: string,
+  chain: { projectId: string; idempotencyKey: string },
 ): Promise<{ state: 'pending' | 'done' | 'failed'; detail: string }> {
-  const job = await prisma.backgroundJob
-    .findUnique({ where: { id: jobId }, select: { status: true, result: true, error: true, attempts: true } })
+  const job = await newestJobOfChain(chain)
+    .then((newest) => newest ?? prisma.backgroundJob.findUnique({ where: { id: jobId }, select: JOB_FIELDS }))
     .catch(() => null)
+  return backgroundJobState(job, jobId)
+}
+
+/**
+ * What one job row of a batch chain says about the chain, by the rules above.
+ * Exported for structural evolution (lib/structural-evolution/backfill-job.ts),
+ * whose chain is found by its plan version but must be read by exactly these
+ * rules: a second reader would be a second definition of "the backfill finished".
+ */
+export function backgroundJobState(
+  job: { id: string; status: string; result: unknown; error: string | null; attempts: number } | null,
+  jobId: string,
+): { state: 'pending' | 'done' | 'failed'; detail: string } {
   if (!job) return { state: 'failed', detail: `background job ${jobId} no longer exists` }
 
-  if (job.status === 'failed' || job.status === 'dead_letter') {
-    return { state: 'failed', detail: `job ${jobId} is ${job.status}: ${job.error ?? 'no error recorded'}` }
+  // A regional project's batches end as `regional_failed` (lib/queue REGIONAL_STATUS),
+  // whose error is the platform's own sentence. Read as pending, it would be waited on forever.
+  if (job.status === 'failed' || job.status === 'dead_letter' || job.status === REGIONAL_STATUS.failed) {
+    return { state: 'failed', detail: `job ${job.id} is ${job.status}: ${job.error ?? 'no error recorded'}` }
   }
   if (job.status !== 'completed') {
-    return { state: 'pending', detail: `${job.status} (attempt ${job.attempts})` }
+    const at = job.id === jobId ? '' : `, at job ${job.id} of its batch chain`
+    return { state: 'pending', detail: `${job.status} (attempt ${job.attempts})${at}` }
   }
 
   const result = (job.result ?? {}) as Record<string, unknown>
@@ -778,12 +794,12 @@ export async function inspectBackgroundJob(
     return {
       state: 'failed',
       detail:
-        `job ${jobId} was recorded completed but SKIPPED: ${String(result.reason ?? 'no reason given')}. ` +
+        `job ${job.id} was recorded completed but SKIPPED: ${String(result.reason ?? 'no reason given')}. ` +
         'A skipped job did no work, and treating it as success would verify rows nothing backfilled.',
     }
   }
   if (result.refusal) {
-    return { state: 'failed', detail: `job ${jobId} refused: ${String(result.refusal)}` }
+    return { state: 'failed', detail: `job ${job.id} refused: ${String(result.refusal)}` }
   }
   if (result.done !== true) {
     // A batch chain re-queues itself; the chain is finished only when a batch
@@ -796,43 +812,32 @@ export async function inspectBackgroundJob(
   }
 }
 
+const JOB_FIELDS = { id: true, status: true, result: true, error: true, attempts: true } as const
+
 /**
- * The state of a backfill CHAIN, read from its newest job.
+ * The newest job of a step's backfill chain, or null when it has none.
  *
- * `handleBackfillJob` runs one batch per job and queues the next batch as a NEW
- * job, so the id the step row recorded at dispatch is only the chain's first
- * link. That job completes with `done: false` the moment a second batch exists,
- * and reading it alone reported "more remain" forever: any table longer than one
- * batch (2,000 rows by default) left its ladder `awaiting_background_work` on
- * every pass, with the backfill long finished.
- *
- * Every batch carries the step's idempotency key in its payload, which is unique
- * to one rung of one plan, so the chain is followed by that key to its newest
- * job — whose state IS the chain's state: queued or running means pending, a
- * failure means the chain stopped there, `done: true` means it reached the end.
- * A single-batch chain resolves to its own first job, so nothing changes for it.
- *
- * Falls back to the recorded job when the lookup fails, which is the previous
- * behaviour: never better than before, never worse.
+ * Each job is created while the one before it runs, so the newest is the last
+ * created. Two created in the same millisecond, which a worker that claims
+ * once a minute does not do but nothing forbids, are told apart by the batches
+ * the chain had completed when each was queued.
  */
-export async function inspectBackfillChain(
-  projectId: string,
-  idempotencyKey: string,
-  firstJobId: string,
-): Promise<{ jobId: string; progress: { state: 'pending' | 'done' | 'failed'; detail: string } }> {
-  const newest = await prisma.backgroundJob
-    .findFirst({
-      where: {
-        projectId,
-        type: 'maintenance_backfill',
-        payload: { path: ['idempotencyKey'], equals: idempotencyKey },
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
-    })
-    .catch(() => null)
-  const jobId = newest?.id ?? firstJobId
-  return { jobId, progress: await inspectBackgroundJob(jobId) }
+async function newestJobOfChain(chain: { projectId: string; idempotencyKey: string }) {
+  const [newest, previous] = await prisma.backgroundJob.findMany({
+    where: {
+      projectId: chain.projectId,
+      type: 'maintenance_backfill',
+      payload: { path: ['idempotencyKey'], equals: chain.idempotencyKey },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 2,
+    select: { ...JOB_FIELDS, createdAt: true, payload: true },
+  })
+  if (!newest) return null
+  const batchesBefore = (job: { payload: unknown }) => Number((job.payload as { batches?: unknown } | null)?.batches ?? 0)
+  return previous && previous.createdAt.getTime() === newest.createdAt.getTime() && batchesBefore(previous) > batchesBefore(newest)
+    ? previous
+    : newest
 }
 
 async function awaiting(

@@ -7,14 +7,12 @@
  * Returns structured output with action, plan, and explanation.
  */
 
-import OpenAI from 'openai'
 import { buildWorkspaceState, formatWorkspaceStateForLLM, WorkspaceState } from './workspace-state'
 import { getSystemPrompt } from './system-prompt'
 const BACKENLY_AI_SYSTEM_PROMPT = getSystemPrompt()
 import { BackendStateGraph } from '@/lib/orchestration/backend-state-graph'
-import { getModel } from './model-router'
-import { getOpenAIClient } from './openai-service'
 
+import { chat, type ChatMessage } from '@/lib/ai/llm/chat'
 /**
  * Build a concise, imperative "Quick Backend Facts" block from workspace state.
  * Injected as a dedicated system message so the LLM is explicitly directed
@@ -108,7 +106,7 @@ export async function generateReasonedResponse(
     const quickFacts = buildQuickBackendFacts(workspaceState)
 
     // Build messages array
-    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    const messages: ChatMessage[] = [
       { role: 'system', content: BACKENLY_AI_SYSTEM_PROMPT },
       {
         role: 'system',
@@ -143,17 +141,14 @@ export async function generateReasonedResponse(
     messages.push({ role: 'user', content: userMessage })
 
     // Call LLM with full context - optimized for speed
-    const openai = getOpenAIClient()
-    const completion = await openai.chat.completions.create({
-      model: getModel('respond'), // Conversational response — smart model
-      messages,
-      temperature: 0.3,
-      max_tokens: 400, // Reduced for faster responses
-      presence_penalty: 0,
-      frequency_penalty: 0,
+    const completion = await chat({
+      purpose: 'insight.explain',
+      messages: messages,
+      maxTokens: 400,
+      label: 'reasoning-engine',
     })
 
-    const response = completion.choices[0]?.message?.content?.trim()
+    const response = completion.text?.trim()
     
     if (!response) {
       throw new Error('Empty response from LLM')

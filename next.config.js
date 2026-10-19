@@ -72,18 +72,15 @@ const nextConfig = {
       { source: P, has: [{ type: 'query', key: 'hub', value: 'mcp' }], destination: `${P}/connect`, permanent: false },
       { source: P, has: [{ type: 'query', key: 'hub', value: 'client-keys' }], destination: `${P}/settings?tab=keys`, permanent: false },
 
-      // /docs has no page yet; the content hub lives at /resources. Exact
-      // match only — /docs/llms.txt must fall through to the rewrite below.
-      { source: '/docs', destination: '/resources', permanent: false },
-
       // /mcp and /quickstart were two pages answering "how do I connect my
       // agent". /mcp was merged into /quickstart, then /quickstart itself was
       // removed — the connect flow lives in the product, not on a marketing
-      // page. Both URLs are indexed and both are still printed as the homepage
-      // of the published @backenly/mcp-server and @backenly/sdk packages, so
-      // they must keep resolving. Permanent, pointing at the docs hub.
-      { source: '/mcp', destination: '/resources', permanent: true },
-      { source: '/quickstart', destination: '/resources', permanent: true },
+      // page. Both URLs are indexed and still printed in older copies of the
+      // published @backenly/mcp-server and @backenly/sdk packages, so they must
+      // keep resolving. Permanent, pointing at the docs page that answers the
+      // same question.
+      { source: '/mcp', destination: '/docs/connect', permanent: true },
+      { source: '/quickstart', destination: '/docs/connect', permanent: true },
 
       // Audience repositioning 2026-07-18: marketing slugs renamed away from
       // "vibe coders" / "non-technical founders" to agent-era audience names.
@@ -109,10 +106,29 @@ const nextConfig = {
       // away from in the 2026-07-18 repositioning above. Every old slug is
       // indexed, so each one points at its nearest real replacement.
       { source: '/resources/what-is-ai-backend-generation', destination: '/features/ai-backend-generation', permanent: true },
-      { source: '/resources/how-to-build-a-backend-without-coding', destination: '/resources/your-first-backend', permanent: true },
+      { source: '/resources/how-to-build-a-backend-without-coding', destination: '/docs/database', permanent: true },
       { source: '/resources/best-backend-tools-for-non-technical-founders', destination: '/comparisons', permanent: true },
       { source: '/resources/full-stack-development-with-ai-coding-agents', destination: '/use-cases/ai-assisted-developers', permanent: true },
       { source: '/resources/backend-development-for-ai-app-builders', destination: '/use-cases/ai-product-backends', permanent: true },
+
+      // ── /resources became /docs 2026-10-11 ─────────────────────────────────
+      //
+      // Customers read the seven guides above as architecture essays and still
+      // could not say what Storage or Functions were for. The docs are now one
+      // page per console section, at /docs, the path Supabase, Neon and Clerk
+      // use for theirs. Each guide points at the section page that answers its
+      // question; self-hosting has no console section and was already covered
+      // by the repository README, so it goes there. The catch-all keeps any
+      // other /resources link from landing on a 404.
+      { source: '/resources', destination: '/docs', permanent: true },
+      { source: '/resources/connect-your-coding-agent', destination: '/docs/connect', permanent: true },
+      { source: '/resources/your-first-backend', destination: '/docs/database', permanent: true },
+      { source: '/resources/the-data-api', destination: '/docs/database', permanent: true },
+      { source: '/resources/access-control-and-rls', destination: '/docs/database', permanent: true },
+      { source: '/resources/how-backenly-works', destination: '/docs', permanent: true },
+      { source: '/resources/after-you-launch', destination: '/docs/autonomy', permanent: true },
+      { source: '/resources/self-hosting', destination: 'https://github.com/backenly/backenly#self-hosted', permanent: true },
+      { source: '/resources/:path*', destination: '/docs', permanent: true },
 
       // ── Use cases became workflows, not audience segments 2026-08-29 ───────
       //

@@ -11,7 +11,9 @@
  * FORBIDDEN: "Users can now", "Your backend is ready", "I've created"
  */
 
-import { chatCompletion, isAIEnabled } from '../openai/client'
+import { chat } from '@/lib/ai/llm/chat'
+import { aiAvailability } from '@/lib/ai/llm'
+
 
 export interface ConversationResponse {
   type: 'acknowledgment' | 'clarification' | 'guidance'
@@ -40,7 +42,7 @@ export async function converseWithUser(
     needsClarification: false
   }
 
-  if (!isAIEnabled()) {
+  if (!aiAvailability().available) {
     return defaultResponse
   }
 
@@ -79,7 +81,9 @@ If the request is vague:
 
 Keep responses to 1-2 sentences maximum.`
 
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: systemPrompt
@@ -88,9 +92,12 @@ Keep responses to 1-2 sentences maximum.`
         role: 'user',
         content: `User wants: "${userMessage}"\n\nProvide a calm, non-technical acknowledgment. Remember: Nothing executes. You're just understanding their intent.`
       }
-    ], { temperature: 0.3, maxTokens: 150 })
+    ],
+      maxTokens: 150,
+      label: 'orchestration-ai-conversation',
+    })
 
-    const aiMessage = response?.choices[0]?.message?.content || defaultResponse.message
+    const aiMessage = response?.text || defaultResponse.message
 
     // Safety check: Block any forbidden phrases
     const forbiddenPhrases = [

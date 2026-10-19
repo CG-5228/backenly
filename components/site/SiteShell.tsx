@@ -22,10 +22,15 @@ export const ROUTES = {
   login: '/auth/login',
   app: '/app',
   pricing: '/pricing',
+  // Backenly for Startups. The page and its application are Backenly Cloud's
+  // (the overlay owns app/startups/**); like every marketing page here, the
+  // link is only ever rendered on Cloud, since self-hosted installs redirect
+  // the marketing site to /app.
+  startups: '/startups',
   features: '/features',
   useCases: '/use-cases',
   comparisons: '/comparisons',
-  resources: '/resources',
+  docs: '/docs',
   alternatives: '/alternatives',
   privacy: '/privacy',
   terms: '/terms',
@@ -84,7 +89,7 @@ const SHOW_LAUNCH_BAR = true
 
 const NAV_LINKS = [
   { label: 'Product', href: '/#capabilities', activePath: '/' },
-  { label: 'Resources', href: ROUTES.resources, activePath: ROUTES.resources },
+  { label: 'Docs', href: ROUTES.docs, activePath: ROUTES.docs },
   { label: 'Use cases', href: ROUTES.useCases, activePath: ROUTES.useCases },
   { label: 'Pricing', href: ROUTES.pricing, activePath: ROUTES.pricing },
   { label: 'Contact', href: ROUTES.contact, activePath: ROUTES.contact },
@@ -449,6 +454,7 @@ export function SiteFooter() {
   const product = [
     { label: 'Features', href: ROUTES.features },
     { label: 'Pricing', href: ROUTES.pricing },
+    { label: 'Startup program', href: ROUTES.startups },
     { label: 'Use cases', href: ROUTES.useCases },
     { label: 'Comparisons', href: ROUTES.comparisons },
     { label: 'Alternatives', href: ROUTES.alternatives },
@@ -459,7 +465,7 @@ export function SiteFooter() {
     { label: 'CLI', href: 'https://www.npmjs.com/package/@backenly/cli' },
     { label: 'Agent skill', href: '/skill.md' },
     { label: 'llms.txt', href: '/llms.txt' },
-    { label: 'Documentation', href: ROUTES.resources },
+    { label: 'Documentation', href: ROUTES.docs },
   ]
   const company = [
     { label: 'Contact', href: ROUTES.contact },

@@ -28,6 +28,16 @@
  *   npx tsx scripts/autonomy-baseline.ts
  *   npx tsx scripts/autonomy-baseline.ts --out artifacts/baseline.json
  *   npx tsx scripts/autonomy-baseline.ts --fault rls-disabled-on-user-table
+ *   npx tsx scripts/autonomy-baseline.ts --ai scripted
+ *   npx tsx scripts/autonomy-baseline.ts --ai live --yes
+ *
+ * --ai adds the AI arm (tests/lab/ai-arm.ts): after the live loop has had its
+ * turn on a fault, the escalation pass investigates what it left for a person,
+ * and the arm reports gates and utility separately. `scripted` answers every
+ * call with a fixture and costs nothing; it checks the gates, not usefulness.
+ * `live` calls the configured provider (Claude on Bedrock), is PAID, books its
+ * spend through the gateway's ledger and limits, and needs --yes and the
+ * founder's approval for each run.
  */
 
 import { randomUUID } from 'crypto'
@@ -37,6 +47,13 @@ import { dirname, resolve } from 'path'
 import { PrismaClient } from '@prisma/client'
 
 import { FAULTS, type LabFault, type FaultContext } from '../tests/lab/faults'
+import {
+  countingProvider,
+  runAiArm,
+  summarizeAiArm,
+  uncertainModel,
+  type AiArmOutcome,
+} from '../tests/lab/ai-arm'
 import { scenario } from '../tests/lab/scenarios'
 import { seedScenario, teardownScenario, type SeededProject } from '../tests/lab/seed'
 import { schemaFingerprint, schemaIsObservable } from '../tests/lab/oracles'
@@ -164,6 +181,8 @@ interface FaultOutcome {
   } | null
 
   timings: { shadowMs: number; liveMs: number }
+  /** The AI arm on this fault, when the run was asked for one (--ai). */
+  aiArm: AiArmOutcome | null
   notes: string[]
 }
 
@@ -184,6 +203,7 @@ async function runFault(
   observer: LabObserver | null,
   appBypassesRls: boolean,
   appRole: { user: string; bypasses: boolean },
+  model: { calls: number } | null,
 ): Promise<FaultOutcome> {
   const notes: string[] = []
   let seeded: SeededProject | null = null
@@ -234,6 +254,7 @@ async function runFault(
     },
     shadow: null,
     timings: { shadowMs: 0, liveMs: 0 },
+    aiArm: null,
     notes,
   }
 
@@ -485,6 +506,22 @@ async function runFault(
     }
 
     score(outcome, f)
+
+    // ── The AI arm: what the investigator does with what the loop left ───────
+    //
+    // After the loop's own score, so a mutation by the arm can never be booked
+    // to the loop. The arm's own fingerprint check is its unsafe-mutation gate.
+    if (model) {
+      try {
+        outcome.aiArm = await runAiArm(
+          prisma,
+          { projectId: seeded.projectId, schema: seeded.schema, fault: f },
+          () => model.calls,
+        )
+      } catch (e: any) {
+        notes.push(`ai arm failed: ${firstLine(e)}`)
+      }
+    }
   } catch (err: any) {
     outcome.observed.error = `harness: ${err?.message ?? err}`
     notes.push('harness error — row is not a measurement of the system')
@@ -791,11 +828,45 @@ async function main() {
   const outPath = outIdx >= 0 ? args[outIdx + 1] : 'artifacts/autonomy-baseline.json'
   const onlyIdx = args.indexOf('--fault')
   const only = onlyIdx >= 0 ? args[onlyIdx + 1] : null
+  const aiIdx = args.indexOf('--ai')
+  const aiMode = aiIdx >= 0 ? args[aiIdx + 1] : null
+  if (aiMode !== null && aiMode !== 'scripted' && aiMode !== 'live') {
+    console.error('--ai takes "scripted" or "live"')
+    process.exit(2)
+  }
 
   const faults = only ? FAULTS.filter(f => f.id === only) : FAULTS
   if (faults.length === 0) {
     console.error(`No fault matched "${only}"`)
     process.exit(2)
+  }
+
+  let model: { calls: number } | null = null
+  if (aiMode) {
+    const llm = await import('../lib/ai/llm')
+    if (aiMode === 'live') {
+      const ai = llm.aiAvailability()
+      if ('reason' in ai) {
+        console.error(`--ai live: no model provider is configured (${ai.reason})`)
+        process.exit(2)
+      }
+      if (!args.includes('--yes')) {
+        console.error(
+          `--ai live calls ${ai.provider} once or more per escalated finding, up to ` +
+            `${faults.length} faults, and it is paid. Re-run with --yes once the founder has approved it.`,
+        )
+        process.exit(2)
+      }
+      const counted = countingProvider(llm.activeProvider())
+      llm.setProviderForTests(counted)
+      model = counted
+    } else {
+      const { memorySpendLedger, setSpendLedgerForTests } = await import('../lib/ai/llm/spend')
+      setSpendLedgerForTests(memorySpendLedger())
+      const counted = countingProvider(uncertainModel())
+      llm.setProviderForTests(counted)
+      model = counted
+    }
   }
 
   const prisma = new PrismaClient()
@@ -824,7 +895,7 @@ async function main() {
 
   for (const f of faults) {
     process.stdout.write(`  ${f.id.padEnd(34)} `)
-    const r = await runFault(prisma, f, observer, appRole.bypasses, appRole)
+    const r = await runFault(prisma, f, observer, appRole.bypasses, appRole, model)
     rows.push(r)
     const verdict = !r.faultWasReal
       ? 'INVALID (fault did nothing)'
@@ -856,6 +927,14 @@ async function main() {
       'Baseline of the CURRENT autonomy system, before the Authority Decision ' +
       'layer exists. Phase 2 shadow runs must be compared against this file.',
     summary: aggregate(rows),
+    // Gates and utility side by side, never summed: a useful arm does not pay
+    // for an unsafe one. Null when the run had no AI arm.
+    aiArm: aiMode
+      ? {
+          mode: aiMode,
+          ...summarizeAiArm(rows.map(r => r.aiArm).filter((a): a is AiArmOutcome => a !== null)),
+        }
+      : null,
     rows,
   }
 
@@ -870,6 +949,20 @@ async function main() {
   console.log(`  utility         ${s.utility.converged} converged, ${s.utility.overRefusals} over-refusal`)
   console.log(`  auto-eligible   ${s.availability.actuallyAutoExecuted}/${s.availability.autoEligibleFaults} auto-executed`)
   console.log(`  FREEZE needed   ${s.availability.freezeRequiredButUnavailable} (vocabulary cannot express it today)`)
+  if (report.aiArm) {
+    const a = report.aiArm
+    const pct = (x: number | null) => (x === null ? 'n/a' : `${Math.round(x * 100)}%`)
+    console.log(
+      `  ai arm gates    ${a.gates.unsafeMutations} unsafe, ${a.gates.falseVerified} false-fixed, ` +
+        `${a.gates.controlsThatCalledTheModel} control calls, ${a.gates.blindProposals} blind proposals (${a.mode})`,
+    )
+    console.log(
+      `  ai arm utility  diagnosed ${pct(a.utility.diagnosisRate)}, agrees ${pct(a.utility.agreementRate)}, ` +
+        `proposed ${pct(a.utility.proposalRate)}, ${a.utility.modelCalls} model calls ` +
+        `(${a.utility.controlModelCalls} on controls, on findings the loop escalated)` +
+        `${a.mode === 'scripted' ? ' (scripted: gates only, utility not measured)' : ''}`,
+    )
+  }
   console.log(`\n  written to ${outPath}\n`)
 
   // Exit 0 regardless of findings: this measures, it does not gate. A baseline

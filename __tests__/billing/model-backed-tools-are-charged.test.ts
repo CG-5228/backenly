@@ -171,12 +171,19 @@ describe('token meter — behaviour', () => {
 describe('the billing contract is wired at every boundary', () => {
   const read = (p: string) => fs.readFileSync(path.join(ROOT, p), 'utf8')
 
-  it('both OpenAI clients attach the meter', () => {
-    // The platform has two clients that grew up separately. A model call added
-    // through either one must be countable, or "is this billed?" becomes a
-    // question about which module someone happened to import.
-    expect(read('lib/ai/openai-service.ts')).toContain('attachTokenMeter')
-    expect(read('lib/openai/client.ts')).toContain('attachTokenMeter')
+  it('has one model boundary left, the AI gateway', () => {
+    // There used to be two OpenAI clients that grew up separately, and a model
+    // call through either had to be countable. Both are gone: every call goes
+    // through lib/ai/llm, so "is this billed?" has one place to answer it.
+    expect(fs.existsSync(path.join(ROOT, 'lib/ai/openai-service.ts'))).toBe(false)
+    expect(fs.existsSync(path.join(ROOT, 'lib/openai/client.ts'))).toBe(false)
+  })
+
+  it('the AI gateway reports every call that ran into the meter', () => {
+    // The brain's answer_question runs through the gateway, and the MCP tool
+    // route charges it from this meter. tests/unit/llm-gateway.spec.ts shows
+    // the behaviour; this pins the boundary that carries it.
+    expect(read('lib/ai/llm/index.ts')).toContain('recordTokens(')
   })
 
   it('the MCP tool route both gates AND charges its model-backed tools', () => {
@@ -186,19 +193,48 @@ describe('the billing contract is wired at every boundary', () => {
     expect(route).toContain('enforceAiCredits')
     // Charge half — the half that was missing, and whose absence made the gate
     // decorative. If a refactor drops this, the tool silently becomes free and
-    // unlimited again.
-    expect(route).toContain('chargeAiCredits')
+    // unlimited again. The route closes the turn, which charges and then stops
+    // the turn's credit holds counting.
+    expect(route).toContain('closeCreditTurn')
     // Charged from measured usage, not an estimate or a flat per-call fee.
     expect(route).toContain('runInTokenScope')
     expect(route).toContain('tokenScope.tokens')
+  })
+
+  it('the MCP tool route gates and charges every tool’s model calls, not a listed few', () => {
+    // The charge used to apply only to MODEL_BACKED_TOOLS, so functions.schedule
+    // and integrations.connect spent the model budget ungated and uncharged
+    // (FN-12, FN-19, INT-15). The scope names who pays, so each model call holds
+    // credits, and the charge is whatever the scope measured.
+    // tests/integration/model-spend-on-every-tool.spec.ts shows the behaviour.
+    const route = read('app/api/mcp/tool/route.ts')
+    expect(route).toContain('createTokenScope({ projectId: auth.projectId })')
+    expect(route).not.toMatch(/metered\s*\?/)
+    expect(route).toContain('closeCreditTurn(await creditAccountOf(auth.projectId), tokenScope, tokenScope.tokens)')
+  })
+
+  it('a typed call is never handed to a model for a different action unless its caller opts in', () => {
+    // A failed typed call used to be "replanned": a model picked another
+    // action from the error and the executor ran it, uncharged.
+    expect(read('lib/ai/brain/tools.ts')).toContain('ctx.allowReplan ?? false')
   })
 
   it('the natural-language route still charges what the brain burned', () => {
     // Guards hole #1 against regression.
     const route = read('app/api/mcp/chat/route.ts')
     expect(route).toContain('enforceAiCredits')
-    expect(route).toContain('chargeAiCredits')
+    expect(route).toContain('closeCreditTurn')
     expect(route).toContain('onTokens')
+  })
+
+  it('closing a turn charges it before it stops the turn’s holds counting', () => {
+    // Both routes charge through closeCreditTurn. If it stopped charging, every
+    // model-backed path would be free again; if it released before charging,
+    // a finished call would be counted nowhere for a moment.
+    const holds = read('lib/entitlements/credit-holds.ts')
+    const body = holds.slice(holds.indexOf('export async function closeCreditTurn('))
+    expect(body.indexOf('await chargeAiCredits(')).toBeGreaterThan(-1)
+    expect(body.indexOf('await chargeAiCredits(')).toBeLessThan(body.indexOf('aiCreditHold'))
   })
 
   it('names a non-empty model-backed set (guards against a vacuous pass)', () => {
@@ -210,6 +246,7 @@ describe('the billing contract is wired at every boundary', () => {
     expect(match).not.toBeNull()
     const members = [...match![1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1])
     expect(members).toContain('generate_function')
+    expect(members).toContain('create_cron_job')
     expect(members.length).toBeGreaterThan(0)
   })
 })

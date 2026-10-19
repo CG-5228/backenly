@@ -7,8 +7,6 @@
  * Flow: User Prompt → AI Understanding → Metadata Storage
  */
 
-import { getOpenAIClient } from './openai-service'
-import { getModel } from './model-router'
 import {
   analyzeAllTablePurposes,
   extractWorkflowsFromPrompt,
@@ -19,6 +17,7 @@ import {
   type Workflow,
   type BusinessRule,
 } from './semantic-domain-analyzer'
+import { chat } from '@/lib/ai/llm/chat'
 
 export interface ExtractedEntity {
   name: string
@@ -350,8 +349,6 @@ export async function extractMetadataFromIntent(
   console.log('🧠 [Intent Extractor] Analyzing user intent...')
   console.log('📝 [Intent Extractor] Prompt:', userPrompt.substring(0, 200))
 
-  const openai = getOpenAIClient()
-
   const systemPrompt = `You are Backenly's Intent Analyzer. Your job is to understand what the user wants to build and extract structured metadata.
 
 **CRITICAL RULES:**
@@ -470,18 +467,18 @@ Examples:
 **Respond ONLY with valid JSON. No explanations, no markdown, just JSON.**`
 
   try {
-    const response = await openai.chat.completions.create({
-      model: getModel('plan'), // Intent extraction — smart model
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      temperature: 0.3, // Low temperature for consistent extraction
-      max_tokens: 8000,
-      response_format: { type: 'json_object' },
+      maxTokens: 8000,
+      json: true,
+      label: 'intent-extractor',
     })
 
-    const rawContent = response.choices[0].message.content || '{}'
+    const rawContent = response.text || '{}'
     console.log('🤖 [Intent Extractor] Raw OpenAI response:', rawContent.substring(0, 500))
     
     const extracted = JSON.parse(rawContent)

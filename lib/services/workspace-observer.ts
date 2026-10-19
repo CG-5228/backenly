@@ -20,6 +20,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { detectSubsystemRecurrence } from '@/lib/autonomy/subsystem-recurrence'
+import { detectIntentDrift } from '@/lib/autonomy/intent-conformance'
 import { probeQueryFailed } from '@/lib/core/drift-detector'
 import { queryWorkspaceSchema, executeInWorkspaceSchema } from './workspaceDatabase'
 import { applyPermissionPolicy } from './workspace-rls'
@@ -45,7 +46,7 @@ import { verifyWorkflows } from '@/lib/core/workflow-verifier'
 import {
   runContractVerification,
   probePlatformIngress,
-  attributeContractFailures,
+  attributeAcrossRegions,
   settleTenantContract,
   type ProjectProbeOutcome,
 } from '@/lib/services/contract-verifier'
@@ -58,6 +59,11 @@ import { generateFixPlansFromRawFindings, type FixPlan } from '@/lib/core/fix-pl
 import { runBuiltInVerification, type VerificationExecutionResult } from '@/lib/verification/verification-executor'
 import { FLAGS } from '@/lib/config/flags'
 import { watchableProjectsWhere, isWatchableProject } from '@/lib/projects/backend-presence'
+import { canReach, skipUnreachable } from '@/lib/autonomy/region-skip'
+import { projectRegion } from '@/lib/data-plane/regional'
+import { partitionServed } from '@/lib/data-plane/serving'
+import { findingDetailsKeptHere } from '@/lib/data-plane/residency'
+import type { CloudRegionId } from '@/lib/regions'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -77,6 +83,15 @@ export interface ObserverResult {
   fixPlans?: FixPlan[]
   /** Phase 13 — populated when ENABLE_VERIFICATION_EXECUTION + ENABLE_SAFE_VERIFICATION_MODE are on */
   verificationResult?: VerificationExecutionResult
+  /**
+   * Set when nothing was checked here. `served-elsewhere`: another region's
+   * worker checks and repairs the project on its own schedule. `unreachable`:
+   * this process cannot reach the project's region, and the skip is recorded
+   * (lib/autonomy/region-skip.ts).
+   */
+  skipped?: 'served-elsewhere' | 'unreachable'
+  /** The region whose worker checks the project, when it is served elsewhere. */
+  region?: CloudRegionId
 }
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -101,10 +116,15 @@ export async function runWorkspaceObserver(): Promise<{
   results: ObserverResult[]
   errors: string[]
 }> {
-  const projects = await prisma.project.findMany({
-    where: watchableProjectsWhere(),
-    select: { id: true, userId: true },
-  })
+  // Only projects this process can reach; the rest are recorded as skipped
+  // (lib/autonomy/region-skip.ts) rather than observed as empty.
+  const projects = await skipUnreachable(
+    await prisma.project.findMany({
+      where: watchableProjectsWhere(),
+      select: { id: true, userId: true },
+    }),
+    'workspace-observer',
+  )
 
   const results: ObserverResult[] = []
   const topLevelErrors: string[] = []
@@ -178,12 +198,17 @@ export async function runContractSweep(options: {
     errors.push(`[reap] ${err?.message ?? String(err)}`)
   })
 
-  const projects = await prisma.project.findMany({
-    where: options.projectIds
-      ? { id: { in: options.projectIds }, ...watchableProjectsWhere() }
-      : watchableProjectsWhere(),
-    select: { id: true },
-  })
+  // Only projects this process can reach; the rest are recorded as skipped
+  // (lib/autonomy/region-skip.ts) rather than probed and filed as broken.
+  const projects = await skipUnreachable(
+    await prisma.project.findMany({
+      where: options.projectIds
+        ? { id: { in: options.projectIds }, ...watchableProjectsWhere() }
+        : watchableProjectsWhere(),
+      select: { id: true },
+    }),
+    'contract-sweep',
+  )
   if (projects.length === 0) return { processed: 0, broken, errors, platformFaults }
 
   const ingress = await probePlatformIngress()
@@ -214,7 +239,20 @@ export async function runContractSweep(options: {
     }
   }
 
-  const attribution = attributeContractFailures(outcomes)
+  // Faults are attributed fleet-wide and within each region, because each
+  // region has its own data plane (attributeAcrossRegions). A project whose
+  // region cannot be looked up is not settled this pass: placing it in the
+  // wrong region would attribute its failures against the wrong plane.
+  const regionOf = new Map<string, CloudRegionId>()
+  for (const { projectId } of outcomes) {
+    try {
+      regionOf.set(projectId, await projectRegion(projectId))
+    } catch (err: any) {
+      errors.push(`[${projectId}] ${err?.message ?? String(err)}`)
+    }
+  }
+  const placed = outcomes.filter(o => regionOf.has(o.projectId))
+  const attribution = attributeAcrossRegions(placed, id => regionOf.get(id) as CloudRegionId)
 
   for (const f of attribution.platformFaults) {
     const fault: PlatformFaultReport = {
@@ -224,32 +262,35 @@ export async function runContractSweep(options: {
       status: f.status,
       projectIds: f.projectIds,
       origin: ingress.origin,
+      ...(f.region ? { region: f.region } : {}),
     }
     reportPlatformFault(fault)
     platformFaults.push(fault)
   }
 
-  // The data plane is shared. When it fails for everyone, the repair is a
-  // platform action taken once, not a finding per tenant. healDataPlane is
-  // single-flighted and re-verifies against its own PostgREST probe before it
-  // restarts anything.
-  const dataPlaneDown = attribution.platformFaults.some(
-    f =>
+  // A data plane serves one region. When it fails for that region's projects,
+  // the repair is a platform action taken once for the region, not a finding
+  // per tenant. healDataPlane is single-flighted per region and re-verifies
+  // against that region's PostgREST probe before it restarts anything.
+  const regionsDown = new Set<CloudRegionId>()
+  for (const f of attribution.platformFaults) {
+    const dataPlane =
       f.kind === 'surface_failing_fleetwide' &&
-      isDataPlaneOutage({ surface: f.surface, httpStatus: f.status === 'timeout' ? null : f.status ?? null }),
-  )
-  if (dataPlaneDown) {
+      isDataPlaneOutage({ surface: f.surface, httpStatus: f.status === 'timeout' ? null : f.status ?? null })
+    if (dataPlane) for (const id of f.projectIds) regionsDown.add(regionOf.get(id) as CloudRegionId)
+  }
+  for (const region of regionsDown) {
     try {
       const { healDataPlane, describeHeal } = await import('@/lib/postgrest/supervisor')
-      const heal = await healDataPlane(null)
-      if (!heal.healthy) errors.push(`[data-plane heal] ${describeHeal(heal)}`)
+      const heal = await healDataPlane(null, region)
+      if (!heal.healthy) errors.push(`[data-plane heal ${region}] ${describeHeal(heal)}`)
     } catch (err: any) {
-      errors.push(`[data-plane heal] ${err?.message ?? String(err)}`)
+      errors.push(`[data-plane heal ${region}] ${err?.message ?? String(err)}`)
     }
   }
 
-  for (let i = 0; i < outcomes.length; i += CONCURRENCY) {
-    const batch = outcomes.slice(i, i + CONCURRENCY)
+  for (let i = 0; i < placed.length; i += CONCURRENCY) {
+    const batch = placed.slice(i, i + CONCURRENCY)
     const settled = await Promise.allSettled(
       batch.map(async ({ projectId, results }) => {
         const findings = await settleTenantContract(
@@ -315,7 +356,7 @@ export async function runContractSweep(options: {
     )
   }
 
-  return { processed: outcomes.length, broken, errors, platformFaults }
+  return { processed: placed.length, broken, errors, platformFaults }
 }
 
 /**
@@ -333,7 +374,22 @@ export async function runObserverForProject(projectId: string): Promise<Observer
     errors: [],
   }
 
-  // Nothing built means nothing can be wrong. This is the only gate, and it is
+  // A project is checked and repaired only by the region that serves it
+  // (lib/autonomy/region-skip.ts). The scheduled passes keep to their own
+  // projects before they get here, but a mutation's event, the event bus and
+  // the console reach this function for any project, so the rule is kept here,
+  // where every caller passes: nothing here detects or repairs a project
+  // another region serves. One this process cannot reach is skipped and
+  // recorded, as the scheduled passes do.
+  const { served } = await partitionServed([{ id: projectId }])
+  if (served.length === 0) {
+    const region = await projectRegion(projectId)
+    console.log(`[WorkspaceObserver] project=${projectId} is checked by its own region's worker (${region}); nothing was scanned here`)
+    return { ...result, skipped: 'served-elsewhere', region }
+  }
+  if (!(await canReach(projectId, 'observer'))) return { ...result, skipped: 'unreachable' }
+
+  // Nothing built means nothing can be wrong. This gate, like the region's, is
   // here rather than at the callers because five of them reach this function
   // (the dashboard's first-load kick, Re-scan, the event bus, the cron route
   // and the daily sweep) and the one that did not check is the one that
@@ -398,6 +454,12 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     // only from the WOULD_AUTO_APPLY branch. The observer is the path that
     // persists non-auto findings, which is what this is.
     detectSubsystemRecurrence(projectId),
+    // A column the developer asked for that the database no longer has, or has
+    // as a different kind of thing. The per-minute loop evaluates this invariant
+    // but, like every notify_only gap, never mints a finding for it, so without
+    // this line it was detected every minute and recorded nowhere: nobody was
+    // told, and the investigator, which reads findings, never saw one.
+    detectIntentDrift(projectId),
   ]
 
   const settled = await Promise.allSettled(detectors)
@@ -459,10 +521,33 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     } else if (finding.autoFixable && finding.fix) {
       try {
         await finding.fix()
-        status = 'auto_fixed'
-        autoFixed = true
-        fixAppliedAt = new Date()
-        result.autoFixed++
+        // The repair returning is not proof it worked. Re-check the specific
+        // gap against the live database, the same rule every other repair path
+        // follows: 'resolved' is a verified fix, 'unresolved' is not a fix at
+        // all, and anything else is a repair that ran without confirmation.
+        const { recheckGap } = await import('@/lib/autonomy/desired-state')
+        const recheck = await recheckGap(
+          projectId,
+          finding.type,
+          finding.details as Record<string, unknown>,
+        ).catch(() => 'unknown' as const)
+        if (recheck === 'unresolved') {
+          status = 'pending_approval'
+          result.pendingApproval++
+          finding.details = {
+            ...finding.details,
+            fixError: 'The repair ran, but the problem is still present on re-check.',
+          }
+        } else {
+          status = 'auto_fixed'
+          autoFixed = true
+          fixAppliedAt = new Date()
+          result.autoFixed++
+          finding.details = {
+            ...finding.details,
+            verification: recheck === 'resolved' ? 'confirmed' : 'unverified',
+          }
+        }
       } catch (err: any) {
         // Fix failed — demote to pending_approval so a human can review
         status = 'pending_approval'
@@ -733,12 +818,12 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
   try {
     const { reapStaleFindings } = await import('@/lib/core/finding-reaper')
     const reaped = await reapStaleFindings(projectId)
-    const total = reaped.arch + reaped.performance + reaped.invariants + reaped.migration
+    const total = reaped.arch + reaped.retired + reaped.invariants + reaped.drift
     if (total > 0) {
       console.log(
         `[WorkspaceObserver] reaped stale findings for ${projectId}: ` +
-        `arch=${reaped.arch} performance=${reaped.performance} ` +
-        `invariants=${reaped.invariants} migration=${reaped.migration}`,
+        `arch=${reaped.arch} retired=${reaped.retired} ` +
+        `invariants=${reaped.invariants} drift=${reaped.drift}`,
       )
     }
   } catch { /* best-effort — a failed reap must never fail the scan */ }
@@ -792,6 +877,8 @@ async function writeFinding(
   autoFixed: boolean,
   fixAppliedAt?: Date
 ): Promise<{ firstDetectedAt: Date }> {
+  finding.details = await findingDetailsKeptHere(projectId, finding.type, finding.details as Record<string, unknown>)
+
   // Upsert: if an open finding of the same type already exists, update it.
   //
   // Some types carry several INDEPENDENT instances at once, and keying the
@@ -814,6 +901,9 @@ async function writeFinding(
     // reaped — which is exactly the continuity reset the fingerprint cannot
     // provide, since a table joining the component can move it.
     subsystem_repeat_failure: 'membershipHash',
+    // One row per drifted column (`table.column`): two missing columns are two
+    // repairs, and each one's proposal is bound to its own finding.
+    intent_drift: 'location',
   }
 
   const discriminatorKey = DISCRIMINATOR[finding.type]
@@ -876,11 +966,15 @@ async function writeFinding(
   // "previous fix", so it escalated itself on the next scan). The approve
   // route writes the real user-resolution history when the user acts.
   if (status === 'auto_fixed') {
-    const resolution = buildResolutionText(
+    const text = buildResolutionText(
       finding.type as FindingType,
       finding.details as Record<string, unknown>,
       true,
     )
+    // History is kept for every repair that ran (recurrence escalation reads
+    // it), but only a re-checked repair may call itself fixed.
+    const verified = (finding.details as Record<string, unknown>).verification === 'confirmed'
+    const resolution = verified ? text : text.replace(/^Auto-fixed:/, 'Applied, not verified:')
     await writeFixHistory(projectId, {
       findingType: finding.type as FindingType,
       findingSeverity: finding.severity as FindingSeverity,
@@ -1012,6 +1106,25 @@ export async function notifyCritical(
 // Exported so the declarative desired-state spec (lib/autonomy/desired-state.ts)
 // can reuse the canonical RLS probe read-only. Calling this never mutates —
 // the `fix` closure on each finding is lazy and only the observer loop invokes it.
+/**
+ * The tables whose latest Backenly RLS template is all-access: their owner (or
+ * an agent acting for them) chose to leave every row open. Template rows are
+ * upserted per table and template, so the latest by updatedAt is the choice in
+ * force.
+ */
+export async function tablesOwnerOpened(projectId: string, tables: string[]): Promise<Set<string>> {
+  const rows = await prisma.permissionPolicy.findMany({
+    where: { projectId, tableName: { in: tables }, enabled: true, policyName: { startsWith: 'backenly_' } },
+    select: { tableName: true, policyName: true, updatedAt: true },
+  })
+  const latest = new Map<string, { policyName: string; updatedAt: Date }>()
+  for (const row of rows) {
+    const current = latest.get(row.tableName)
+    if (!current || row.updatedAt > current.updatedAt) latest.set(row.tableName, row)
+  }
+  return new Set([...latest].filter(([, row]) => row.policyName === 'backenly_all_access').map(([table]) => table))
+}
+
 export async function detectMissingRls(projectId: string): Promise<RawFinding[]> {
   const schemaName = `workspace_${projectId}`
 
@@ -1065,8 +1178,16 @@ export async function detectMissingRls(projectId: string): Promise<RawFinding[]>
   // No swallow. "I could not look" must never be reported as "I looked and
   // found nothing" — that is precisely how this probe stayed dead for months.
 
-  const hits: Array<{ tablename: string; has_owner_column: boolean }> =
+  const found: Array<{ tablename: string; has_owner_column: boolean }> =
     (rows?.rows ?? rows ?? []) as any
+
+  // A table its owner opened on purpose is not missing anything. The all-access
+  // template turns RLS off and records the choice (backenly_all_access); while
+  // that is the table's latest Backenly template, the detector leaves the table
+  // alone, as reconcileAutoRls already does, rather than re-locking it on every
+  // pass. A later template (which turns RLS back on) outranks it.
+  const opened = found.length ? await tablesOwnerOpened(projectId, found.map((h) => h.tablename)) : new Set<string>()
+  const hits = found.filter((h) => !opened.has(h.tablename))
 
   if (!hits.length) return []
 

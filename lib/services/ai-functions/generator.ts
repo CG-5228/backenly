@@ -14,12 +14,12 @@
  *   ctx.require('package') — whitelisted npm packages
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { introspectSchema } from '@/lib/ai/minimal-executor'
 import { prisma } from '@/lib/db'
 import { getConnectedProviderIds } from './integration-context'
 import { renderIntegrationDocs } from './integration-registry'
 
+import { chat } from '@/lib/ai/llm/chat'
 export interface GeneratedFunction {
   name: string
   code: string
@@ -122,8 +122,6 @@ export async function generateFunctionCode(
   triggerTable: string | null,
   projectId: string
 ): Promise<GeneratedFunction> {
-  const openai = getOpenAIClient()
-
   // Run schema introspection, integration lookup, and web research in parallel
   const [liveSchema, connectedProviderIds, liveDocs] = await Promise.all([
     introspectSchema(projectId),
@@ -154,7 +152,10 @@ The function receives two arguments:
   event — object with: { data: Record<string, any>, old?: Record<string, any>, type: string, table?: string }
   ctx   — execution context with these APIs:
 
-ctx.db.query(table, where?)         → Promise<rows[]>       — query rows with optional WHERE filter
+ctx.db.query(table, where?, opts?)  → Promise<rows[]>       — rows matching where (each key = value, ANDed; no ranges or LIKE).
+                                                              Returns at most opts.limit rows (default 100, max 1000), in no particular order
+                                                              unless opts.orderBy is given, e.g. { id: 'asc' }. To act on every matching row,
+                                                              page with opts.offset under one fixed opts.orderBy, collect the ids, then act.
 ctx.db.insert(table, data)          → Promise<row>          — insert a single row, returns inserted row
 ctx.db.update(table, where, data)   → Promise<rows[]>       — update rows matching where
 ctx.db.delete(table, where)         → Promise<void>         — delete rows matching where
@@ -188,17 +189,16 @@ User's description: "${description}"
 
 Generate ONLY the function body code (no function declaration, no exports). Start directly with the code.`
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    max_tokens: 700,
-    temperature: 0.2,
+  const response = await chat({
+    purpose: 'functions.generate',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
+    label: 'ai-function-generator',
   })
 
-  const rawCode = response.choices[0]?.message?.content?.trim() || ''
+  const rawCode = response.text?.trim() || ''
 
   // Strip markdown code fences if present
   const code = rawCode
@@ -207,19 +207,19 @@ Generate ONLY the function body code (no function declaration, no exports). Star
     .trim()
 
   // Generate a short human-readable name from the description
-  const nameResponse = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    max_tokens: 20,
-    temperature: 0,
+  const nameResponse = await chat({
+    purpose: 'build.classify',
     messages: [
       {
         role: 'user',
         content: `Generate a short snake_case function name (3-5 words, no spaces) for: "${description}". Reply with ONLY the name, nothing else.`,
       },
     ],
+    maxTokens: 20,
+    label: 'ai-function-name',
   })
 
-  const rawName = nameResponse.choices[0]?.message?.content?.trim() || 'custom_function'
+  const rawName = nameResponse.text?.trim() || 'custom_function'
   const name = rawName
     .toLowerCase()
     .replace(/[^a-z0-9_]/g, '_')
@@ -244,8 +244,6 @@ export async function generateFixedFunctionCode(
   triggerTable: string | null,
   projectId: string
 ): Promise<string> {
-  const openai = getOpenAIClient()
-
   const [liveSchema, connectedProviderIds] = await Promise.all([
     introspectSchema(projectId),
     getConnectedProviderIds(projectId).catch(() => [] as string[]),
@@ -261,7 +259,7 @@ export async function generateFixedFunctionCode(
   const systemPrompt = `You are a backend function debugger for Backenly. Fix the broken JavaScript function body below.
 
 AVAILABLE APIs (same as before):
-ctx.db.query(table, where?) / ctx.db.insert(table, data) / ctx.db.update(table, where, data) / ctx.db.delete(table, where)
+ctx.db.query(table, where?, { limit, offset, orderBy }?) / ctx.db.insert(table, data) / ctx.db.update(table, where, data) / ctx.db.delete(table, where)
 ctx.http.get(url, headers?) / ctx.http.post(url, body, headers?)
 ctx.log(...args)
 ctx.integrations.* — see the connected-integration surface below (only those methods exist)
@@ -288,17 +286,16 @@ ${originalCode}
 
 Fix the code to resolve the error. Return ONLY the fixed function body (no function declaration, no markdown). Start directly with the code.`
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    max_tokens: 700,
-    temperature: 0.1,
+  const response = await chat({
+    purpose: 'functions.generate',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
+    label: 'ai-function-repair',
   })
 
-  const rawCode = response.choices[0]?.message?.content?.trim() || originalCode
+  const rawCode = response.text?.trim() || originalCode
   return rawCode
     .replace(/^```(?:javascript|js|typescript|ts)?\n?/i, '')
     .replace(/\n?```$/i, '')

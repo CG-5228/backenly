@@ -48,15 +48,29 @@ import { AGENT_ICON, GenericAgentIcon } from './AgentBrandIcons'
 import { CodeSurface, CliText, JsonText } from './CodeSurface'
 
 /**
- * /resources is written for a person, so every link a human clicks in this UI
- * points there. llms.txt is written for a model and is never linked from here:
- * sending a developer to a plaintext dump addressed to their agent is a dead
- * end. (Was /quickstart until that page was removed; it now 301s here anyway.)
+ * /docs is written for a person, so every link a human clicks in this UI points
+ * there, at the page for this section. llms.txt is written for a model and is
+ * never linked from here: sending a developer to a plaintext dump addressed to
+ * their agent is a dead end. (Was /quickstart, then /resources; both now
+ * redirect into /docs.)
  */
-const USER_DOCS = '/resources'
+const USER_DOCS = '/docs/connect'
 const KEY_PLACEHOLDER = '<SCOPED_KEY>'
+/**
+ * The dashboard's own origin — which is the backend these commands must point
+ * at. Hardcoding backenly.com here sent every SELF-HOSTED operator's agent to
+ * Backenly Cloud, where their key is unknown and the connection dies with
+ * INVALID_KEY — the one-command install was broken for exactly the audience
+ * that cannot fall back to the hosted product. Client component, so the
+ * browser's origin is the truth; the env fallback only covers prerender.
+ */
+export function dashboardOrigin(): string {
+  if (typeof window !== 'undefined') return window.location.origin
+  return (process.env.NEXT_PUBLIC_APP_URL || 'https://backenly.com').replace(/\/+$/, '')
+}
+
 /** The remote (Streamable-HTTP) MCP endpoint — app/api/mcp/route.ts. No npx. */
-const REMOTE_URL = 'https://backenly.com/api/mcp'
+export const remoteUrl = () => `${dashboardOrigin()}/api/mcp`
 
 type Transport = 'local' | 'remote'
 
@@ -84,7 +98,13 @@ interface Agent {
   remote: Variant
 }
 
-const NPX_ARGS = (p: string, k: string) => ['-y', '@backenly/mcp-server', '--project', p, '--key', k]
+export const NPX_ARGS = (p: string, k: string) => {
+  const args = ['-y', '@backenly/mcp-server', '--project', p, '--key', k]
+  // The stdio package defaults to backenly.com; a self-host must say where it
+  // lives. Cloud commands stay exactly as they were.
+  const origin = dashboardOrigin()
+  return origin === 'https://backenly.com' ? args : [...args, '--endpoint', origin]
+}
 
 /**
  * JSON the way people write mcp.json by hand: two-space indent, with an array
@@ -104,7 +124,7 @@ function stdioJson(projectId: string, key: string): string {
 
 /** Cursor remote: url + headers; Cursor infers the transport from the url. */
 function cursorRemoteJson(_projectId: string, key: string): string {
-  return configJson({ mcpServers: { backenly: { url: REMOTE_URL, headers: { 'x-api-key': key } } } })
+  return configJson({ mcpServers: { backenly: { url: remoteUrl(), headers: { 'x-api-key': key } } } })
 }
 
 /**
@@ -115,7 +135,7 @@ function cursorRemoteJson(_projectId: string, key: string): string {
  * Servers → View raw config; its path on disk has moved between releases.
  */
 function antigravityRemoteJson(_projectId: string, key: string): string {
-  return configJson({ mcpServers: { backenly: { serverUrl: REMOTE_URL, headers: { 'x-api-key': key } } } })
+  return configJson({ mcpServers: { backenly: { serverUrl: remoteUrl(), headers: { 'x-api-key': key } } } })
 }
 
 /**
@@ -124,10 +144,19 @@ function antigravityRemoteJson(_projectId: string, key: string): string {
  * live under `http_headers`. Codex infers http from the `url` key (no `type`).
  */
 function codexRemoteToml(_projectId: string, key: string): string {
-  return `[mcp_servers.backenly]\nurl = "${REMOTE_URL}"\nhttp_headers = { "x-api-key" = "${key}" }`
+  return `[mcp_servers.backenly]\nurl = "${remoteUrl()}"\nhttp_headers = { "x-api-key" = "${key}" }`
 }
 
 const RUN_THEN_NEW_SESSION = 'Run it in a terminal, then start a new Claude Code session.'
+/**
+ * Cursor reads a user config and a per-project one. This block carries a real
+ * key, so it goes in the user config: a project's `.cursor/mcp.json` gets
+ * committed, and it sits beside the app code an agent writes, which is how an
+ * MCP key ended up in a frontend bundle (lib/security/key-placement.ts).
+ */
+const CURSOR_NEXT = (
+  <>Paste into <code>~/.cursor/mcp.json</code>, not the project&apos;s, so the key never reaches git. Then reload the window.</>
+)
 const ANTIGRAVITY_NEXT = (
   <>Paste into <code>mcp_config.json</code> (Manage MCP Servers → View raw config), then restart Antigravity.</>
 )
@@ -136,12 +165,12 @@ const AGENTS: Agent[] = [
   {
     id: 'claude-code', name: 'Claude Code',
     local: { kind: 'cli', next: RUN_THEN_NEW_SESSION, build: (p, k) => `claude mcp add backenly -- npx -y @backenly/mcp-server --project ${p} --key ${k}` },
-    remote: { kind: 'cli', next: RUN_THEN_NEW_SESSION, build: (_p, k) => `claude mcp add --transport http backenly ${REMOTE_URL} --header "x-api-key: ${k}"` },
+    remote: { kind: 'cli', next: RUN_THEN_NEW_SESSION, build: (_p, k) => `claude mcp add --transport http backenly ${remoteUrl()} --header "x-api-key: ${k}"` },
   },
   {
     id: 'cursor', name: 'Cursor',
-    local: { kind: 'json', next: <>Paste into <code>.cursor/mcp.json</code>, then reload the window.</>, build: stdioJson },
-    remote: { kind: 'json', next: <>Paste into <code>.cursor/mcp.json</code>, then reload the window.</>, build: cursorRemoteJson },
+    local: { kind: 'json', next: CURSOR_NEXT, build: stdioJson },
+    remote: { kind: 'json', next: CURSOR_NEXT, build: cursorRemoteJson },
   },
   {
     id: 'codex', name: 'Codex',
@@ -160,7 +189,7 @@ const AGENTS: Agent[] = [
   {
     id: 'other', name: 'Other',
     local: { kind: 'cli', next: 'Use it as the server command in any MCP host, then restart the host.', build: (p, k) => `npx -y @backenly/mcp-server --project ${p} --key ${k}` },
-    remote: { kind: 'cli', next: 'Add it as a Streamable HTTP server in any MCP host, then restart the host.', build: (_p, k) => `URL     ${REMOTE_URL}\nHeader  x-api-key: ${k}` },
+    remote: { kind: 'cli', next: 'Add it as a Streamable HTTP server in any MCP host, then restart the host.', build: (_p, k) => `URL     ${remoteUrl()}\nHeader  x-api-key: ${k}` },
   },
 ]
 
@@ -246,7 +275,7 @@ export function AgentInstallGuide({
               {key ? 'Key ready' : 'One key for this project, scoped and revocable'}
             </p>
             <p className="mt-0.5 text-[12.5px] text-zinc-500">
-              {key ? 'It is in the command below. Revoke it any time from the list.' : 'Never a root key. It can request a destructive change, never approve one.'}
+              {key ? 'It is in the command below, for your agent only: an app gets its own key. Revoke it any time from the list.' : 'Never a root key. It can request a destructive change, never approve one.'}
             </p>
           </div>
           <KitButton

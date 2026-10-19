@@ -5,15 +5,18 @@ import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api
 import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes } from '@/lib/api/v1/errors'
 import { aiGenerateSchema } from '@/lib/api/v1/schemas'
 import { validateRequestBody } from '@/lib/validation/schemas'
-import OpenAI from 'openai'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
+import { generateForProject } from '@/lib/ai/runtime-generate'
 
 /**
  * POST /v1/{projectId}/ai/generate
- * Generate content using AI
+ * Generate text with the deployment's AI provider, charged to the project's AI
+ * credits. `model` is an alias ("fast", or anything else for the default);
+ * `temperature` is accepted and ignored. lib/ai/runtime-generate.ts has the
+ * rules.
  */
 async function handlePOST(request: NextRequest, props: { params: Promise<{ projectId: string }> }) {
-  const params = await props.params;
+  const params = await props.params
   try {
     const middleware = await v1ApiMiddleware(request, params)
     if (middleware.response) {
@@ -38,44 +41,13 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       return handleValidationError((validation as { success: false; error: string; status: number }).error as any)
     }
 
-    const { prompt, model, temperature, maxTokens } = validation.data
-
-    // Initialize OpenAI client
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    })
-
-    // Generate content
-    const completion = await openai.chat.completions.create({
-      model: model || 'gpt-4.1',
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      temperature: temperature || 0.7,
-      max_tokens: maxTokens || 1000,
-    })
-
-    const content = completion.choices[0]?.message?.content || ''
-
-    return createSuccessResponse({
-      content,
-      model: completion.model,
-      usage: {
-        promptTokens: completion.usage?.prompt_tokens || 0,
-        completionTokens: completion.usage?.completion_tokens || 0,
-        totalTokens: completion.usage?.total_tokens || 0,
-      },
-    })
-  } catch (error: any) {
+    const { prompt, model, maxTokens } = validation.data
+    const result = await generateForProject({ projectId: context.projectId, prompt, model, maxTokens })
+    if ('data' in result) return createSuccessResponse(result.data)
+    return createErrorResponse(result.code, result.message, result.status, result.details)
+  } catch (error) {
     console.error('AI generate error:', error)
-    return createErrorResponse(
-      ErrorCodes.INTERNAL_ERROR,
-      'Failed to generate content',
-      500
-    )
+    return createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to generate content', 500)
   }
 }
 

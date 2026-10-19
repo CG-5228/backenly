@@ -19,10 +19,9 @@
  * Rule: every handler MUST use real project state. No generic answers.
  */
 
-import { getOpenAIClient } from './openai-service'
-import { getModel } from './model-router'
 import { countExposedResources } from '@/lib/api/exposed-resources'
 
+import { chat } from '@/lib/ai/llm/chat'
 // ── Public types ──────────────────────────────────────────────────────────────
 
 export type BuildSubBehavior =
@@ -194,11 +193,10 @@ function fastRoute(message: string, hasSchema: boolean): BuildRouterResult | nul
 
 async function llmRoute(message: string, schemaContext: string): Promise<BuildRouterResult> {
   try {
-    const openai = getOpenAIClient()
     const hasSchema = schemaContext.trim().length > 50
 
-    const response = await openai.chat.completions.create({
-      model: getModel('classify'),
+    const response = await chat({
+      purpose: 'build.classify',
       messages: [
         {
           role: 'system',
@@ -226,12 +224,12 @@ Respond ONLY with JSON: {"subBehavior": "...", "reason": "one sentence"}`,
         },
         { role: 'user', content: `Classify: "${message}"` },
       ],
-      temperature: 0.1,
-      max_tokens: 80,
-      response_format: { type: 'json_object' },
+      maxTokens: 80,
+      json: true,
+      label: 'build-mode-router',
     })
 
-    const raw = response.choices[0].message.content || '{}'
+    const raw = response.text || '{}'
     const parsed = JSON.parse(raw)
     const valid: BuildSubBehavior[] = ['EXECUTION', 'INSPECTION', 'MODIFICATION', 'CONTINUATION', 'VERIFICATION']
     const subBehavior: BuildSubBehavior = valid.includes(parsed.subBehavior) ? parsed.subBehavior : 'EXECUTION'

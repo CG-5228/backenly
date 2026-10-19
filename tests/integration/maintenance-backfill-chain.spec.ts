@@ -12,14 +12,15 @@
  * This drives the real handler through real BackgroundJob rows over 4,500 rows
  * and pins both halves: the first job alone still says "pending" (that is what
  * it truthfully says, and the defect was trusting it), and the chain, followed
- * by the rung's idempotency key, says "done" and names its last job.
+ * by the rung's idempotency key, says "done". It also pins the batch cursor on
+ * integer keys, which sorted as text and made every batch re-read the last.
  */
 
 import { randomUUID } from 'node:crypto'
 import { prisma } from '@/lib/db'
 import { enqueue } from '@/lib/queue'
 import { handleBackfillJob, type BackfillJobPayload } from '@/lib/autonomy/maintenance/primitives/backfill-job'
-import { inspectBackfillChain, inspectBackgroundJob } from '@/lib/autonomy/maintenance/execute'
+import { backgroundJobState, inspectBackgroundJob } from '@/lib/autonomy/maintenance/execute'
 
 jest.setTimeout(300_000)
 
@@ -87,22 +88,22 @@ describe('a backfill chain longer than one batch', () => {
   })
 
   it('reads as pending from its first job alone — the defect was trusting that', async () => {
-    expect((await inspectBackgroundJob(first)).state).toBe('pending')
+    const row = await prisma.backgroundJob.findUnique({ where: { id: first } })
+    expect(backgroundJobState(row, first).state).toBe('pending')
   })
 
-  it('reads as done from the chain, and names its last job', async () => {
-    const r = await inspectBackfillChain(PROJECT_ID, KEY, first)
-    expect(r.jobId).toBe(jobs[2])
-    expect(r.progress.state).toBe('done')
-    expect(r.progress.detail).toMatch(/backfill complete/)
+  it('reads as done from the chain', async () => {
+    const r = await inspectBackgroundJob(first, { projectId: PROJECT_ID, idempotencyKey: KEY })
+    expect(r.state).toBe('done')
+    expect(r.detail).toMatch(/backfill complete: \d+ row\(s\) updated over 3 batch/)
   })
 
   it('is not confused by another rung\'s chain on the same project', async () => {
     const other = `other-${randomUUID()}`
     await enqueue('maintenance_backfill', payload(other) as unknown as Record<string, unknown>, { projectId: PROJECT_ID })
     // Queued and not yet run: the other chain is pending, this one is still done.
-    expect((await inspectBackfillChain(PROJECT_ID, other, 'unused')).progress.state).toBe('pending')
-    expect((await inspectBackfillChain(PROJECT_ID, KEY, first)).progress.state).toBe('done')
+    expect((await inspectBackgroundJob('unused', { projectId: PROJECT_ID, idempotencyKey: other })).state).toBe('pending')
+    expect((await inspectBackgroundJob(first, { projectId: PROJECT_ID, idempotencyKey: KEY })).state).toBe('done')
     await drain()
   })
 
@@ -114,8 +115,7 @@ describe('a backfill chain longer than one batch', () => {
       { projectId: PROJECT_ID },
     )
     await drain()
-    const r = await inspectBackfillChain(PROJECT_ID, single, job.id)
-    expect(r).toMatchObject({ jobId: job.id, progress: { state: 'done' } })
+    expect(await inspectBackgroundJob(job.id, { projectId: PROJECT_ID, idempotencyKey: single })).toMatchObject({ state: 'done' })
   })
 })
 

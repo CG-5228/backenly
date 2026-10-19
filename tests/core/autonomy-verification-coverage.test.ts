@@ -329,7 +329,6 @@ describe('verification surfaces do not read the dead ApiDefinition table', () =>
   const VERIFICATION_SURFACES = [
     'lib/ai/behavioral-verifier.ts',
     'lib/core/drift-detector.ts',
-    'lib/ai/agents/repair-agent.ts',
     'lib/autonomy/desired-state.ts',
   ]
 

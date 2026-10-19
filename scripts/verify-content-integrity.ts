@@ -1,5 +1,5 @@
 /**
- * Content integrity gate for /resources, /use-cases, /comparisons,
+ * Content integrity gate for /docs, /use-cases, /comparisons,
  * /alternatives and /privacy.
  *
  * WHY THIS EXISTS
@@ -14,8 +14,10 @@
  * Most of those are judgement calls a script cannot make. These are the ones it
  * can, and they are the ones that rot silently:
  *
- *   1. Cross-references resolve.       A relatedSlug to a deleted guide is a
- *                                      dead "Next" card nobody notices.
+ *   1. Links and files resolve.        A link in the docs content to a retired
+ *                                      page, or a walkthrough video that was
+ *                                      never uploaded, fails nobody's eye until
+ *                                      a reader clicks it.
  *   2. The sitemap matches reality.    A slug that 404s, or a live page missing
  *                                      from the sitemap, is invisible until a
  *                                      crawler finds it.
@@ -62,7 +64,8 @@
 
 import fs from 'fs'
 import path from 'path'
-import { ALL_ARTICLES, ARTICLES_BY_SLUG, LANES, READ_MINUTES } from '../app/resources/content'
+import { DOC_GROUPS, DOC_SECTIONS, DOC_SLUGS, DOCS_BY_SLUG } from '../app/docs/content'
+import { DOC_VIDEOS } from '../app/docs/videos'
 import { USE_CASE_LIST, USE_CASES } from '../app/use-cases/data'
 import { COMPARISON_LIST, COMPARISON_SLUGS } from '../app/comparisons/data'
 import {
@@ -94,22 +97,62 @@ const fail = (m: string) => failures.push(m)
 const warnings: string[] = []
 const warn = (m: string) => warnings.push(m)
 
-// ── 1. Guide cross-references, shape, and anchors ────────────────────────────
+// ── 1. Docs: one complete page per console section ───────────────────────────
+//
+// The docs exist because customers could not say what Storage or Functions
+// were for. A page that cannot say why you would need a section, or how it
+// works, is the failure they were rebuilt to end, so the fields that carry
+// those answers are enforced rather than reviewed.
 
-for (const a of ALL_ARTICLES) {
-  for (const s of a.relatedSlugs) {
-    if (!ARTICLES_BY_SLUG[s]) fail(`resources/${a.slug}: relatedSlug "${s}" does not exist`)
+{
+  const slugs = DOC_SECTIONS.map((d) => d.slug)
+  if (new Set(slugs).size !== slugs.length) fail('docs: duplicate slug — one page is shadowing another')
+  for (const slug of DOC_SLUGS) {
+    if (!slugs.includes(slug)) fail(`docs: "${slug}" is declared in DOC_SLUGS but has no page`)
   }
-  if (a.relatedSlugs.includes(a.slug)) fail(`resources/${a.slug}: links to itself`)
-  if (!LANES.some((l) => l.id === a.lane)) fail(`resources/${a.slug}: lane "${a.lane}" has no shelf on the index`)
-  if (a.sections.length === 0) fail(`resources/${a.slug}: has no sections`)
-  if (!a.answers.trim().endsWith('?')) fail(`resources/${a.slug}: "answers" must be the question the page answers`)
-  if (new Date(a.dateModified) < new Date(a.datePublished)) fail(`resources/${a.slug}: dateModified precedes datePublished`)
-  if (!READ_MINUTES[a.slug] || READ_MINUTES[a.slug] < 1) fail(`resources/${a.slug}: derived read time is not a positive number`)
+  for (const group of DOC_GROUPS) {
+    if (!DOC_SECTIONS.some((d) => d.group === group.id)) fail(`docs: group "${group.id}" has no pages`)
+  }
 
-  const headings = a.sections.map((s) => s.heading)
-  if (new Set(headings).size !== headings.length) {
-    fail(`resources/${a.slug}: duplicate section headings — the in-page nav anchors will collide`)
+  for (const d of DOC_SECTIONS) {
+    const at = (m: string) => fail(`docs/${d.slug}: ${m}`)
+    if (!DOC_GROUPS.some((g) => g.id === d.group)) at(`group "${d.group}" does not exist`)
+    for (const field of ['title', 'purpose', 'summary', 'metaDescription', 'why'] as const) {
+      if (!d[field].trim()) at(`"${field}" is empty`)
+    }
+    if (d.examples.length < 3) at(`only ${d.examples.length} examples — a reader needs to recognise their own app`)
+    if (d.how.length < 3) at(`"How it works" has only ${d.how.length} steps`)
+    if (d.notes.length < 2) at(`"Good to know" has only ${d.notes.length} entries`)
+    if (d.prompts.length === 0 && !d.code) at('has nothing to try')
+
+    // Duplicates collide as React keys, and mean the page says the same thing twice.
+    const dupe = (label: string, values: string[]) => {
+      if (new Set(values).size !== values.length) at(`duplicate ${label} (React key collision)`)
+    }
+    dupe('step titles', d.how.map((s) => s.title))
+    dupe('examples', d.examples)
+    dupe('prompts', d.prompts)
+    dupe('notes', d.notes)
+  }
+}
+
+// ── 1b. Docs videos: every listed file exists ────────────────────────────────
+//
+// A typo in app/docs/videos.ts would otherwise ship a player that never loads,
+// on the page whose whole job is to explain the section.
+
+for (const [slug, video] of Object.entries(DOC_VIDEOS)) {
+  if (!video) continue
+  if (!(slug in DOCS_BY_SLUG)) fail(`docs/videos: "${slug}" is not a docs page`)
+  for (const file of [video.src, video.poster, video.captions]) {
+    if (file === undefined) continue
+    if (!file.startsWith('/media/docs/')) {
+      fail(`docs/videos/${slug}: ${file} must live under /media/docs/ (served from this origin, see videos.ts)`)
+      continue
+    }
+    if (!fs.existsSync(path.join(process.cwd(), 'public', file))) {
+      fail(`docs/videos/${slug}: ${file} does not exist under public/`)
+    }
   }
 }
 
@@ -405,13 +448,13 @@ const compare = (label: string, prefix: string, real: string[]) => {
   return `${inSitemap.length} ${label}`
 }
 
-const resourceCount = compare('resource', '/resources/', ALL_ARTICLES.map((a) => a.slug))
+const docCount = compare('docs', '/docs/', [...DOC_SLUGS])
 const useCaseCount = compare('use-case', '/use-cases/', USE_CASE_LIST.map((u) => u.slug))
 const comparisonCount = compare('comparison', '/comparisons/', [...COMPARISON_SLUGS])
 
-// The two index routes are hand-listed in the sitemap rather than derived, so
-// they are the ones that can silently go missing.
-for (const index of ['/comparisons', '/alternatives', '/privacy']) {
+// The index routes are hand-listed in the sitemap rather than derived, so they
+// are the ones that can silently go missing.
+for (const index of ['/docs', '/comparisons', '/alternatives', '/privacy']) {
   if (!urls.includes(index)) fail(`${index} exists but is missing from the sitemap`)
 }
 
@@ -443,18 +486,19 @@ async function checkRedirects(): Promise<void> {
   }
 
   // A retired slug must not still be served: if a page exists at the source, the
-  // redirect never fires and the rule is a lie.
-  const liveResources = new Set(ALL_ARTICLES.map((a) => `/resources/${a.slug}`))
+  // redirect never fires and the rule is a lie. /docs itself counts: it was a
+  // redirect to /resources before it became the docs home.
+  const liveDocs = new Set(['/docs', ...DOC_SLUGS.map((s) => `/docs/${s}`)])
   const liveUseCases = new Set(USE_CASE_LIST.map((u) => `/use-cases/${u.slug}`))
   for (const r of rules) {
-    if (liveResources.has(r.source) || liveUseCases.has(r.source)) {
+    if (liveDocs.has(r.source) || liveUseCases.has(r.source)) {
       fail(`redirect ${r.source} → ${r.destination} is dead: a page still exists at that slug`)
     }
   }
 
   // Every internal redirect destination must resolve to something real.
   for (const r of rules) {
-    if (r.destination.startsWith('/resources/') && !liveResources.has(r.destination)) {
+    if ((r.destination === '/docs' || r.destination.startsWith('/docs/')) && !liveDocs.has(r.destination)) {
       fail(`redirect ${r.source} points at ${r.destination}, which does not exist`)
     }
     if (r.destination.startsWith('/use-cases/') && !liveUseCases.has(r.destination)) {
@@ -487,6 +531,11 @@ const SURFACE_FILES = [
   // leaves a dead link in a document people are asked to accept at signup.
   'app/privacy/page.tsx',
   'app/privacy/data.ts',
+  // The docs pages and their navigation. Links inside the docs content itself
+  // are written as [label](/path) and checked separately below.
+  'app/docs/page.tsx',
+  'app/docs/[slug]/page.tsx',
+  'components/docs/DocsNav.tsx',
 ]
 
 /** Resolve a static pathname against the App Router directory layout. */
@@ -519,13 +568,38 @@ async function checkInternalLinks(): Promise<void> {
   const dynamicFamilies: Record<string, Set<string>> = {
     '/comparisons/': new Set(COMPARISON_SLUGS),
     '/use-cases/': new Set(USE_CASE_LIST.map((u) => u.slug)),
-    '/resources/': new Set(ALL_ARTICLES.map((a) => a.slug)),
+    '/docs/': new Set<string>(DOC_SLUGS),
+  }
+
+  const checkHref = (where: string, href: string) => {
+    const pathname = href.split(/[?#]/)[0].replace(/\/$/, '') || '/'
+
+    if (redirectSources.has(pathname)) {
+      fail(
+        `${where}: links to ${pathname}, which is a redirect source — link to the final ` +
+          `destination, or remove the link if the page it promised is gone`,
+      )
+      return
+    }
+
+    const family = Object.keys(dynamicFamilies).find((p) => pathname.startsWith(p))
+    if (family) {
+      const slug = pathname.slice(family.length)
+      if (slug && !dynamicFamilies[family].has(slug)) {
+        fail(`${where}: links to ${pathname}, which is not a live ${family.slice(1, -1)} slug`)
+      }
+      return
+    }
+
+    if (!staticRouteExists(pathname)) {
+      fail(`${where}: links to ${pathname}, which does not resolve to a page`)
+    }
   }
 
   for (const file of SURFACE_FILES) {
     const full = path.join(process.cwd(), file)
     if (!fs.existsSync(full)) {
-      fail(`content integrity: ${file} is listed as a comparison surface but does not exist`)
+      fail(`content integrity: ${file} is listed as a link-checked surface but does not exist`)
       continue
     }
     const source = fs.readFileSync(full, 'utf8')
@@ -536,30 +610,15 @@ async function checkInternalLinks(): Promise<void> {
     for (const m of source.matchAll(/href(?:=|:\s*)["'`](\/[^"'`${}\s]*)["'`]/g)) {
       hrefs.add(m[1])
     }
+    for (const href of hrefs) checkHref(file, href)
+  }
 
-    for (const href of hrefs) {
-      const pathname = href.split(/[?#]/)[0].replace(/\/$/, '') || '/'
-
-      if (redirectSources.has(pathname)) {
-        fail(
-          `${file}: links to ${pathname}, which is a redirect source — link to the final ` +
-            `destination, or remove the link if the page it promised is gone`,
-        )
-        continue
-      }
-
-      const family = Object.keys(dynamicFamilies).find((p) => pathname.startsWith(p))
-      if (family) {
-        const slug = pathname.slice(family.length)
-        if (slug && !dynamicFamilies[family].has(slug)) {
-          fail(`${file}: links to ${pathname}, which is not a live ${family.slice(1, -1)} slug`)
-        }
-        continue
-      }
-
-      if (!staticRouteExists(pathname)) {
-        fail(`${file}: links to ${pathname}, which does not resolve to a page`)
-      }
+  // Links written inside the docs content as [label](/path). Every string field
+  // is scanned, so a link added to a field that does not render links still has
+  // to point somewhere real.
+  for (const doc of DOC_SECTIONS) {
+    for (const m of JSON.stringify(doc).matchAll(/\]\((\/[^)\s]*)\)/g)) {
+      checkHref(`docs/${doc.slug}`, m[1])
     }
   }
 }
@@ -582,8 +641,8 @@ checkRedirects()
       process.exit(1)
     }
     console.log(
-      `✓ Content integrity: ${ALL_ARTICLES.length} guides + ${USE_CASE_LIST.length} use cases + ` +
-        `${COMPARISON_LIST.length} comparisons · ${resourceCount} + ${useCaseCount} + ` +
+      `✓ Content integrity: ${DOC_SECTIONS.length} docs pages + ${USE_CASE_LIST.length} use cases + ` +
+        `${COMPARISON_LIST.length} comparisons · ${docCount} + ${useCaseCount} + ` +
         `${comparisonCount} sitemap URLs match · redirects unchained · internal links resolve · ` +
         `every comparison concedes a case · competitor facts sourced · keys unique · ` +
         `privacy: ${PRIVACY_SECTIONS.length} sections, ${PROVIDERS.length} providers disclosed, ` +

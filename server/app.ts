@@ -19,6 +19,10 @@ import { projectServingGate } from './lib/serving-gate'
 import { recordRuntimeRequest, INTERNAL_TRAFFIC_HEADER, isInternalTraffic } from '@/lib/traffic/request-recorder'
 import { meterNodeResponse } from '@/lib/usage/egress'
 import { branchIdForRequest, refuseBranchKeyOffDataPlane } from '@/lib/branches/key-scope'
+import { refuseMisplacedKey } from '@/lib/security/key-placement'
+import { isRegionError } from '@/lib/data-plane/regional'
+import { isAuthorizationUnavailable } from '@/lib/auth-projection/read'
+import { misdirection } from '@/lib/data-plane/serving'
 
 const app = express()
 
@@ -139,12 +143,49 @@ app.use(['/api/v1/:projectId', '/api/v2/:projectId'], (req, res, next) => {
   next()
 })
 
+// ── Each region's projects are served only in that region ─────────────────────
+// Before the serving gate, the Next proxy and every router: a project of another
+// region is answered 421 WRONG_REGION with its own address, and nothing about it
+// is looked up or checked here. Behind Next the same check has already run
+// (lib/traffic/recorded-v1.ts); on a single-box layout this is the only one.
+// lib/data-plane/serving.ts.
+app.use(['/api/v1/:projectId', '/api/v2/:projectId'], asyncRoute(async (req, res, next) => {
+  const projectId = /^\/api\/v[12]\/([^/?#]+)/.exec(req.originalUrl)?.[1]
+  if (projectId) {
+    const refusal = await misdirection(projectId, process.env.NEXT_PUBLIC_APP_URL || 'https://backenly.com')
+    if (refusal) {
+      res.status(refusal.status).json(refusal.body)
+      return
+    }
+  }
+  next()
+}))
+
 // ── Project serving gate ───────────────────────────────────────────────────────
 // Before the Next proxy and before every router, because it is the one check
 // they all need and none of them used to make: founder lockdown was enforced by
 // the Next-owned surfaces only, so /db, /v2, end-user auth, functions and
 // realtime kept serving a sealed project. See lib/projects/serving-state.ts.
 app.use(['/api/v1/:projectId', '/api/v2/:projectId'], asyncRoute(projectServingGate))
+
+// ── A key is served only where it belongs ──────────────────────────────────────
+// An MCP key drives an agent's tools and is never an app's key, so the runtime
+// refuses it from anywhere; a service-role key never answers a browser. Refused
+// here, before the Next proxy, every router and any rate-limit accounting, so no
+// surface can forget either rule. lib/security/key-placement.ts.
+app.use(['/api/v1', '/api/v2'], asyncRoute(async (req, res, next) => {
+  const refusal = await refuseMisplacedKey(
+    req.originalUrl,
+    { get: (name: string) => req.get(name) },
+    new URL(req.originalUrl, 'http://runtime.internal'),
+    req.method,
+  )
+  if (refusal) {
+    res.status(refusal.status).json(refusal.body)
+    return
+  }
+  next()
+}))
 
 // ── A branch-bound key stays on the data plane ─────────────────────────────────
 // Only /db/*, /api/v2 and end-user sign-up, sign-in, refresh and logout are
@@ -236,6 +277,27 @@ app.use((err: any, _req: express.Request, res: express.Response, next: express.N
   // after that point lands here with nothing sendable. Express's default
   // handler destroys the socket, which is the only correct answer.
   if (res.headersSent) return next(err)
+
+  // The project's data is in a region this process has no connection to, or
+  // its row names a region this build does not know. Nothing was read from
+  // another region's database instead (lib/data-plane/regional.ts). Retryable
+  // once the deployment is configured, so 503 rather than 500, with the code
+  // an operator can search for and without the variable names.
+  if (isRegionError(err)) {
+    res.status(503).json({
+      error: "This project's data region is not reachable from this server.",
+      code: err.code,
+    })
+    return
+  }
+
+  // The region's copy of what authorizes the request was past its bound and
+  // home could not be asked (lib/auth-projection/read.ts). Refused, never
+  // served on stale authorization; retryable.
+  if (isAuthorizationUnavailable(err)) {
+    res.status(503).json({ error: 'This request could not be authorized right now. Try again shortly.', code: err.code })
+    return
+  }
 
   res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' })
 })

@@ -30,12 +30,12 @@ call, or a Backenly repo path. A claim with no locator does not belong here.
 
 ## Capability register
 
-**Derived from `79b4fa20` on 2026-09-22 by `scripts/derive-selfhost-register.ts`.**
+**Derived from `12886874` on 2026-10-18 by `scripts/derive-selfhost-register.ts`.**
 Do not hand-edit this section: it is regenerated, and a capability
 cannot be marked done by editing prose. The previous hand-maintained
 matrix listed five shipped capabilities as "not started".
 
-DONE 21 · INTENTIONAL 2
+BACKEND_ONLY 1 · DONE 21 · INTENTIONAL 2
 
 | Area | Capability | Verdict | Evidence |
 |---|---|---|---|
@@ -45,7 +45,8 @@ DONE 21 · INTENTIONAL 2
 | Database | Table editor | **DONE** | app/api/database/tables/route.ts, app/app/projects/[id]/database/page.tsx |
 | Database | Foreign keys and constraints | **DONE** | app/api/database/schema/constraints/route.ts, lib/db/fk-shape.ts, app/app/projects/[id]/database/page.tsx |
 | Database | Read-only SQL workspace | **DONE** | app/api/database/query/route.ts, lib/mcp/read-query.ts, components/database/SqlWorkspace.tsx |
-| Database | Migration / schema history | **DONE** | app/api/projects/[id]/schema-versions/route.ts, components/database/SchemaHistory.tsx |
+| Database | Change history (checkpointed, verified, recovered) | **DONE** | app/api/projects/[id]/changes/route.ts, lib/changes/ledger.ts, components/changes/ChangeHistory.tsx |
+| Database | Restore previous state of a change | **DONE** | app/api/projects/[id]/changes/[changeId]/restore/route.ts, lib/changes/recovery.ts, components/changes/RestoreDialog.tsx |
 | Database | Schema graph | **DONE** | app/api/database/relationships/route.ts, components/database/EnhancedSchemaVisualizer.tsx |
 | Database | Dashboard SQL writes / DDL | **INTENTIONAL** | AGENTS.md: mutations go through typed governed actions so they can be planned, approved, verified and reversed. A SQL parser must never be the tenant boundary. |
 | Observability | Logs explorer | **DONE** | app/api/logs/route.ts, components/monitoring/LogsExplorer.tsx |
@@ -56,7 +57,7 @@ DONE 21 · INTENTIONAL 2
 | Auth | End-user auth runtime | **DONE** | app/api/v1/[projectId]/auth/signin/route.ts, app/app/projects/[id]/auth/page.tsx |
 | Auth | SMTP configuration | **DONE** | lib/email/project-smtp.ts, app/api/projects/[id]/email/smtp/route.ts, components/auth/EmailSettingsPanel.tsx |
 | Auth | Email template editing | **DONE** | lib/email/template-kinds.ts, app/api/projects/[id]/email/templates/[kind]/route.ts, components/auth/EmailSettingsPanel.tsx |
-| Storage | Buckets and objects | **DONE** | app/api/v1/[projectId]/storage/upload/route.ts, lib/services/storage.ts, components/storage/StorageWorkbench.tsx |
+| Storage | Buckets and objects | **BACKEND_ONLY** | backend: app/api/v1/[projectId]/storage/upload/route.ts, lib/services/storage.ts. no surface references createBucket |
 | Storage | Per-bucket access policies | **DONE** | lib/storage/access-policy.ts, app/api/storage/files/[fileId]/download/route.ts, components/storage/BucketPolicyDialog.tsx, components/storage/StorageWorkbench.tsx |
 | Postgres admin | Index management | **DONE** | app/api/database/indexes/route.ts, app/app/projects/[id]/database/page.tsx |
 | Postgres admin | Extension allowlist provisioning | **DONE** | lib/services/extensions.ts, app/api/projects/[id]/database/extensions/route.ts, components/database/ExtensionsPanel.tsx |
@@ -1132,7 +1133,7 @@ State vocabulary: `full` · `degraded` · `absent` · **`backend-present-ui-abse
 | Realtime: channel policies | full | absent | — | gap |
 | **Logs explorer** | requires override | **backend-present-ui-absent** | `app/api/logs/route.ts`, 8 filters, **0 callers** | **ui-absent** |
 | Metrics / latency charts | needs Logflare | full, no extra service | `components/monitoring/MonitoringWorkbench.tsx` | **Backenly ahead** |
-| Advisors | security + performance | findings queue + auto-fix | `components/workspace/AdvisorBlock.tsx` | different shape |
+| Advisors | security + performance | findings queue + auto-fix | `components/workspace/WorkspaceHome.tsx`, `components/ReviewQueuePanel.tsx` | different shape |
 | **Backups / restore UI** | **cloud-only** | **backend-present-ui-absent** | `app/api/projects/[id]/backup/route.ts` GET/POST/PUT, **0 callers** | **cloud-only** since Part 7; restore still broken (Part 6) |
 | PITR | cloud-only | absent | — | — (parity) |
 | Branching | cloud-only | **cloud-only** (removed from self-host 2026-09-17, Part 7) | `lib/branches/engine.ts` | — (parity, by decision) |

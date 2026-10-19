@@ -164,7 +164,7 @@ const BUILD_TOOLS = new Set<string>([
   'create_table', 'add_column', 'create_index', 'rename_column', 'add_constraint',
   // (list_branches / diff_branch are read tools; all four are reachable through
   // the single advertised `branch` tool — see BRANCH_ACTIONS.)
-  'generate_api', 'enable_auth', 'create_bucket', 'set_bucket_public', 'add_rls', 'set_rls',
+  'generate_api', 'enable_auth', 'create_bucket', 'set_bucket_public', 'set_bucket_policy', 'add_rls', 'set_rls',
   'create_trigger', 'enable_realtime', 'generate_function', 'enable_vector_search',
   'create_cron_job', 'set_rate_limit', 'generate_aggregate_api', 'enable_teams',
   'send_push', 'rotate_webhook_secret', 'connect_frontend',
@@ -571,13 +571,14 @@ export function buildDispatchable(): McpToolDescriptor[] {
     name: 'check_approval',
     tier: 'read',
     description:
-      'Check the status of a destructive-operation approval request created by backend_chat. ' +
-      'Returns pending | executed | partial | failed | rejected | expired plus a result summary once decided. ' +
+      'Check the status of an approval request: a call that was parked for a human instead of running. ' +
+      'Returns pending | approved | executed | failed | rejected | expired (older requests may also read partial) ' +
+      'plus a result summary once decided. ' +
       'Poll every 15-30s while pending; stop on any terminal status. Only the human can approve — ' +
       'from the Backenly dashboard Review Queue. ' +
-      'The distinction that matters: `failed` means NOTHING was applied and the backend is unchanged, ' +
-      'so it is safe to retry; `partial` means some changes DID land before the run stopped, so you must ' +
-      'read resultSummary and verify current state rather than replaying the request.',
+      'Neither `failed` nor `partial` promises the backend is unchanged: read resultSummary and check the ' +
+      'current state before raising the request again, because a call that stops part-way can leave some ' +
+      'of its work applied.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -626,7 +627,7 @@ export function buildDispatchable(): McpToolDescriptor[] {
       description:
         'Read rows from a single workspace table by simple column = value filter. Returns whole rows. ' +
         'For joins, aggregates, GROUP BY, or any multi-table question use `run_query` instead — this tool cannot express them. ' +
-        'Owner/admin maintenance tool: validates table and column shapes, but intentionally bypasses end-user RLS, triggers, and AI function side effects.',
+        'Owner/admin maintenance tool: validates table and column shapes, but intentionally bypasses end-user RLS and app triggers. Row-event AI functions and row webhooks still fire: they are captured inside PostgreSQL, so they see every writer.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -648,7 +649,7 @@ export function buildDispatchable(): McpToolDescriptor[] {
       name: 'db_insert',
       tier: 'data',
       description:
-        'Insert one row into a workspace table. Owner/admin maintenance tool: bypasses end-user RLS, triggers, and AI function side effects. ' +
+        'Insert one row into a workspace table. Owner/admin maintenance tool: bypasses end-user RLS and app triggers; row-event AI functions and row webhooks still fire (captured inside PostgreSQL). ' +
         'Returns the created row including auto-generated id and timestamps.',
       inputSchema: {
         type: 'object',
@@ -666,7 +667,7 @@ export function buildDispatchable(): McpToolDescriptor[] {
       tier: 'data',
       description:
         'Patch one or more rows in a workspace table. `filter` selects which rows to update; `patch` is the column → value diff. ' +
-        'Owner/admin maintenance tool: bypasses end-user RLS, triggers, and AI function side effects. Returns the count of rows updated.',
+        'Owner/admin maintenance tool: bypasses end-user RLS and app triggers; row-event AI functions and row webhooks still fire (captured inside PostgreSQL). Returns the count of rows updated.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -684,7 +685,7 @@ export function buildDispatchable(): McpToolDescriptor[] {
       tier: 'data',
       description:
         'Delete rows from a workspace table matching `filter`. `filter` is REQUIRED and non-empty — there is no "delete all rows" path here. ' +
-        'Owner/admin maintenance tool: bypasses end-user RLS, triggers, and AI function side effects. For destructive table-wide operations use the dashboard.',
+        'Owner/admin maintenance tool: bypasses end-user RLS and app triggers; row-event AI functions and row webhooks still fire (captured inside PostgreSQL). For destructive table-wide operations use the dashboard.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -900,7 +901,12 @@ export const STATE_SECTIONS: Record<string, string> = {
   integrations: 'list_integration_keys',
   apps: 'list_connected_apps',
   env: 'list_env_vars',
-  webhooks: 'list_webhook_deliveries',
+  // The Webhooks PAGE: configured endpoints, their health. This once pointed
+  // at list_webhook_deliveries — the AppTrigger delivery log, which is empty
+  // unless legacy /database/* routes fired — so an agent grounding itself on a
+  // project with three live webhook endpoints was told there were none.
+  webhooks: 'list_webhooks',
+  deliveries: 'list_webhook_deliveries',
   findings: 'list_findings',
   incidents: 'get_pending_incidents',
   metrics: 'get_metrics',

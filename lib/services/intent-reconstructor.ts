@@ -6,10 +6,10 @@
  */
 
 import { AppInspectionResult } from './app-inspector'
-import OpenAI from 'openai'
 import { prisma } from '@/lib/db'
 import { createProvisionedProject } from '@/lib/projects/provision'
 
+import { chat } from '@/lib/ai/llm/chat'
 export interface IntentReconstructionResult {
   success: boolean
   error?: string
@@ -85,14 +85,11 @@ export class IntentReconstructor {
       console.log('[IntentReconstructor] Reconstructing intent from:', inspectionData.appName)
 
       // Use AI to understand the app's intent
-      const openai = new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY,
-      })
 
       const prompt = this.buildReconstructionPrompt(inspectionData)
 
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4.1',
+      const completion = await chat({
+        purpose: 'build.plan',
         messages: [
           {
             role: 'system',
@@ -109,11 +106,11 @@ CRITICAL RULES:
             content: prompt,
           },
         ],
-        temperature: 0.3,
-        response_format: { type: 'json_object' },
+        json: true,
+        label: 'intent-reconstructor',
       })
 
-      const result = completion.choices[0].message.content
+      const result = completion.text
       if (!result) {
         throw new Error('No response from AI')
       }

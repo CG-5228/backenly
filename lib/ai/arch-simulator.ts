@@ -21,6 +21,8 @@ import { Pool } from 'pg'
 import { loadProjectMemory } from '@/lib/ai/project-memory'
 import { getWorkspaceDatabaseNames } from '@/lib/services/databaseProvisioning'
 
+import { chat } from '@/lib/ai/llm/chat'
+import { projectDatabaseUrl } from '@/lib/data-plane/regional'
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface SimulationScenario {
@@ -131,8 +133,8 @@ interface TableStat {
   n_live_tup: number
 }
 
-async function fetchTableStats(schemaName: string): Promise<TableStat[]> {
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 })
+async function fetchTableStats(connectionString: string, schemaName: string): Promise<TableStat[]> {
+  const pool = new Pool({ connectionString, max: 3 })
   try {
     const result = await pool.query<TableStat>(
       // `relname AS tablename`, not `tablename`: pg_stat_user_tables exposes
@@ -272,8 +274,6 @@ async function llmAnalysis(
   tableStats: TableStat[],
   scenario: SimulationScenario,
 ): Promise<LLMAnalysis> {
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
 
   const tableList = tableStats
     .map(t => `${t.tablename} (${fmtNum(t.n_live_tup)} rows)`)
@@ -305,18 +305,18 @@ Scenario: ${scenario.label} (${scenario.multiplier}x scale, ${scenario.timeframe
 Identify the top performance bottlenecks and provide concrete SQL fixes where applicable.
 Focus on the most impactful issues only.`
 
-  const response = await client.chat.completions.create({
-    model,
+  const response = await chat({
+    purpose: 'insight.explain',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
-    max_tokens: 1500,
-    temperature: 0.2,
-    response_format: { type: 'json_object' },
+    maxTokens: 1500,
+    json: true,
+    label: 'arch-simulator',
   })
 
-  const raw = response.choices[0]?.message?.content ?? '{}'
+  const raw = response.text ?? '{}'
   return JSON.parse(raw) as LLMAnalysis
 }
 
@@ -369,9 +369,12 @@ export async function simulateScenario(
 
     // 2. Query live row counts
     const { postgresSchema } = getWorkspaceDatabaseNames(projectId)
+    // The project's own database, in its region. Resolved outside the catch
+    // below, which would size the project at zero rows.
+    const projectDbUrl = await projectDatabaseUrl(projectId)
     let tableStats: TableStat[] = []
     try {
-      tableStats = await fetchTableStats(postgresSchema)
+      tableStats = await fetchTableStats(projectDbUrl, postgresSchema)
     } catch (dbErr: any) {
       console.warn('[ArchSimulator] Could not fetch table stats:', dbErr?.message)
       // Fall back to synthetic stats from memory

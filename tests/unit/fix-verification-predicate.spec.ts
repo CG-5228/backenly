@@ -119,12 +119,13 @@ describe('no caller of the acceptance probe can swallow its failure again', () =
   const ROOT = path.resolve(__dirname, '..', '..')
   const engine = fs.readFileSync(path.join(ROOT, 'lib/core/auto-fix-engine.ts'), 'utf8')
 
-  it('has exactly the two call sites this fix covers', () => {
-    // A third producer added later would not inherit the three-state handling,
-    // and the bug would come back in a file nobody re-read. If this count
-    // changes, the new call site needs the same treatment.
+  it('has exactly the three call sites this fix covers', () => {
+    // A producer added later would not inherit the three-state handling, and
+    // the bug would come back in a file nobody re-read. If this count changes,
+    // the new call site needs the same treatment. The third is the approved
+    // AI-proposal path (executeApprovedProposal), which has it.
     const calls = [...engine.matchAll(/await evaluateFixOutcome\(/g)]
-    expect(calls.length).toBe(2)
+    expect(calls.length).toBe(3)
   })
 
   it('never discards the error with a bare catch', () => {
@@ -140,15 +141,15 @@ describe('no caller of the acceptance probe can swallow its failure again', () =
     }
   })
 
-  it('captures the verifier error at both call sites', () => {
+  it('captures the verifier error at every call site', () => {
     const captures = [...engine.matchAll(/verifierError = err instanceof Error/g)]
-    expect(captures.length).toBe(2)
+    expect(captures.length).toBe(3)
   })
 
   it('branches on the captured error before reading the outcome', () => {
     // Ordering is the property. Checking `outcome` first and the error second
     // would re-open the hole for the null case.
     const branches = [...engine.matchAll(/if \(verifierError !== null\)/g)]
-    expect(branches.length).toBe(2)
+    expect(branches.length).toBe(3)
   })
 })

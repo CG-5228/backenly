@@ -5,10 +5,12 @@
  * Recording aid for the self-healing demo. The autonomy loop normally does
  * everything in ONE tick (reconciler.ts: ensureFinding → runAutoFix on the very
  * next line), so a finding opens and closes milliseconds apart. The dashboard
- * only animates a heal it personally witnessed — WorkspaceHome polls at 2.5s
- * ONLY while a finding is already open, and fires the Detect→Propose→Apply→
- * Verify sweep only when an ID it previously saw open disappears. A same-tick
- * fix is therefore invisible: nothing to film.
+ * polls at 2.5s ONLY while a finding is already open, and plays the
+ * Detect→Propose→Apply→Verify sweep only for a repair /health reports as
+ * confirmed by a re-check (recentlyResolved, closedBy 'autonomy_verified') that
+ * the page has not shown yet. With nothing open nothing polls, so a same-tick
+ * fix appears only on the next refresh and its Detect step is never on screen:
+ * nothing to film.
  *
  * This script splits the tick in two so the camera can see each half. It does
  * NOT fake anything:

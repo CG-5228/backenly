@@ -24,11 +24,13 @@ import { Cpu, X, ArrowRight } from 'lucide-react'
 
 interface BannerData {
   total: number
+  /** Fixes a re-check confirmed. */
   autonomousFixes: number
+  /** Changes that ran but could not be confirmed — never shown as fixes. */
+  unverifiedChanges: number
   escalations: number
-  rollbacks: number
   headline: string
-  examples: Array<{ id: string; at: string; what: string; why: string; full: string }>
+  examples: Array<{ id: string; at: string; what: string; why: string; full: string; verified: boolean }>
   shouldShow: boolean
 }
 

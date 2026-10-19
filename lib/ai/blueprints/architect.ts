@@ -22,8 +22,7 @@
  * to the user.
  */
 
-import { getOpenAIClient, trackCompletionCost } from '../openai-service'
-import { getModel } from '../model-router'
+import { AiError, effectiveTokensOf, generate, type AiErrorKind } from '../llm'
 import type { Blueprint, BlueprintColumn } from './types'
 import { validateAndEnrichSpec, type ArchitectSpec } from './validate'
 
@@ -245,10 +244,12 @@ export async function architectBackend(
     if (attempt.kind === 'vague') {
       return { vague: true, askUser: attempt.askUser }
     }
+    const last = omitSeeds || attempt.final
     console.warn(
       `[Architect] attempt ${omitSeeds ? 2 : 1} failed (${attempt.reason})` +
-      (omitSeeds ? ' — giving up, caller falls back to agent loop' : ' — retrying without seeds'),
+      (last ? ' — giving up, caller falls back to agent loop' : ' — retrying without seeds'),
     )
+    if (last) break
   }
   return null
 }
@@ -256,83 +257,98 @@ export async function architectBackend(
 type ArchitectAttempt =
   | { kind: 'ok'; blueprint: Blueprint; rawSpec: ArchitectSpec; tokensUsed: number }
   | { kind: 'vague'; askUser: string; tokensUsed: number }
-  | { kind: 'failed'; reason: string; tokensUsed: number }
+  | {
+      kind: 'failed'
+      reason: string
+      tokensUsed: number
+      /** A smaller spec cannot help: no provider, no spend allowed, or a refusal. */
+      final?: boolean
+    }
+
+/**
+ * Failures a second, smaller spec can get past: an answer too slow or too long
+ * to finish, or one lost in flight. Anything else (no provider, a spending
+ * limit, a refusal, a rate limit the gateway already waited out) fails the
+ * retry the same way, so it is not spent.
+ */
+const RETRYABLE_WITHOUT_SEEDS: ReadonlySet<AiErrorKind> = new Set(['timeout', 'unavailable', 'output_invalid'])
+
+/** The spec as JSON: as sent, inside a code fence, or between the first and last brace of a reply with prose around it. */
+function parseSpec(raw: string): unknown {
+  const candidates = [
+    raw,
+    raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim(),
+    raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1),
+  ]
+  for (const text of candidates) {
+    if (!text) continue
+    try {
+      return JSON.parse(text)
+    } catch {
+      /* try the next shape */
+    }
+  }
+  return undefined
+}
 
 async function architectOnce(
   userPrompt: string,
   projectId: string,
   omitSeeds: boolean,
 ): Promise<ArchitectAttempt> {
-  const openai = getOpenAIClient()
   let raw: string
   let tokensUsed = 0
-  let finishReason = ''
+  let cutOff = false
   const startedAt = Date.now()
   try {
-    const messages: Array<{ role: 'system' | 'user'; content: string }> = [
-      { role: 'system', content: ARCHITECT_PROMPT },
+    // One long design call: the gateway gives it its own output ceiling and
+    // timeout (brain.architect) and streams it, and retries only a request the
+    // provider refused before running it. The two-attempt loop above owns
+    // every other retry.
+    const reply = await generate({
+      purpose: 'brain.architect',
+      system: ARCHITECT_PROMPT,
+      ...(omitSeeds
+        ? {
+            context:
+              'RETRY MODE: your previous spec was too large or failed to complete. ' +
+              'Output the same design but OMIT the "seeds" field entirely and keep every description under 200 characters. ' +
+              'Do not drop tables, functions, or crons — only seeds.',
+          }
+        : {}),
       // 12k chars ≈ 3k tokens — detailed specs (10+ tables with full column
       // lists) run 3–6k chars, and truncating one mid-schema silently drops
       // the user's tables. Cheap to keep; catastrophic to cut.
-      { role: 'user', content: userPrompt.slice(0, 12000) },
-    ]
-    if (omitSeeds) {
-      messages.push({
-        role: 'system',
-        content:
-          'RETRY MODE: your previous spec was too large or failed to complete. ' +
-          'Output the same design but OMIT the "seeds" field entirely and keep every description under 200 characters. ' +
-          'Do not drop tables, functions, or crons — only seeds.',
-      })
-    }
-    const completion = await openai.chat.completions.create(
-      {
-        model: getModel('plan'),
-        messages,
-        response_format: { type: 'json_object' },
-        temperature: 0.2,
-        // A 15–25 table spec with per-table columns + RLS + realtime +
-        // triggers + functions can exceed 4.5k output tokens; a truncated
-        // JSON body fails the parse and the attempt is wasted.
-        max_tokens: 8000,
-      },
-      // The shared client is tuned for small classify calls (30s). Generating
-      // a full backend spec is the heaviest single LLM call in the product —
-      // give it a real budget and disable SDK-level retries (our two-attempt
-      // loop owns the retry policy; stacking both would triple latency).
-      { timeout: 180_000, maxRetries: 0 },
-    )
-    if (projectId) trackCompletionCost(completion, projectId, 'architect')
-    tokensUsed = completion.usage?.total_tokens ?? 0
-    finishReason = completion.choices[0]?.finish_reason ?? ''
-    raw = completion.choices[0]?.message?.content?.trim() ?? ''
+      messages: [{ role: 'user', content: userPrompt.slice(0, 12000) }],
+      billing: { projectId },
+      label: 'architect',
+    })
+    tokensUsed = effectiveTokensOf(reply.model, reply.usage)
+    cutOff = reply.message.stop_reason === 'max_tokens'
+    raw = reply.text.trim()
   } catch (err) {
-    const e = err as { message?: string }
+    const ai = err instanceof AiError ? err : null
     return {
       kind: 'failed',
-      reason: `LLM call failed after ${Math.round((Date.now() - startedAt) / 1000)}s: ${e?.message?.slice(0, 120) ?? 'unknown'}`,
-      tokensUsed,
+      reason:
+        `model call failed after ${Math.round((Date.now() - startedAt) / 1000)}s` +
+        (ai ? ` (${ai.kind})` : '') +
+        `: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`,
+      tokensUsed: ai?.consumption === 'ran' && ai.usage ? effectiveTokensOf(ai.model ?? '', ai.usage) : 0,
+      final: ai !== null && !RETRYABLE_WITHOUT_SEEDS.has(ai.kind),
     }
   }
 
-  if (finishReason === 'length') {
+  if (cutOff) {
     // Truncated mid-JSON — parsing is hopeless; report precisely so the
     // retry (or an operator reading logs) knows this was size, not flakiness.
-    return { kind: 'failed', reason: `output truncated at max_tokens (finish_reason=length, ${tokensUsed} tokens)`, tokensUsed }
+    return { kind: 'failed', reason: `output truncated at the output ceiling (${tokensUsed} tokens)`, tokensUsed }
   }
 
   // Vague handler — surface the LLM's clarifying question to the user.
-  let parsed: any
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    // Sometimes the model wraps in fences despite the system instruction.
-    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
-    try {
-      parsed = JSON.parse(cleaned)
-    } catch {
-      return { kind: 'failed', reason: `non-JSON response, head: ${raw.slice(0, 120)}`, tokensUsed }
-    }
+  const parsed: any = parseSpec(raw)
+  if (parsed === undefined) {
+    return { kind: 'failed', reason: `non-JSON response, head: ${raw.slice(0, 120)}`, tokensUsed }
   }
   if (parsed?.error === 'VAGUE' && typeof parsed.askUser === 'string') {
     return { kind: 'vague', askUser: parsed.askUser, tokensUsed }

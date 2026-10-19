@@ -68,14 +68,20 @@ export async function GET(
         d = r.details ? JSON.parse(r.details) : {}
       } catch { /* legacy free-text */ }
       const explained = explainAutonomyEvent(d)
+      // Only a recorded 'confirmed' outcome is a verified fix. A change that ran
+      // without one is still shown, and says so, so a toast never implies a
+      // repair worked when nothing confirmed it.
+      const verified = d.verification === 'confirmed'
+      const note = verified ? '' : ' (it ran, but could not be confirmed)'
       return {
         id: r.id,
         action: r.action,
         at: r.timestamp.toISOString(),
-        what: explained.what,
+        what: `${explained.what}${note}`,
         why: explained.why,
-        full: explained.full,
+        full: `${explained.full}${note}`,
         kind: explained.kind,
+        verified,
         // Source data — useful for downstream filters in the UI (e.g. "show
         // only the database section's events" by inspecting tableName).
         tableName: d.tableName ?? d.table ?? null,

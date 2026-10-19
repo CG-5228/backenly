@@ -1,42 +1,74 @@
 /**
  * LLM COST TRACKER (#14)
  * =======================
- * Tracks real token usage and cost for every OpenAI call.
+ * Tracks real token usage and cost for every model call, OpenAI or Claude.
  * Records to the AiUsage model and aggregates per project per month.
  *
- * Pricing (USD per 1M tokens, as of 2025):
- *   gpt-4o         input: $2.50   output: $10.00
- *   gpt-4o-mini    input: $0.15   output: $0.60
- *   gpt-4-turbo    input: $10.00  output: $30.00
- *   gpt-4          input: $30.00  output: $60.00
- *   gpt-3.5-turbo  input: $0.50   output: $1.50
+ * Pricing (USD per 1M tokens):
+ *   gpt-4o            input: $2.50   output: $10.00
+ *   gpt-4o-mini       input: $0.15   output: $0.60
+ *   gpt-4-turbo       input: $10.00  output: $30.00
+ *   gpt-4             input: $30.00  output: $60.00
+ *   gpt-3.5-turbo     input: $0.50   output: $1.50
+ *   claude-opus-4-6   input: $5.00   output: $25.00 (Anthropic list price)
+ *
+ * Caching is priced per model family. OpenAI bills a cache read at a quarter of
+ * the input price and charges nothing extra to write one. Claude bills a read at
+ * a tenth, and a write at 1.25x (5-minute entry) or 2x (1-hour entry).
  *
  * Alerts when a single request is unexpectedly expensive.
  */
+
+import { canonicalModel, isClaudeModel } from './llm/models'
 
 // ─── Model pricing table (USD per 1M tokens) ──────────────────────────────────
 interface ModelPricing {
   inputPer1M: number
   outputPer1M: number
+  /** A cache read, as a fraction of the input price. */
+  cacheReadMult: number
+  /** Writing a 5-minute cache entry, as a fraction of the input price. */
+  cacheWrite5mMult: number
+  /** Writing a 1-hour cache entry, as a fraction of the input price. */
+  cacheWrite1hMult: number
 }
 
+const OPENAI_CACHE = { cacheReadMult: 0.25, cacheWrite5mMult: 1, cacheWrite1hMult: 1 } as const
+const CLAUDE_CACHE = { cacheReadMult: 0.1, cacheWrite5mMult: 1.25, cacheWrite1hMult: 2 } as const
+
 const MODEL_PRICING: Record<string, ModelPricing> = {
-  // gpt-4.1 family — the brain's actual smart model (see lib/ai/model-router).
+  // gpt-4.1 family — the OpenAI provider's default for most purposes (lib/ai/llm/config.ts).
   // Absent from this table until 2026-07-26, which made every brain call fall
   // through the prefix loop below onto legacy 'gpt-4' at $30/$60 and report
   // ~12x the real cost. 326,874 recorded tokens were billed at $9.87 when the
   // true figure was $0.85.
-  'gpt-4.1':         { inputPer1M: 2.00,  outputPer1M: 8.00  },
-  'gpt-4.1-mini':    { inputPer1M: 0.40,  outputPer1M: 1.60  },
-  'gpt-4.1-nano':    { inputPer1M: 0.10,  outputPer1M: 0.40  },
-  'gpt-4o':          { inputPer1M: 2.50,  outputPer1M: 10.00 },
-  'gpt-4o-mini':     { inputPer1M: 0.15,  outputPer1M: 0.60  },
-  'gpt-4-turbo':     { inputPer1M: 10.00, outputPer1M: 30.00 },
-  'gpt-4':           { inputPer1M: 30.00, outputPer1M: 60.00 },
-  'gpt-3.5-turbo':   { inputPer1M: 0.50,  outputPer1M: 1.50  },
+  'gpt-4.1':         { inputPer1M: 2.00,  outputPer1M: 8.00,  ...OPENAI_CACHE },
+  'gpt-4.1-mini':    { inputPer1M: 0.40,  outputPer1M: 1.60,  ...OPENAI_CACHE },
+  'gpt-4.1-nano':    { inputPer1M: 0.10,  outputPer1M: 0.40,  ...OPENAI_CACHE },
+  'gpt-4o':          { inputPer1M: 2.50,  outputPer1M: 10.00, ...OPENAI_CACHE },
+  'gpt-4o-mini':     { inputPer1M: 0.15,  outputPer1M: 0.60,  ...OPENAI_CACHE },
+  'gpt-4-turbo':     { inputPer1M: 10.00, outputPer1M: 30.00, ...OPENAI_CACHE },
+  'gpt-4':           { inputPer1M: 30.00, outputPer1M: 60.00, ...OPENAI_CACHE },
+  'gpt-3.5-turbo':   { inputPer1M: 0.50,  outputPer1M: 1.50,  ...OPENAI_CACHE },
+  // Bedrock ids (global.anthropic.claude-opus-4-6-v1) resolve here through
+  // canonicalModel. Bedrock bills Claude through AWS Marketplace; the
+  // invoice, not this table, is the record of what AWS charged.
+  'claude-opus-4-6': { inputPer1M: 5.00,  outputPer1M: 25.00, ...CLAUDE_CACHE },
 }
 
-const DEFAULT_PRICING: ModelPricing = { inputPer1M: 2.00, outputPer1M: 8.00 }
+const DEFAULT_PRICING: ModelPricing = { inputPer1M: 2.00, outputPer1M: 8.00, ...OPENAI_CACHE }
+
+/**
+ * A Claude model missing from the table is priced as Opus 4.6, the most
+ * expensive Claude model routed here, so an unknown one is never under-counted.
+ */
+const CLAUDE_FALLBACK: ModelPricing = MODEL_PRICING['claude-opus-4-6']
+
+/** Prompt tokens written to the cache, by entry lifetime. */
+export interface CacheWrite {
+  tokens5m?: number
+  tokens1h?: number
+}
 
 /** Alert if a single request costs more than this (USD) */
 const SINGLE_REQUEST_ALERT_THRESHOLD = 0.10
@@ -44,57 +76,75 @@ const SINGLE_REQUEST_ALERT_THRESHOLD = 0.10
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Calculate the USD cost for a given model and token counts.
+ * Prompt tokens split by how they bill. Clamped so no reading can exceed the
+ * prompt or produce a negative bill.
  */
-/**
- * Fraction of the input price charged for tokens served from OpenAI's prompt
- * cache. Cached input bills at 25% on the gpt-4o and gpt-4.1 families.
- *
- * This matters far more here than it looks. The brain sends `BRAIN_TOOLS`
- * (~15.7k tokens) plus a fixed system prompt as the first thing in every single
- * request, byte-identical across every turn, every project and every user — a
- * textbook cacheable prefix. Treating those tokens as full price overstated the
- * cost of the loop's dominant component by 4x, on top of the gpt-4 prefix bug.
- */
-const CACHED_INPUT_MULTIPLIER = 0.25
+function splitPrompt(promptTokens: number, cachedTokens: number, cacheWrite: CacheWrite) {
+  const read = Math.max(0, Math.min(cachedTokens, promptTokens))
+  const write5m = Math.max(0, Math.min(cacheWrite.tokens5m ?? 0, promptTokens - read))
+  const write1h = Math.max(0, Math.min(cacheWrite.tokens1h ?? 0, promptTokens - read - write5m))
+  return { read, write5m, write1h, fresh: promptTokens - read - write5m - write1h }
+}
+
+/** Prompt tokens in units of a fresh input token, at this model's cache prices. */
+function weightedPrompt(pricing: ModelPricing, promptTokens: number, cachedTokens: number, cacheWrite: CacheWrite): number {
+  const p = splitPrompt(promptTokens, cachedTokens, cacheWrite)
+  return (
+    p.fresh +
+    p.read * pricing.cacheReadMult +
+    p.write5m * pricing.cacheWrite5mMult +
+    p.write1h * pricing.cacheWrite1hMult
+  )
+}
 
 /**
- * `cachedTokens` is the subset of `promptTokens` OpenAI served from cache
- * (`usage.prompt_tokens_details.cached_tokens`). Omit it and behaviour is
- * unchanged — every prompt token bills at full rate.
+ * Calculate the USD cost for a given model and token counts.
+ *
+ * `promptTokens` is every prompt token. `cachedTokens` is the subset read from
+ * the cache (OpenAI's `prompt_tokens_details.cached_tokens`, Claude's
+ * `cache_read_input_tokens`), and `cacheWrite` the subset written to it, which
+ * only Claude reports. Omit both and every prompt token bills at full rate.
+ *
+ * Cache reads matter far more here than they look. The brain sends its tool
+ * catalog (~15.7k tokens) plus a fixed system prompt first in every request,
+ * byte-identical across turns, projects and users — a textbook cacheable
+ * prefix. Pricing those tokens at full rate overstated the cost of the loop's
+ * dominant component by 4x on OpenAI, and would by 10x on Claude.
  */
 export function calculateCost(
   model: string,
   promptTokens: number,
   completionTokens: number,
   cachedTokens = 0,
+  cacheWrite: CacheWrite = {},
 ): number {
   const pricing = resolvePricing(model)
-  // Clamp: cached can never exceed prompt, and a bad reading must not produce a
-  // negative bill.
-  const cached = Math.max(0, Math.min(cachedTokens, promptTokens))
-  const fresh = promptTokens - cached
-  const inputCost =
-    (fresh / 1_000_000) * pricing.inputPer1M +
-    (cached / 1_000_000) * pricing.inputPer1M * CACHED_INPUT_MULTIPLIER
+  const inputCost = (weightedPrompt(pricing, promptTokens, cachedTokens, cacheWrite) / 1_000_000) * pricing.inputPer1M
   const outputCost = (completionTokens / 1_000_000) * pricing.outputPer1M
   return parseFloat((inputCost + outputCost).toFixed(6))
 }
 
 /**
  * Tokens weighted by what they actually cost us, for metering against a user's
- * credit balance. A cached prompt token is a quarter of a fresh one, so billing
- * it as a whole one charges the user four times over for a catalog they did not
- * ask for and we did not re-pay for.
+ * credit balance. A cached prompt token is a fraction of a fresh one (a quarter
+ * on OpenAI, a tenth on Claude), so billing it as a whole one charges the user
+ * several times over for a catalog they did not ask for and we did not re-pay
+ * for. A Claude cache write costs more than a fresh token, and is metered so.
+ *
+ * Without `model`, OpenAI's cache prices apply, as they always have here.
  *
  * This is what makes a long multi-step build affordable: iteration 1 pays for
- * the tool catalog, iterations 2..N read it from cache, and the credit meter now
+ * the tool catalog, iterations 2..N read it from cache, and the credit meter
  * reflects that instead of charging 15.7k tokens per step.
  */
-export function effectiveTokens(promptTokens: number, completionTokens: number, cachedTokens = 0): number {
-  const cached = Math.max(0, Math.min(cachedTokens, promptTokens))
-  const fresh = promptTokens - cached
-  return Math.round(fresh + cached * CACHED_INPUT_MULTIPLIER + completionTokens)
+export function effectiveTokens(
+  promptTokens: number,
+  completionTokens: number,
+  cachedTokens = 0,
+  opts: { model?: string; cacheWrite?: CacheWrite } = {},
+): number {
+  const pricing = opts.model ? resolvePricing(opts.model) : DEFAULT_PRICING
+  return Math.round(weightedPrompt(pricing, promptTokens, cachedTokens, opts.cacheWrite ?? {}) + completionTokens)
 }
 
 /**
@@ -117,11 +167,13 @@ export async function recordAiUsage(
   completionTokens: number,
   endpoint: string,
   cachedTokens = 0,
+  cacheWrite: CacheWrite = {},
 ): Promise<void> {
   try {
     const { prisma } = await import('@/lib/db/prisma')
-    const cost = calculateCost(model, promptTokens, completionTokens, cachedTokens)
+    const cost = calculateCost(model, promptTokens, completionTokens, cachedTokens, cacheWrite)
     const totalTokens = promptTokens + completionTokens
+    const cacheWriteTokens = (cacheWrite.tokens5m ?? 0) + (cacheWrite.tokens1h ?? 0)
 
     await prisma.aiUsage.create({
       data: {
@@ -136,7 +188,12 @@ export async function recordAiUsage(
         // brain cost, and there is no column for it — `metadata` is Json, so
         // record it there rather than migrate. Lets a query answer "what share
         // of our prompt tokens are we actually re-paying for?"
-        metadata: { cachedTokens, cacheHitRate: promptTokens > 0 ? +(cachedTokens / promptTokens).toFixed(3) : 0 },
+        metadata: {
+          cachedTokens,
+          cacheReadTokens: cachedTokens,
+          cacheWriteTokens,
+          cacheHitRate: promptTokens > 0 ? +(cachedTokens / promptTokens).toFixed(3) : 0,
+        },
       },
     })
 
@@ -252,14 +309,15 @@ const PRICING_PREFIXES = Object.entries(MODEL_PRICING).sort(
 )
 
 function resolvePricing(model: string): ModelPricing {
+  const name = canonicalModel(model)
   // Exact match
-  if (MODEL_PRICING[model]) return MODEL_PRICING[model]
+  if (MODEL_PRICING[name]) return MODEL_PRICING[name]
 
   // Longest-prefix match (e.g. "gpt-4.1-mini-2025-04-14" → "gpt-4.1-mini",
   // never the shorter "gpt-4.1" and never bare "gpt-4").
   for (const [key, pricing] of PRICING_PREFIXES) {
-    if (model.startsWith(key)) return pricing
+    if (name.startsWith(key)) return pricing
   }
 
-  return DEFAULT_PRICING
+  return isClaudeModel(model) ? CLAUDE_FALLBACK : DEFAULT_PRICING
 }

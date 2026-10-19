@@ -96,11 +96,13 @@ describe('no cadence throttle survives anywhere', () => {
     expect(block).not.toMatch(/cron\.schedule\('[\d*\/ ]*\d+ \* \* \*'/)
   })
 
-  it('the background monitor does not fall back to an hourly floor', () => {
+  it('the background monitor does not gate the loop on a cadence at all', () => {
+    // Its cadence floor bounded the retired agent orchestrator's model calls.
+    // With that gone it runs the reconciler every time it is called, so no
+    // interval, fallback or "next scan due" check may come back.
     const src = read('lib/ai/background-monitor.ts')
-    const m = src.match(/AUTONOMY_SCAN_INTERVAL_MIN\)\s*\|\|\s*(\d+)\)/)
-    expect(m).not.toBeNull()
-    expect(Number(m![1])).toBe(1)
+    expect(src).toContain('runReconciler(projectId)')
+    expect(src).not.toMatch(/AUTONOMY_SCAN_INTERVAL_MIN|autonomyScanIntervalMin|nextScanDue/)
   })
 })
 

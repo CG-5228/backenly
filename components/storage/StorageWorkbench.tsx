@@ -45,8 +45,11 @@ import {
 import { FOCUS_INSET } from '@/components/console/tokens'
 import { POLICY_LABELS, type AccessPolicy } from '@/lib/storage/access-policy'
 import { BucketPolicyDialog } from '@/components/storage/BucketPolicyDialog'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 const ALL_BUCKETS = '__all__'
+/** Rows fetched per page — the route clamps at 500. */
+const FILE_PAGE_SIZE = 200
 
 const TH_BASE = 'h-[36px] whitespace-nowrap border-b border-white/[0.06] px-3 text-[12px] font-medium text-zinc-500'
 const TH = `${TH_BASE} text-left`
@@ -110,11 +113,17 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
 
   const [buckets, setBuckets] = useState<StorageBucket[]>([])
   const [files, setFiles] = useState<StorageFile[]>([])
+  // What the SERVER holds vs what is loaded. The old fetch took the route's
+  // first page (100 rows) and every count, "Select all" and delete-bucket
+  // confirmation treated it as the whole project.
+  const [serverTotal, setServerTotal] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [stats, setStats] = useState<StorageStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [projectId, setProjectId] = useState<string | null>(projectIdProp ?? null)
   const [project, setProject] = useState<Project | null>(null)
+  const agent = useAgentConnection(projectId)
 
   const [actionError, setActionError] = useState<string | null>(null)
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
@@ -166,15 +175,16 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
     if (!activePid) return
     try {
       setLoading(true)
-      const [bucketsResult, filesData, statsData] = await Promise.all([
+      const [bucketsResult, filesPage, statsData] = await Promise.all([
         getBucketsWithCaveat(activePid),
-        getFiles({ projectId: activePid }),
+        getFiles({ projectId: activePid, limit: FILE_PAGE_SIZE }),
         getStorageStats(activePid),
       ])
       const bucketsData = bucketsResult.buckets
       setCdnServesPublicObjects(bucketsResult.cdnServesPublicObjects)
       setBuckets(bucketsData)
-      setFiles(filesData)
+      setFiles(filesPage.files)
+      setServerTotal(filesPage.total)
       setStats(statsData)
     } catch (error) {
       console.error('Failed to fetch storage data:', error)
@@ -200,7 +210,7 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
   const selectedFile = selectedFileId ? files.find((f) => f.id === selectedFileId) ?? null : null
 
   const totalStorage = toNum(stats?.totalSize) || files.reduce((sum, f) => sum + toNum(f.size), 0)
-  const totalFiles = stats?.totalFiles ?? files.length
+  const totalFiles = stats?.totalFiles ?? serverTotal
   const totalBuckets = buckets.length
 
   const maxStorage = project?.storageLimit ? toNum(project.storageLimit) : 1 * 1024 * 1024 * 1024
@@ -213,7 +223,26 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
   const isStorageWarning = storagePercentage >= 80
   const isStorageCritical = storagePercentage >= 95
 
-  const countFor = (bucketName: string) => files.filter((f) => f.bucket === bucketName).length
+  const loadMoreFiles = async () => {
+    if (!projectId || loadingMore || files.length >= serverTotal) return
+    setLoadingMore(true)
+    try {
+      const page = await getFiles({ projectId, limit: FILE_PAGE_SIZE, offset: files.length })
+      setFiles((prev) => [...prev, ...page.files])
+      setServerTotal(page.total)
+    } catch (error) {
+      console.error('Failed to load more files:', error)
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  // Bucket counts come from the SERVER's per-bucket stats, never from the
+  // loaded page: counting the truncated array under-reported every bucket
+  // past the first page, including the delete-bucket confirmation.
+  const countFor = (bucketName: string) =>
+    buckets.find((b) => b.name === bucketName)?.fileCount
+      ?? files.filter((f) => f.bucket === bucketName).length
   const sizeFor = (bucketName: string) =>
     stats?.buckets.find((b) => b.name === bucketName)?.totalSize
       ?? files.filter((f) => f.bucket === bucketName).reduce((s, f) => s + toNum(f.size), 0)
@@ -585,8 +614,19 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
                     {selectedBucket === ALL_BUCKETS ? 'All buckets' : selectedBucket}
                   </h2>
                   <span className="whitespace-nowrap text-[12px] tabular-nums text-zinc-500">
-                    {filteredFiles.length.toLocaleString()} {filteredFiles.length === 1 ? 'object' : 'objects'}
+                    {files.length < serverTotal
+                      ? `${filteredFiles.length.toLocaleString()} of ${(selectedBucket === ALL_BUCKETS ? serverTotal : countFor(selectedBucket)).toLocaleString()} loaded`
+                      : `${filteredFiles.length.toLocaleString()} ${filteredFiles.length === 1 ? 'object' : 'objects'}`}
                   </span>
+                  {files.length < serverTotal && (
+                    <button
+                      onClick={loadMoreFiles}
+                      disabled={loadingMore}
+                      className="whitespace-nowrap text-[12px] font-medium text-violet-300/90 underline underline-offset-2 transition-colors hover:text-violet-200 disabled:opacity-50"
+                    >
+                      {loadingMore ? 'Loading…' : 'Load more'}
+                    </button>
+                  )}
                   {selectedBucket !== ALL_BUCKETS && (
                     <span className="hidden sm:inline whitespace-nowrap text-[12px] tabular-nums text-zinc-600">
                       {formatFileSize(toNum(sizeFor(selectedBucket)))}
@@ -649,12 +689,14 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
                       totalBuckets === 0 ? (
                         <div className="flex w-full flex-col items-center gap-4">
                           <AgentPrompt prompt="Add profile photo uploads: a private bucket, and only the owner can read their files." />
-                          <KitButton
-                            icon={Sparkles}
-                            onClick={() => router.push(projectId ? `/app/projects/${projectId}/connect` : '/app')}
-                          >
-                            Connect your agent
-                          </KitButton>
+                          {agent.needsConnect && (
+                            <KitButton
+                              icon={Sparkles}
+                              onClick={() => router.push(projectId ? `/app/projects/${projectId}/connect` : '/app')}
+                            >
+                              Connect your agent
+                            </KitButton>
+                          )}
                         </div>
                       ) : undefined
                     }

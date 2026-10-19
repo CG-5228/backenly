@@ -11,8 +11,9 @@
 
 import { type ReactNode } from 'react'
 import { usePathname } from 'next/navigation'
-import { FolderKanban, Gauge, Users, CreditCard, Settings } from 'lucide-react'
+import { FolderKanban, Gauge, Users, CreditCard, LifeBuoy, Settings } from 'lucide-react'
 import { CLOUD_CONTROL_PLANE } from '@cloud/control-plane'
+import { useOrgHrefs } from '@cloud/org-routing'
 import {
   AccountMenu,
   AccountScope,
@@ -33,9 +34,18 @@ import {
  * routing to a page it does not contain. CLOUD_CONTROL_PLANE is a build-time
  * constant that is true exactly when those files are present. It gates
  * PRESENTATION only; every access decision stays server-side.
+ *
+ * Backenly Cloud scopes Projects, Usage, Members and Billing to an
+ * organization (/app/org/[orgId]...), so their hrefs come from `useOrgHrefs`
+ * and their active row matches both shapes.
  */
+const ORG_ROOT = /^\/app\/org\/[^/]+\/?$/
+const ORG_MEMBERS = /^\/app\/org\/[^/]+\/members/
+const ORG_USAGE = /^\/app\/org\/[^/]+\/usage/
+const ORG_BILLING = /^\/app\/org\/[^/]+\/billing/
+
 const NAV = [
-  { id: 'projects', title: 'Projects',          icon: FolderKanban, href: '/app',          match: (p: string) => p === '/app' || p === '/app/' },
+  { id: 'projects', title: 'Projects',          icon: FolderKanban, match: (p: string) => p === '/app' || p === '/app/' || ORG_ROOT.test(p) },
   // Usage is a billing-cycle surface: it reads /api/billing/usage (overlay-only)
   // and renders consumption against plan ceilings. A self-hosted deployment has
   // no billing cycle and no ceilings — every self-host entitlement is null —
@@ -43,9 +53,14 @@ const NAV = [
   // build it showed "Could not load usage data" because its endpoint is absent.
   ...(CLOUD_CONTROL_PLANE
     ? ([
-        { id: 'usage',    title: 'Usage',             icon: Gauge,        href: '/app/usage',    match: (p: string) => p.startsWith('/app/usage') },
-        { id: 'members',  title: 'Members',           icon: Users,        href: '/app/members',  match: (p: string) => p.startsWith('/app/members') },
-        { id: 'billing',  title: 'Billing', icon: CreditCard,   href: '/app/billing',  match: (p: string) => p.startsWith('/app/billing') },
+        { id: 'usage',    title: 'Usage',             icon: Gauge,        match: (p: string) => p.startsWith('/app/usage') || ORG_USAGE.test(p) },
+        { id: 'members',  title: 'Members',           icon: Users,        match: (p: string) => p.startsWith('/app/members') || ORG_MEMBERS.test(p) },
+        { id: 'billing',  title: 'Billing', icon: CreditCard,   match: (p: string) => p.startsWith('/app/billing') || ORG_BILLING.test(p) },
+        // Support is Cloud-gated for the same reason as Usage: behind the form
+        // is Backenly's support team, which a self-hosted deployment does not
+        // have. Cases belong to the person, not an organization, so the href is
+        // static rather than org-routed.
+        { id: 'support',  title: 'Support', icon: LifeBuoy,     href: '/app/support', match: (p: string) => p.startsWith('/app/support') },
       ] as const)
     : ([] as const)),
   // HIDDEN 2026-07-19 — referral program parked for now. Backend (signup ?ref=,
@@ -56,6 +71,11 @@ const NAV = [
 export function OrgShell({ children }: { children: ReactNode }) {
   const pathname = usePathname() ?? ''
   const settingsActive = pathname.startsWith('/app/settings')
+  const orgHrefs = useOrgHrefs()
+  // Org-scoped surfaces take their hrefs from the org-routing seam; an item
+  // with its own `href` (Support) is account-level on every edition.
+  const hrefOf = (item: (typeof NAV)[number]) =>
+    'href' in item ? item.href : orgHrefs[item.id as keyof typeof orgHrefs]
 
   const bar = (
     <ConsoleBar>
@@ -82,7 +102,7 @@ export function OrgShell({ children }: { children: ReactNode }) {
     >
       <NavGroup first>
         {NAV.map((item) => (
-          <NavItem key={item.id} href={item.href} icon={item.icon} label={item.title} active={item.match(pathname)} />
+          <NavItem key={item.id} href={hrefOf(item)} icon={item.icon} label={item.title} active={item.match(pathname)} />
         ))}
       </NavGroup>
     </SidebarNav>

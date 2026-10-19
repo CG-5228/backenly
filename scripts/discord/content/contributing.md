@@ -15,7 +15,7 @@ Apache-2.0 is permissive: use, modify, and redistribute, including commercially 
 ## A local instance
 
 ```bash
-cp .env.example .env    # fill in OPENAI_API_KEY; the rest have defaults
+cp .env.example .env    # set an AI provider key (ANTHROPIC_API_KEY or OPENAI_API_KEY); the rest have defaults
 docker compose -f docker-compose.dev.yml up -d
 npm install
 npm run db:push

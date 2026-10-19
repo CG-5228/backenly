@@ -1,8 +1,17 @@
 # Backenly
 
-> Backenly is a backend platform operated by coding agents over MCP or the CLI: PostgreSQL tables in a per-project schema, REST APIs, end-user auth, storage, realtime, functions and third-party integrations. Every change goes through one governed kernel that plans, applies, verifies and journals it; destructive and high-risk changes wait for a human.
+> Backenly is an autonomous backend platform built for coding agents. Coding agents can build a real production backend with Postgres, APIs, auth, storage, realtime and functions through MCP. Once it's built, Backenly autonomously maintains the backend, detects and fixes issues, and can restructure the system as it evolves, while keeping risky or destructive actions human-controlled, verified and reversible.
 
-This is the index. Each topic below is its own document: fetch one with `fetch_docs { topic: "<topic>" }` or from its URL.
+## What Backenly is
+
+- **Built through your coding agent.** Claude Code, Codex, Cursor, Antigravity, Cline or any other MCP client builds the backend through Backenly's MCP server or CLI. The dashboard is for oversight: inspecting the backend, approving parked actions, reading the change history.
+- **A real backend.** Each project has its own PostgreSQL schema, and REST endpoints are live the moment a table exists, served by PostgREST. Each project also gets auth for the app's own users, file storage, realtime, functions with schedules, signed webhooks, provider integrations (Stripe, Resend, OpenAI, Anthropic, PostHog), deploys with rollback, and preview branches on Backenly Cloud.
+- **Governed change.** Every structural change made through Backenly is checkpointed before it runs, applied, and verified against the live database by checks the caller cannot weaken; one that fails is recovered automatically when that is provably lossless, and otherwise waits for a person, who can also restore the state before any change. Reads stay open: read-only SQL or a direct Postgres connection.
+- **Autonomous maintenance.** A loop watches each active project. On its own it applies only additive, snapshotted fixes it can verify and reverse: missing indexes, drift it can reconcile, broken triggers. Schema restructuring runs as a staged expand-and-contract plan, only with the owner's consent and only when every step can be undone; the final step, dropping the old structure, is always left to a human. Anything the loop will not apply becomes a finding with evidence. It runs no model and draws no AI credits.
+- **Humans approve the risky calls.** Destructive or irreversible actions, such as dropping a table, deploying, rolling back or revoking a key, are parked until a human approves them on the project's **Autonomy** page. The approved call runs exactly as it was made.
+- **Open source.** The platform, autonomy engine included, is Apache-2.0 at https://github.com/backenly/backenly, and the SDK, CLI and MCP server are MIT. Self-host it (one deployment serves one project) or use Backenly Cloud at https://backenly.com, which has a free plan. Current plans and prices: https://backenly.com/pricing.
+
+The rest of this file is the index for coding agents. Each topic below is its own document: fetch one with `fetch_docs { topic: "<topic>" }` or from its URL.
 
 ## Connect
 
@@ -13,7 +22,7 @@ claude mcp add backenly -- npx -y @backenly/mcp-server --project <id> --key <sco
 claude mcp add --transport http backenly https://backenly.com/api/mcp --header "x-api-key: <scoped-key>"
 ```
 
-The remote endpoint also accepts a browser sign-in instead of a key. Other hosts (Codex, Cursor, Antigravity, Cline) are in `client-setup`.
+The remote endpoint also accepts a browser sign-in instead of a key. Other hosts (Codex, Cursor, Antigravity, Cline) are in `client-setup`. The agent skill is at https://backenly.com/skill.md.
 
 **If the Backenly tools are not in this conversation** (you registered the server during it), do not ask your human to restart. The CLI calls the same tools with the same key and the same governance:
 
@@ -40,7 +49,7 @@ Exactly **23** tools are advertised; `tools/list` is the authority. Every tool e
 
 | Tool | What it is for |
 | --- | --- |
-| `read_backend_state` | The read door for state. No arguments: the overview. `section` drills in: `schema`, `instructions`, `tables`, `apis`, `buckets`, `files`, `keys`, `users`, `rls`, `triggers`, `functions`, `cron`, `integrations`, `apps`, `env`, `webhooks`, `findings`, `incidents`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `autonomy`, `maintenance`, `evolution`, `realtime`. |
+| `read_backend_state` | The read door for state. No arguments: the overview. `section` drills in: `schema`, `instructions`, `tables`, `apis`, `buckets`, `files`, `keys`, `users`, `rls`, `triggers`, `functions`, `cron`, `integrations`, `apps`, `env`, `webhooks`, `deliveries`, `findings`, `incidents`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `autonomy`, `maintenance`, `evolution`, `realtime`. |
 | `get_table_schema` | One table in full: columns, keys, indexes, CHECK constraints with their permitted values, triggers, RLS policies. |
 | `run_query` | Read-only SQL over the project's schema, as a SELECT-only role. |
 | `apply_migration` | Schema changes as SQL. Every statement is checked before any runs, and anything it cannot map is refused with the tool to use instead; a statement that fails while running stops the migration, and the response lists what was applied and what remains. With `branchId`, it changes that preview branch only. |
@@ -49,7 +58,7 @@ Exactly **23** tools are advertised; `tools/list` is the authority. Every tool e
 | `generate_types` | TypeScript types, a typed client or OpenAPI from the live catalog. |
 | `branch` | Preview branches: `list`, `create`, `connect`, `diff`, `merge`. `create` and `connect` return the branch's preview endpoint and a key bound to it; `merge` replays the branch's migrations onto production once a human approves. |
 | `check_approval` | Poll an action waiting for a human. |
-| `backend_chat` | Plain-English requests to Backenly's own engine. Draws AI credits. |
+| `backend_chat` | Natural-language requests to Backenly's own engine. Draws AI credits. |
 | `fetch_docs` | These docs, one topic at a time. |
 
 One tool per dashboard section, each with an `action`:
@@ -57,21 +66,21 @@ One tool per dashboard section, each with an `action`:
 <!-- generated:section-tools by scripts/generate-agent-docs.ts from lib/mcp/domains.ts; do not edit -->
 | Tool | Actions | Docs |
 | --- | --- | --- |
-| `auth` | `enable`, `add_oauth_provider`, `list_users`, `reset_password`, `unblock_user`, `enable_teams`, `email_settings`, `set_smtp`, `test_smtp`, `set_email_template`, `reset_email_template`; `remove_oauth_provider`, `block_user`, `remove_smtp` wait for approval | https://backenly.com/docs/agents/auth.md |
-| `storage` | `create_bucket`, `set_public`, `list_buckets`, `list_files`, `signed_url`; `delete_file`, `delete_bucket` wait for approval | https://backenly.com/docs/agents/storage.md |
+| `auth` | `enable`, `add_oauth_provider`, `list_users`, `reset_password`, `unblock_user`, `enable_teams`, `email_settings`, `set_email_policy`, `set_smtp`, `test_smtp`, `set_email_template`, `reset_email_template`; `remove_oauth_provider`, `block_user`, `remove_smtp` wait for approval | https://backenly.com/docs/agents/auth.md |
+| `storage` | `create_bucket`, `set_public`, `set_policy`, `list_buckets`, `list_files`, `signed_url`; `delete_file`, `delete_bucket` wait for approval | https://backenly.com/docs/agents/storage.md |
 | `functions` | `create`, `deploy_code`, `list`, `get`, `invoke`, `logs`, `set_active`, `schedule`, `list_schedules`; `delete`, `delete_schedule` wait for approval | https://backenly.com/docs/agents/functions.md |
 | `realtime` | `enable`, `status`; `disable` waits for approval | https://backenly.com/docs/agents/realtime.md |
 | `integrations` | `list`, `capabilities`, `verify`, `connect`, `send_push`; `disconnect` waits for approval | https://backenly.com/docs/agents/integrations.md |
 | `monitoring` | `metrics`, `errors`, `usage`, `incidents`, `request_logs` | https://backenly.com/docs/agents/monitoring.md |
 | `autonomy` | `status`, `findings`, `maintenance`, `evolution`, `set_level` | https://backenly.com/docs/agents/autonomy.md |
 | `webhooks` | `list`, `create`, `update`, `test`, `logs`, `replay`, `rotate_secret`, `triggers`, `trigger_deliveries`, `replay_trigger_delivery`, `rotate_trigger_secret`; `delete` waits for approval | https://backenly.com/docs/agents/webhooks.md |
-| `deploy` | `status`, `history`, `readiness`; `deploy`, `rollback` wait for approval | https://backenly.com/docs/agents/deploy.md |
+| `deploy` | `status`, `history`, `readiness`, `changes`; `deploy`, `rollback`, `revert_change` wait for approval | https://backenly.com/docs/agents/deploy.md |
 | `connect` | `whoami`, `create_api_key`, `list_api_keys`, `set_key_permissions`, `set_env`, `list_env`, `database_credentials`, `connect_frontend`, `list_apps`; `revoke_api_key`, `delete_env`, `disconnect_frontend` wait for approval | https://backenly.com/docs/agents/connect.md |
 <!-- end generated -->
 
 ## Approvals
 
-An action marked "wait for approval" never runs from the call. The exact call is parked, the response carries an `approval` object with its id, and nothing changes until a human approves it on the project's **Autonomy** page; the approved call then runs verbatim, with no model re-reading it. Dropping or truncating a table and discarding a branch go through `backend_chat`, which parks them the same way. Poll `check_approval` every 15–30 seconds until the status is `executed`, `rejected` (do not retry), `expired`, `failed` (nothing was applied) or `partial` (some changes landed; verify state instead of replaying). Details: `autonomy`.
+An action marked "wait for approval" never runs from the call. The exact call is parked, the response carries an `approval` object with its id, and nothing changes until a human approves it on the project's **Autonomy** page; the approved call then runs verbatim, with no model re-reading it. Dropping or truncating a table and discarding a branch go through `backend_chat`, which parks them the same way. Poll `check_approval` every 15–30 seconds until the status is `executed`, `rejected` (do not retry), `expired`, `failed` (approved but the call did not complete — it can stop part-way, so read state to see what landed before retrying) or `partial` (some changes landed; verify state instead of replaying). Details: `autonomy`.
 
 ## Read-only keys
 
@@ -81,6 +90,7 @@ A read-only key or connection sees **16** tools: the read tools, and each sectio
 
 - MCP: the key goes in `x-api-key`, or the remote endpoint signs in through the browser.
 - Your app's runtime API: `x-api-key: <project key>` on every request, and `X-User-Token: <end-user JWT>` for anything row-level security protects. Do not send the project key as `Authorization: Bearer`: the data API reads that header as an end-user JWT and the request fails with 401.
+- The project key is never your MCP key. Create the app's own with `connect { action: "create_api_key", description: "web app" }`: publishable by default (`proj_live_…`), safe in a browser and bound by row-level security; `serviceRole: true` issues a server-only `svc_live_…` key. The runtime API refuses an MCP key (`mcp_live_…`) from anywhere with `MCP_KEY_IN_APP`, and a service-role key from a browser with `SERVICE_ROLE_IN_BROWSER`.
 
 ## Topics
 

@@ -7,12 +7,12 @@
  * This transforms Backenly from "blind execution" to "co-architect mode".
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 import type { BackendStateGraph } from './backend-state-graph'
 import type { SemanticUnderstanding } from './semantic-understanding'
 import type { InferredEntity } from './entity-inference'
 
+import { chat } from '@/lib/ai/llm/chat'
 /**
  * Architectural integration option
  */
@@ -98,8 +98,6 @@ export async function generateIntegrationOptions(
     // BaaS platforms need cohesive data architecture. No need to ask users.
     logger.info('[Integration Planner] Existing schema detected - auto-selecting Fully Integrated')
 
-    const openai = getOpenAIClient()
-
     // Build context for AI
     const existingSchema = Object.keys(graph.entities).map(name => ({
       name,
@@ -111,8 +109,8 @@ export async function generateIntegrationOptions(
       fields: e.fields.map(f => ({ name: f.name, type: f.type }))
     }))
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -168,11 +166,12 @@ Return ONLY valid JSON, no markdown.`
           content: 'Determine optimal integration relationships'
         }
       ],
-      temperature: 0.5,
-      max_tokens: 1200,
+      maxTokens: 1200,
+      json: true,
+      label: 'integration-planner',
     })
 
-    const content = response.choices[0]?.message?.content
+    const content = response.text
     if (!content) {
       throw new Error('No response from AI')
     }

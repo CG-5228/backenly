@@ -108,7 +108,7 @@ export default async function UseCaseSlugPage(props: { params: Promise<{ slug: s
           actions={
             <>
               <StartButton />
-              <ButtonLink href="/resources" variant="secondary">
+              <ButtonLink href="/docs" variant="secondary">
                 Read the docs
               </ButtonLink>
             </>
@@ -270,7 +270,7 @@ export default async function UseCaseSlugPage(props: { params: Promise<{ slug: s
           lede="No credit card. Connect your agent over MCP and judge it by the verification evidence."
         >
           <StartButton />
-          <ButtonLink href="/resources/connect-your-coding-agent" variant="secondary">
+          <ButtonLink href="/docs/connect" variant="secondary">
             Connect your agent
           </ButtonLink>
         </HorizonClose>

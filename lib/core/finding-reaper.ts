@@ -22,19 +22,13 @@
 import { prisma } from '@/lib/db/prisma'
 import { builtEvidenceWhere } from '@/lib/projects/backend-presence'
 
-/** Performance-agent finding families (`${category}_${location}` types). */
-const PERFORMANCE_REAPABLE_PREFIXES = [
-  'unbounded_pagination_',
-  'n_plus_one_risk_',
-  'missing_index_',
-] as const
-
 async function withdraw(
   rows: Array<{ id: string; details: unknown }>,
   marker:
     | 'evolution_reaper'
     | 'agent_reaper'
     | 'invariant_reaper'
+    | 'detector_retired'
     | 'not_built'
     | 'platform_fault'
     | 'locked_down'
@@ -58,117 +52,70 @@ async function withdraw(
 }
 
 /**
- * Withdraw open/pending performance findings the agent no longer detects.
- * Pass `detected` when a fresh agent run is already in hand (background
- * monitor); otherwise this runs the (deterministic, LLM-free) performance
- * agent itself. Returns the number withdrawn; 0 when the agent skipped or
- * errored — silence must never reap real findings.
+ * Withdraw what the agent orchestrator filed (rows carrying `details.agentType`),
+ * now that it no longer runs (docs/autonomy-orchestrator-parity.md). The real
+ * problems among them are found by the canonical detectors, which file their
+ * own findings; the rest were not real problems.
+ *
+ * A finding someone already acted on stays listed, because withdrawing it would
+ * erase that: one a repair touched (`appliedUnverified`, `rollbackData`) and one
+ * a person approved (a HEALTH_FIX_APPROVED audit row naming it). Summaries label
+ * those as coming from a retired check (lib/core/finding-summaries.ts).
+ *
+ * This replaces the two reapers that withdrew orchestrator findings the agents
+ * no longer detected; with the agents gone, nothing would ever re-detect them.
+ * Idempotent: a second run finds nothing to withdraw. A run that withdraws
+ * anything records one audit row with what it withdrew and what it kept.
  */
-export async function reapPerformanceFindings(
+export async function retireOrchestratorFindings(
   projectId: string,
-  detected?: Set<string>,
-): Promise<number> {
-  let detectedSet = detected
-  if (!detectedSet) {
+): Promise<{ withdrawn: number; kept: number }> {
+  const live = await prisma.healthFinding.findMany({
+    where: { projectId, status: { in: ['open', 'pending_approval'] } },
+    select: { id: true, type: true, details: true },
+  })
+  const filed = live.filter(
+    (f) => typeof (f.details as Record<string, unknown> | null)?.agentType === 'string',
+  )
+  if (filed.length === 0) return { withdrawn: 0, kept: 0 }
+
+  const approvals = await prisma.auditLog.findMany({
+    where: { projectId, action: 'HEALTH_FIX_APPROVED' },
+    select: { details: true },
+  })
+  const approved = new Set<string>()
+  for (const a of approvals) {
     try {
-      const { runPerformanceAgent } = await import('@/lib/ai/agents/performance-agent')
-      const { getWorkspaceDatabaseNames } = await import('@/lib/services/databaseProvisioning')
-      const { postgresSchema } = getWorkspaceDatabaseNames(projectId)
-      const rows = await prisma.$queryRawUnsafe<{ table_name: string }[]>(
-        `SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE'`,
-        postgresSchema,
-      )
-      const run = await runPerformanceAgent({ projectId, tables: rows.map(r => r.table_name) })
-      if (run.skipped) return 0
-      detectedSet = new Set(run.findings.map(f => `${f.category}_${f.location}`))
-    } catch {
-      return 0
-    }
+      const id = (JSON.parse(a.details ?? '{}') as { findingId?: unknown }).findingId
+      if (typeof id === 'string') approved.add(id)
+    } catch { /* free-text legacy row */ }
   }
 
-  const open = await prisma.healthFinding.findMany({
-    where: {
-      projectId,
-      status: { in: ['open', 'pending_approval'] },
-      OR: PERFORMANCE_REAPABLE_PREFIXES.map(p => ({ type: { startsWith: p } })),
-    },
-    select: { id: true, type: true, details: true },
-  }).catch(() => [] as Array<{ id: string; type: string; details: unknown }>)
-
-  return withdraw(open.filter(f => !detectedSet!.has(f.type)), 'agent_reaper')
-}
-
-/**
- * Migration-agent finding families (`${category}_${location}` types, written
- * by storeHealthFindings in background-monitor.ts from migration-agent.ts's
- * DRIFT_CATEGORY_MAP). Deliberately excludes 'missing_index_' and
- * 'missing_rls_' — those prefixes are shared with the performance agent /
- * the bare invariant 'missing_rls' type and are already reaped on their own
- * paths; adding them here would race two different detectors' opinions about
- * the same finding.
- */
-const MIGRATION_REAPABLE_PREFIXES = [
-  'missing_table_',
-  'missing_column_',
-  'type_mismatch_',
-  'extra_table_',
-  'extra_column_',
-] as const
-
-/**
- * Withdraw open/pending migration-agent findings (missing_table, missing_column,
- * type_mismatch, extra_table, extra_column) the schema-drift detector no
- * longer supports. Pass `detected` when a fresh migration-agent run is
- * already in hand (background monitor); otherwise this runs detectSchemaDrift
- * itself.
- *
- * detectSchemaDrift swallows its own errors into an empty report indistinguishable
- * from "genuinely no drift" (same shape, no error field) — UNLESS it never found a
- * snapshot to compare against, in which case `report.snapshotVersion` is absent.
- * `snapshotVersion` is present ONLY on the real success path, so it doubles as the
- * "this scan actually compared against something" signal this reaper needs: without
- * it we cannot tell a clean scan from a silent failure, and reaping on that
- * ambiguity risks withdrawing real findings the probe simply failed to re-detect.
- *
- * This is what was missing for the class of finding a project's own load-test /
- * fuzz harness leaves behind: it builds tables through the AI (captured in a
- * snapshot), drops them when the run ends, and nothing ever re-baselines the
- * snapshot — so `missing_table_<name>` sat open forever with no path back to
- * healthy, inflating "needs attention" counts the reconciler's own invariant
- * probes never touch (this is a different detector entirely).
- */
-export async function reapMigrationFindings(
-  projectId: string,
-  detected?: Set<string>,
-): Promise<number> {
-  let detectedSet = detected
-  if (!detectedSet) {
-    try {
-      const { detectSchemaDrift } = await import('@/lib/ai/schema-reconciler')
-      const report = await detectSchemaDrift(projectId)
-      if (report.snapshotVersion === undefined) return 0 // no confirmed clean compare
-      // Mirror migration-agent.ts's own location join exactly (tableName, or
-      // tableName.columnName for column-level drift) — the persisted finding
-      // type is `${category}_${location}`, so a mismatched join here would
-      // silently never match a real row.
-      detectedSet = new Set(
-        report.drifts.map(d => `${d.type}_${[d.tableName, d.columnName].filter(Boolean).join('.')}`),
-      )
-    } catch {
-      return 0
-    }
+  const actedOn = (f: { id: string; details: unknown }) => {
+    const d = (f.details ?? {}) as Record<string, unknown>
+    return d.appliedUnverified != null || d.rollbackData != null || approved.has(f.id)
   }
+  const retire = filed.filter((f) => !actedOn(f))
+  const kept = filed.length - retire.length
+  const withdrawn = await withdraw(retire, 'detector_retired')
 
-  const open = await prisma.healthFinding.findMany({
-    where: {
-      projectId,
-      status: { in: ['open', 'pending_approval'] },
-      OR: MIGRATION_REAPABLE_PREFIXES.map(p => ({ type: { startsWith: p } })),
-    },
-    select: { id: true, type: true, details: true },
-  }).catch(() => [] as Array<{ id: string; type: string; details: unknown }>)
-
-  return withdraw(open.filter(f => !detectedSet!.has(f.type)), 'agent_reaper')
+  if (withdrawn > 0) {
+    await prisma.auditLog.create({
+      data: {
+        projectId,
+        action: 'AUTONOMY_DETECTOR_RETIRED',
+        type: 'autonomy',
+        details: JSON.stringify({
+          withdrawn,
+          kept,
+          types: [...new Set(retire.map((f) => f.type))].slice(0, 25),
+          findingIds: retire.map((f) => f.id).slice(0, 100),
+        }),
+        timestamp: new Date(),
+      },
+    }).catch(() => {})
+  }
+  return { withdrawn, kept }
 }
 
 /**
@@ -462,19 +409,19 @@ export async function reapObserverFindings(
  */
 export async function reapStaleFindings(
   projectId: string,
-): Promise<{ arch: number; performance: number; drift: number; invariants: number; migration: number }> {
-  const [arch, performance, drift, invariants, migration] = await Promise.all([
+): Promise<{ arch: number; retired: number; drift: number; invariants: number }> {
+  const [arch, retired, drift, invariants] = await Promise.all([
     reapArchFindings(projectId).catch(() => 0),
-    reapPerformanceFindings(projectId).catch(() => 0),
+    // What the retired agent orchestrator filed, so a Re-scan clears it too.
+    retireOrchestratorFindings(projectId).then(r => r.withdrawn).catch(() => 0),
     // Open-loop drift: withdraw external_schema_change once nothing is pending
     // (adopted or ignored) — the claim no longer describes current state.
     import('@/lib/autonomy/drift-watch')
       .then(m => m.reapDriftFindings(projectId))
       .catch(() => 0),
     reapInvariantFindings(projectId).catch(() => 0),
-    reapMigrationFindings(projectId).catch(() => 0),
   ])
-  return { arch, performance, drift, invariants, migration }
+  return { arch, retired, drift, invariants }
 }
 
 /**

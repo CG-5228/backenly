@@ -20,6 +20,9 @@ import { explainAutonomyEvent } from '@/lib/autonomy/because-copy'
 
 const MIN_SINCE_MS = 60 * 1000 // never look further forward than 1 min ago
 
+/** Most autonomous changes read per request. */
+const CHANGE_SCAN_LIMIT = 1000
+
 export async function GET(
   request: NextRequest,
   props: { params: Promise<{ id: string }> },
@@ -44,13 +47,19 @@ export async function GET(
       since = new Date(Date.now() - MIN_SINCE_MS)
     }
 
-    const [autonomousFixes, escalations, rollbacks, samples] = await Promise.all([
-      prisma.auditLog.count({
+    const [changes, escalations] = await Promise.all([
+      // Every autonomous change, with its details, so each can be classified by
+      // the verification it recorded. Bounded; a project changing more than
+      // this between visits is reported as "at least".
+      prisma.auditLog.findMany({
         where: {
           projectId: validated.projectId,
           timestamp: { gt: since },
           action: { in: AUTONOMOUS_AUDIT_ACTIONS as unknown as string[] },
         },
+        orderBy: { timestamp: 'desc' },
+        take: CHANGE_SCAN_LIMIT,
+        select: { id: true, action: true, timestamp: true, details: true },
       }),
       prisma.auditLog.count({
         where: {
@@ -59,50 +68,48 @@ export async function GET(
           action: 'HEALTH_FIX_ESCALATED',
         },
       }),
-      prisma.auditLog.count({
-        where: {
-          projectId: validated.projectId,
-          timestamp: { gt: since },
-          action: { startsWith: 'ROLLBACK_' },
-        },
-      }),
-      prisma.auditLog.findMany({
-        where: {
-          projectId: validated.projectId,
-          timestamp: { gt: since },
-          action: { in: AUTONOMOUS_AUDIT_ACTIONS as unknown as string[] },
-        },
-        orderBy: { timestamp: 'desc' },
-        take: 5,
-        select: { id: true, action: true, timestamp: true, details: true },
-      }),
     ])
 
-    const examples = samples.map(s => {
+    const classified = changes.map(c => {
       let d: Record<string, any> = {}
       try {
-        d = s.details ? JSON.parse(s.details) : {}
+        d = c.details ? JSON.parse(c.details) : {}
       } catch { /* ignore */ }
-      const explained = explainAutonomyEvent(d)
+      // Only a recorded 'confirmed' outcome is a verified fix. A change that
+      // ran without one is still reported, as exactly that.
+      return { row: c, details: d, verified: d.verification === 'confirmed' }
+    })
+    const verifiedFixes = classified.filter(c => c.verified).length
+    const unverifiedChanges = classified.length - verifiedFixes
+    const atLeast = changes.length === CHANGE_SCAN_LIMIT ? 'at least ' : ''
+
+    const examples = classified.slice(0, 5).map(({ row, details, verified }) => {
+      const explained = explainAutonomyEvent(details)
+      const note = verified ? '' : ' (it ran, but could not be confirmed)'
       return {
-        id: s.id,
-        at: s.timestamp.toISOString(),
-        what: explained.what,
+        id: row.id,
+        at: row.timestamp.toISOString(),
+        what: `${explained.what}${note}`,
         why: explained.why,
-        full: explained.full,
+        full: `${explained.full}${note}`,
         kind: explained.kind,
+        verified,
       }
     })
 
-    // "Total" includes rollbacks — a rollback while the user was away is one
-    // of the most important things to surface (it means Backenly applied a
-    // fix that turned out to be wrong and reverted itself). Leaving it out of
-    // the banner trigger was an MVP-grade omission.
-    const total = autonomousFixes + escalations + rollbacks
+    // Autonomy performs no rollbacks today (its rollback path is not built), so
+    // nothing is counted as one here. The only ROLLBACK_* audit rows are deploy
+    // rollbacks someone requested, which are not something Backenly did on its
+    // own while the user was away.
+    const total = verifiedFixes + unverifiedChanges + escalations
     const parts: string[] = []
-    if (autonomousFixes > 0) parts.push(`handled ${autonomousFixes} thing${autonomousFixes === 1 ? '' : 's'} for you`)
-    if (escalations > 0)     parts.push(`flagged ${escalations} for your review`)
-    if (rollbacks > 0)       parts.push(`rolled back ${rollbacks} change${rollbacks === 1 ? '' : 's'} that didn’t verify`)
+    if (verifiedFixes > 0) {
+      parts.push(`fixed ${atLeast}${verifiedFixes} problem${verifiedFixes === 1 ? '' : 's'}, each confirmed by a re-check`)
+    }
+    if (unverifiedChanges > 0) {
+      parts.push(`made ${atLeast}${unverifiedChanges} change${unverifiedChanges === 1 ? '' : 's'} it could not confirm`)
+    }
+    if (escalations > 0) parts.push(`flagged ${escalations} for your review`)
 
     let headline: string
     if (total === 0) {
@@ -119,9 +126,9 @@ export async function GET(
       projectId: validated.projectId,
       since: since.toISOString(),
       now: new Date().toISOString(),
-      autonomousFixes,
+      autonomousFixes: verifiedFixes,
+      unverifiedChanges,
       escalations,
-      rollbacks,
       total,
       headline,
       examples,

@@ -11,6 +11,8 @@
  */
 
 import { Request, Response, NextFunction } from 'express'
+import { countInRegion, regionalRateCounting, type RateKey } from '@/lib/auth-projection/rate'
+import { clientIpFromNodeRequest } from '@/lib/security/client-ip'
 import crypto from 'crypto'
 import { prisma } from '@/lib/db'
 import { verifyPassword } from '@/lib/auth/password'
@@ -23,6 +25,7 @@ import {
   recordServiceRoleBrowserBlock,
   serviceRoleRefusalMessage,
 } from '@/lib/security/service-role-exposure'
+import { MCP_KEY_HINT, MCP_KEY_IN_APP, isMcpCredential, mcpKeyRefusalMessage } from '@/lib/security/key-placement'
 import { touchProjectActivity } from '@/lib/projects/activity'
 
 export interface V1ApiContext {
@@ -189,6 +192,16 @@ async function enforceHardRateLimit(apiKeyRecord: any): Promise<RateLimitDecisio
 }
 
 /**
+ * Count a request against a key's window: in the region when it counts there
+ * (lib/auth-projection/rate.ts), at home otherwise.
+ */
+export async function enforceKeyRateLimit(key: RateKey): Promise<RateLimitDecision> {
+  const region = regionalRateCounting()
+  if (region) return countInRegion(region, key)
+  return enforceRateLimitByKeyId(key.id)
+}
+
+/**
  * Enforce rate limiting by API key ID.
  * Exported so dynamic.ts (which has its own auth flow) can reuse it.
  */
@@ -235,10 +248,7 @@ export async function v1AuthMiddleware(req: Request, res: Response, next: NextFu
     const origin = (req.headers['origin'] as string | undefined)
       ?? (req.headers['referer'] as string | undefined)
       ?? null
-    const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
-      ?? (req.headers['x-real-ip'] as string | undefined)
-      ?? req.socket?.remoteAddress
-      ?? null
+    const ip = clientIpFromNodeRequest(req)
 
     // Feed the Connection Health dashboard surface — non-blocking.
     // SKIP internal origins (backenly.com, localhost): the dashboard
@@ -281,6 +291,15 @@ export async function v1AuthMiddleware(req: Request, res: Response, next: NextFu
   }
 
   const { apiKeyRecord } = resolved
+
+  // An MCP key is refused by the key-type check below as well, but its wording
+  // ("Dashboard keys") names a different credential and sent agents looking for
+  // one. The runtime's doors refuse it first; this answers the same way for a
+  // request a door let through. lib/security/key-placement.ts.
+  if (isMcpCredential(apiKeyRecord)) {
+    sendError(res, MCP_KEY_IN_APP, mcpKeyRefusalMessage(apiKeyRecord.name ?? null), 403, { hint: MCP_KEY_HINT })
+    return
+  }
 
   if (apiKeyRecord.keyType !== 'public') {
     sendError(

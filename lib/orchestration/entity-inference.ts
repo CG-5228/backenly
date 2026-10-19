@@ -15,7 +15,6 @@
  * - NO blocking on missing fields
  */
 
-import { getOpenAIClient } from '@/lib/ai/openai-service'
 import { logger } from '@/lib/logger'
 import type { SemanticUnderstanding } from './semantic-understanding'
 import type { BackendStateGraph } from './backend-state-graph'
@@ -24,6 +23,7 @@ import { sanitizeAIContext } from '@/lib/ai/context-sanitizer'
 import * as fs from 'fs'
 import * as path from 'path'
 
+import { chat } from '@/lib/ai/llm/chat'
 // ============================================================================
 // DETERMINISTIC INLINE FIELD EXTRACTION
 // Extracts comma-separated field lists from natural language prompts
@@ -344,11 +344,9 @@ export async function inferEntities(
     logger.info('[Entity Inference] No template match, using AI inference with architecture context')
     
     // Get OpenAI client
-    const openai = getOpenAIClient()
-    
     // Call OpenAI with CONTEXT-AWARE prompt
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+    const response = await chat({
+      purpose: 'build.plan',
       messages: [
         {
           role: 'system',
@@ -448,11 +446,11 @@ ${semanticUnderstanding && semanticUnderstanding.probableEntities.length > 0
   : ''}`
         }
       ],
-      temperature: 0.4, // Slightly higher for creativity
-      max_tokens: 4000, // Increased from 1500 to prevent JSON truncation on complex apps
+      maxTokens: 4000,
+      label: 'entity-inference',
     })
 
-    const content = response.choices[0]?.message?.content
+    const content = response.text
     if (!content) {
       throw new Error('No response from AI')
     }

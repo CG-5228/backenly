@@ -22,7 +22,20 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
-import { captureSchemaSnapshot, rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
+import { randomUUID } from 'crypto'
+import { regionRawClient } from '@/lib/data-plane/regional'
+import { HOME_REGION } from '@/lib/regions'
+import {
+  findingDetailsKeptHere,
+  quotedError,
+  quotesKeptHere,
+  recordedFixAction,
+  recordedFixResult,
+  recordedResultMessage,
+  recordedStatements,
+} from '@/lib/data-plane/residency'
+import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
+import { captureSchemaSnapshot } from '@/lib/services/workspace-schema-snapshot'
 import {
   withSqlCapture,
   installSqlRecorder,
@@ -30,7 +43,7 @@ import {
 } from '@/lib/execution/sql-recorder'
 import { classifyFix } from './fix-classifier'
 import { checkBreaker, auditBreakerTrip } from '@/lib/autonomy/circuit-breaker'
-import { evaluateFixOutcome, captureCheckBaseline } from '@/lib/autonomy/desired-state'
+import { evaluateFixOutcome, captureCheckBaseline, type FixOutcome } from '@/lib/autonomy/desired-state'
 import { FLAGS } from '@/lib/config/flags'
 import { withBuildLock } from '@/lib/ai/build-runtime/build-lock'
 import { normalizeFindingType } from './types'
@@ -45,6 +58,17 @@ import {
   samePolicies,
   type PolicyCapture,
 } from '@/lib/autonomy/maintenance/primitives/recovery-restore-policies'
+
+/**
+ * The SQL recorder (lib/execution/sql-recorder.ts) on both home-region clients.
+ * A home project's workspace SQL runs on the home workspace client, not the
+ * platform client (lib/data-plane/regional.ts), and a repair's statements are
+ * mostly that SQL.
+ */
+function installHomeSqlRecorders(): void {
+  installSqlRecorder(prisma as any)
+  installSqlRecorder(regionRawClient(HOME_REGION) as any)
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -128,8 +152,11 @@ async function capturePreFixState(
   projectId: string,
   baseType: FindingType,
   fixAction: Pick<AIAction, 'action' | 'params'>,
+  // An AI proposal knows its action touches the schema even when the finding
+  // type's deterministic repairs do not (intent_drift: the column it adds).
+  opts: { schemaTouching?: boolean } = {},
 ): Promise<{ preSnapshotId: string | null; preMetadata: PreFixMetadata | null; schemaTouching: boolean }> {
-  const schemaTouching = SCHEMA_TOUCHING.has(baseType)
+  const schemaTouching = opts.schemaTouching ?? SCHEMA_TOUCHING.has(baseType)
   const preSnapshot = schemaTouching
     ? await captureSchemaSnapshot(projectId, 'pre_migration').catch(() => null)
     : null
@@ -174,6 +201,34 @@ async function capturePreFixState(
   }
 
   return { preSnapshotId: preSnapshot?.id ?? null, preMetadata, schemaTouching }
+}
+
+/**
+ * Run a fix as governed changes grouped under one id (lib/changes), and say
+ * which changes it made. Its undo restores exactly those, scoped to what they
+ * touched and refused if anything later touched the same tables. The undo this
+ * replaced restored the whole schema to a snapshot, which also archived every
+ * table and column anyone had added since the fix.
+ */
+async function withFixGroup<T>(findingId: string, fn: () => Promise<T>): Promise<{ result: T; changeIds: string[] }> {
+  const { withChangeAttribution, currentAttribution } = await import('@/lib/changes/attribution')
+  const groupId = `fix:${findingId}:${randomUUID().slice(0, 8)}`
+  const result = await withChangeAttribution({ source: currentAttribution()?.source ?? 'autonomy', groupId }, fn)
+  return { result, changeIds: await changesInGroup(groupId) }
+}
+
+/**
+ * The governed changes a fix group made, newest first. The fix has already run
+ * by now, so failing to read them must not make it look as if it had not:
+ * none recorded means its Undo says so (revertEligibility).
+ */
+async function changesInGroup(groupId: string): Promise<string[]> {
+  try {
+    const changes = await prisma.backendChange.findMany({ where: { groupId, kind: 'change' }, orderBy: { seq: 'desc' }, select: { id: true } })
+    return changes.map((c) => c.id)
+  } catch {
+    return []
+  }
 }
 
 // ── Core engine ───────────────────────────────────────────────────────────────
@@ -400,6 +455,10 @@ export async function executeApprovedFix(
   rollbackData?: Record<string, unknown>
   /** Whether the gap was re-probed after the fix and confirmed gone. */
   verification?: FixVerification
+  /** Whether other guarantees were compared before and after the fix. */
+  regressionCheck?: FixOutcome['regressionCheck']
+  /** Nothing ran because the project's region, which keeps what it replays, could not be reached. */
+  regionUnavailable?: boolean
 }> {
   const finding = await prisma.healthFinding.findUnique({ where: { id: findingId } })
   if (!finding) return { success: false, message: 'Finding not found.' }
@@ -410,7 +469,19 @@ export async function executeApprovedFix(
   // correct snapshot/rollback treatment via their canonical base.
   const baseType = (normalizeFindingType(finding.type, details)?.base ?? type) as FindingType
 
-  const fixAction = buildFixAction(finding.type, details)
+  // A held action replays exactly the target and arguments it was held with,
+  // which a project kept in another region keeps there
+  // (lib/operational-memory/held-action-targets.ts). They are read for the
+  // replay only, and nothing runs when they cannot be read.
+  let replayDetails: Record<string, unknown>
+  try {
+    replayDetails = await heldActionForReplay(projectId, findingId, details)
+  } catch (err) {
+    if (!(err instanceof HeldActionUnreadable)) throw err
+    return { success: false, message: err.message, regionUnavailable: err.regionUnreachable }
+  }
+
+  const fixAction = buildFixAction(finding.type, replayDetails)
   if (!fixAction) {
     // Friendly fallback for findings that require user input (e.g. orphan tables,
     // credential rotation). Surfaced verbatim to the dashboard instead of a
@@ -465,7 +536,10 @@ export async function executeApprovedFix(
             rollbackData: {
               fixAction: applied.fixAction,
               statements: applied.statements,
-              rollbackFormat: 2,
+              // Format 3 only when the changes it made were recorded; an
+              // unverified apply from before that stays format 2.
+              rollbackFormat: Array.isArray(applied.changeIds) ? 3 : 2,
+              ...(Array.isArray(applied.changeIds) ? { changeIds: applied.changeIds } : {}),
               snapshotId: applied.snapshotId ?? null,
               fixedAt: applied.at,
               verification: 'confirmed' satisfies FixVerification,
@@ -509,7 +583,13 @@ export async function executeApprovedFix(
   const pre = await capturePreFixState(projectId, baseType, fixAction)
 
   // Baseline for the acceptance gate below (see the autonomous path for why).
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // A failed capture is kept rather than swallowed, so the record says
+  // collateral damage was not checked instead of implying nothing broke.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   // Retry on transient lock contention. A human clicked Approve — the right
   // behaviour is to WAIT for the lock, not bounce the wait back to the user.
@@ -523,12 +603,13 @@ export async function executeApprovedFix(
   // What the executor actually sent to PostgreSQL, for the audit row. Captured
   // at the driver rather than reported by each executor, so a new repair cannot
   // silently record nothing. See lib/execution/sql-recorder.ts.
-  installSqlRecorder(prisma as any)
+  installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
 
+  let changeIds: string[] = []
   for (let attempt = 0; attempt <= BACKOFFS_MS.length; attempt++) {
     try {
-      const captured = await withSqlCapture(() => withBuildLock(
+      const { result: captured, changeIds: madeNow } = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
         projectId,
         'modify',
         async () => executeAction(
@@ -541,11 +622,12 @@ export async function executeApprovedFix(
         ),
         // Human-approved: skip the autonomy cooldown/budget gate (see fn docs).
         { skipCooldown: true },
-      ))
+      )))
       const governed = captured.result
       // Only the attempt that actually ran contributes statements; a lock-
       // contention retry captured nothing and must not append an empty round.
       if (captured.statements.length > 0) statements = captured.statements
+      if (madeNow.length > 0) changeIds = madeNow
       if (governed.error) {
         lastLockError = governed.error
         // Retry on lock-contention. cooldown/budget are skipped above for the
@@ -601,6 +683,7 @@ export async function executeApprovedFix(
   // likely to be approving by hand — the auth pair, whose fix rewires sign-in for
   // every end-user of the project.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     // Same three-outcome rule as the autonomous path. The verifier throwing is
     // not the fix failing and is not the fix working, and a human who clicked
@@ -650,6 +733,7 @@ export async function executeApprovedFix(
       }
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history only — never the undo target.
@@ -657,22 +741,42 @@ export async function executeApprovedFix(
     ? await captureSchemaSnapshot(projectId, 'post_migration').catch(() => null)
     : null
 
+  // What the record keeps of the call (lib/data-plane/residency.ts). A held
+  // action's arguments are its caller's own values, a secret among them
+  // (SET_ENV_VAR), which its finding keeps sealed or in the project's region,
+  // the statements replaying it bind them, and its result can carry a value
+  // its approver is shown once (ROTATE_KEY's new key): the record keeps the
+  // arguments' shape, the statements' text and whether it succeeded, in every
+  // region. The approver still reads the result in full, in the response.
+  // Undo reads none of them (revertAutoFix). For a project kept in another
+  // region no repair's arguments, bound values, result or error text is kept
+  // here either.
+  const quote = await quotesKeptHere(projectId)
+  const keep = { quote, held: finding.type === 'ai_action_pending' }
+
   const rollbackData: Record<string, unknown> = {
-    fixAction,
-    fixResult: { message: result.message, data: result.data },
+    fixAction: recordedFixAction(fixAction, keep),
+    fixResult: recordedFixResult(result, keep),
     // The statements the executor actually sent, captured at the driver. This
     // is the half of the audit trail that used to be missing: the change was
     // derivable by diffing two schema snapshots, but the statement itself was
     // never stored, so "show me what it ran" had no answer.
-    statements,
-    // UNDO CONTRACT (rollbackFormat 2): snapshotId is the PRE-fix state.
-    rollbackFormat: 2,
+    statements: recordedStatements(statements, keep),
+    // UNDO CONTRACT (rollbackFormat 3): the governed changes this fix made,
+    // newest first. Undo restores exactly those (lib/changes/recovery.ts).
+    // snapshotId stays as the record of the pre-fix schema; it is not the undo.
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     preMetadata: pre.preMetadata,
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError: quotedError(baselineError, quote) } : {}),
   }
 
   return {
@@ -681,6 +785,225 @@ export async function executeApprovedFix(
     snapshotId: pre.preSnapshotId ?? undefined,
     rollbackData,
     verification,
+    regressionCheck,
+  }
+}
+
+// ── Person-approved AI proposals ──────────────────────────────────────────────
+
+export interface ProposalExecution {
+  /** Whether anything was sent to the database. */
+  mutated: boolean
+  /** All three checks agreed: postcondition confirmed, re-check resolved, regression check ran clean. */
+  fixed: boolean
+  outcome: 'fixed' | 'not_started' | 'stale' | 'failed' | 'unverified'
+  message: string
+  /** Nothing ran only because another change held the lock: the same approval can be tried again. */
+  retryable?: boolean
+  postcondition?: 'confirmed' | 'refuted' | 'error'
+  recheck?: 'resolved' | 'unresolved' | 'unknown' | 'error'
+  regressionCheck?: FixOutcome['regressionCheck']
+  regressions?: string[]
+  /** Present whenever something ran: what Undo needs, and the audit record. */
+  rollbackData?: Record<string, unknown>
+}
+
+/**
+ * "Fixed" for an AI-proposed repair: the action's postcondition is confirmed
+ * in the catalog, the owning probe's re-check says resolved, and the regression
+ * check ran and found nothing broken. All three, or it is not fixed. A command
+ * succeeding, a model's reply, or silence never counts.
+ */
+export function isVerifiedRepair(checks: {
+  postcondition: 'confirmed' | 'refuted' | 'error'
+  recheck: 'resolved' | 'unresolved' | 'unknown' | 'error'
+  regressionCheck: FixOutcome['regressionCheck']
+  regressions: string[]
+}): boolean {
+  return (
+    checks.postcondition === 'confirmed' &&
+    checks.recheck === 'resolved' &&
+    checks.regressionCheck === 'ran' &&
+    checks.regressions.length === 0
+  )
+}
+
+/**
+ * Run a person-approved AI repair (lib/autonomy/ai-proposals.ts) through the
+ * same governed path as an approved deterministic fix, with stricter rules,
+ * because the repair came from a model rather than from the repair map:
+ *
+ *   - It does not start unless the starting state is established: the owning
+ *     probe must positively detect the gap right now, the check baseline must
+ *     be captured, and for a schema change the pre-change snapshot Undo
+ *     restores must exist. Any of those missing means nothing is changed.
+ *     There is no `.catch(() => null)` on this path.
+ *   - The touched catalog is re-read INSIDE the build lock, right before the
+ *     mutation; if it differs from what was approved, nothing runs.
+ *   - It is "fixed" only when the action's catalog postcondition is
+ *     confirmed AND the probe re-check says resolved AND the regression check
+ *     ran and found nothing broken. Anything else is reported as exactly what
+ *     it is, and a change that ran keeps its Undo record.
+ */
+export async function executeApprovedProposal(input: {
+  projectId: string
+  findingId: string
+  action: string
+  params: Record<string, unknown>
+  schemaTouching: boolean
+  expectedCatalogFingerprint: string
+  currentCatalogFingerprint: () => Promise<string>
+}): Promise<ProposalExecution> {
+  const { projectId, findingId, action, params } = input
+  const notStarted = (message: string): ProposalExecution => ({ mutated: false, fixed: false, outcome: 'not_started', message })
+
+  const finding = await prisma.healthFinding.findFirst({ where: { id: findingId, projectId } })
+  if (!finding) return notStarted('The finding no longer exists, so nothing was changed.')
+  const details = (finding.details ?? {}) as Record<string, unknown>
+  const baseType = (normalizeFindingType(finding.type, details)?.base ?? finding.type) as FindingType
+  const fixAction = { action: action as AIAction['action'], params }
+
+  const { recheckGap } = await import('@/lib/autonomy/desired-state')
+  const before = await recheckGap(projectId, finding.type, details).catch(() => 'error' as const)
+  if (before === 'resolved') return notStarted('The issue is no longer detected, so nothing was changed.')
+  if (before !== 'unresolved') {
+    return notStarted('Backenly cannot establish the starting state (the check for this issue could not run), so nothing was changed.')
+  }
+
+  let baseline: Awaited<ReturnType<typeof captureCheckBaseline>>
+  try {
+    baseline = await captureCheckBaseline(projectId)
+  } catch {
+    return notStarted('Backenly cannot establish the starting state (the before-check could not run), so nothing was changed.')
+  }
+
+  const pre = await capturePreFixState(projectId, baseType, fixAction, { schemaTouching: input.schemaTouching })
+  if (pre.schemaTouching && !pre.preSnapshotId) {
+    return notStarted('Backenly could not record the state Undo would restore, so nothing was changed.')
+  }
+
+  installHomeSqlRecorders()
+  let captured
+  let changeIds: string[] = []
+  try {
+    const grouped = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
+      projectId,
+      'modify',
+      async () => {
+        // The last moment before the mutation: the catalog the person approved.
+        if ((await input.currentCatalogFingerprint()) !== input.expectedCatalogFingerprint) {
+          return { stale: true as const }
+        }
+        return {
+          stale: false as const,
+          result: await executeAction(fixAction, projectId, undefined, 0, undefined, false),
+        }
+      },
+      // Human-approved: skip the autonomy cooldown/budget gate.
+      { skipCooldown: true },
+    )))
+    captured = grouped.result
+    changeIds = grouped.changeIds
+  } catch (err) {
+    return { mutated: false, fixed: false, outcome: 'failed', message: `The change could not run: ${err instanceof Error ? err.message : String(err)}` }
+  }
+
+  const governed = captured.result
+  const statements = captured.statements
+  if (governed.error) {
+    return { ...notStarted('Another change is still in progress on this project, so nothing was changed. Approve again in a moment.'), retryable: true }
+  }
+  if (!governed.result) return notStarted('The change did not start, so nothing was changed.')
+  if (governed.result.stale) {
+    return { mutated: false, fixed: false, outcome: 'stale', message: 'The table changed after this was proposed, so nothing was changed. It needs a fresh proposal.' }
+  }
+
+  const result = governed.result.result
+  // What the record keeps of the call, as for an approved fix (lib/data-plane/residency.ts).
+  const keep = { quote: await quotesKeptHere(projectId), held: finding.type === 'ai_action_pending' }
+  const rollbackData: Record<string, unknown> = {
+    fixAction: recordedFixAction(fixAction, keep),
+    fixResult: recordedFixResult(result, keep),
+    statements: recordedStatements(statements, keep),
+    // UNDO CONTRACT (rollbackFormat 3), as for every other fix: the governed
+    // changes it made, newest first, which Undo restores (lib/changes/recovery.ts).
+    rollbackFormat: 3,
+    changeIds,
+    snapshotId: pre.preSnapshotId,
+    preMetadata: pre.preMetadata,
+    schemaTouching: pre.schemaTouching,
+    fixedAt: new Date().toISOString(),
+    source: 'ai_proposal',
+  }
+  if (!result.success) {
+    return {
+      mutated: statements.length > 0,
+      fixed: false,
+      outcome: 'failed',
+      message: `The change failed: ${result.error ?? result.message}`,
+      ...(statements.length > 0 ? { rollbackData } : {}),
+    }
+  }
+
+  const { verifyPostcondition } = await import('@/lib/autonomy/action-postconditions')
+  const postcondition = await verifyPostcondition(action, projectId, params)
+  // Same three-state rule as the other two acceptance call sites: a verifier
+  // that throws is neither the fix failing nor the fix working.
+  let verifierError: string | null = null
+  const evaluated = await evaluateFixOutcome(projectId, finding.type, details, baseline).catch((err: unknown) => {
+    verifierError = err instanceof Error ? err.message : String(err)
+    return null
+  })
+  if (verifierError !== null) {
+    Object.assign(rollbackData, { verification: 'verification_error', postcondition, verifierError })
+    return {
+      mutated: true,
+      fixed: false,
+      outcome: 'unverified',
+      rollbackData,
+      postcondition,
+      recheck: 'error',
+      regressionCheck: 'unavailable',
+      regressions: [],
+      message:
+        `The change ran, but the check that would confirm it could not complete (${verifierError}), ` +
+        'so it is not recorded as fixed. Backenly re-checks on its next pass.',
+    }
+  }
+  const recheck = evaluated?.recheck ?? 'error'
+  const regressionCheck = evaluated?.regressionCheck ?? 'unavailable'
+  const regressions = evaluated?.regressions ?? []
+  const fixed = isVerifiedRepair({ postcondition, recheck, regressionCheck, regressions })
+
+  const verification: FixVerification = fixed
+    ? 'confirmed'
+    : postcondition === 'error' || recheck === 'error'
+      ? 'verification_error'
+      : 'unverified'
+  Object.assign(rollbackData, { verification, regressionCheck, postcondition, recheck })
+
+  const checks = { postcondition, recheck, regressionCheck, regressions }
+  if (fixed) {
+    return {
+      mutated: true, fixed: true, outcome: 'fixed', rollbackData, ...checks,
+      message: 'Fixed and verified: the change is in the catalog, the issue is gone on re-check, and nothing else broke.',
+    }
+  }
+  if (regressions.length > 0) {
+    return {
+      mutated: true, fixed: false, outcome: 'failed', rollbackData, ...checks,
+      message: `The change closed the issue but broke ${regressions.length} check(s) that were passing before, so it is not recorded as fixed. Undo restores the state before it.`,
+    }
+  }
+  if (postcondition === 'refuted' || recheck === 'unresolved') {
+    return {
+      mutated: true, fixed: false, outcome: 'failed', rollbackData, ...checks,
+      message: 'The change ran but did not produce the intended state, so it is not recorded as fixed. The finding stays open.',
+    }
+  }
+  return {
+    mutated: true, fixed: false, outcome: 'unverified', rollbackData, ...checks,
+    message: 'The change ran, but it could not be fully checked, so it is not recorded as fixed. Backenly re-checks on its next pass.',
   }
 }
 
@@ -733,14 +1056,16 @@ export interface RevertEligibility {
  * `revertAutoFix` calls this as its own first gate, so the button's precondition
  * and the engine's precondition are one function and cannot drift.
  *
- * The three ways a fix is genuinely unrevertible are all knowable from the
- * finding row:
+ * The ways a fix is genuinely unrevertible are all knowable from the finding
+ * row:
  *   • no rollbackData at all — the fix predates the undo contract entirely
- *   • rollbackFormat !== 2  — its snapshot was captured AFTER the fix, so a
+ *   • rollbackFormat 1      — its snapshot was captured AFTER the fix, so a
  *     "revert" would restore the post-fix state and report success having done
  *     nothing (this is the bug format 2 exists to close)
- *   • schemaTouching with no snapshotId — capture failed at fix time, so there
- *     is no pre-fix state to go back to
+ *   • a schema-touching fix in format 2 — its only way back is restoring the
+ *     whole schema to the pre-fix snapshot, which would also undo every change
+ *     anyone made since. Format 3 records the governed changes the fix made, and
+ *     undoes exactly those (lib/changes/recovery.ts).
  */
 export function revertEligibility(
   findingType: string,
@@ -757,7 +1082,7 @@ export function revertEligibility(
     }
   }
 
-  if (rollbackData.rollbackFormat !== 2) {
+  if (rollbackData.rollbackFormat !== 2 && rollbackData.rollbackFormat !== 3) {
     return {
       revertible: false,
       requiresConfirmation: false,
@@ -767,13 +1092,32 @@ export function revertEligibility(
     }
   }
 
-  if (rollbackData.schemaTouching === true && !rollbackData.snapshotId) {
+  if (rollbackData.schemaTouching === true && rollbackData.rollbackFormat === 2) {
     return {
       revertible: false,
       requiresConfirmation: false,
-      reason:
-        'No pre-fix snapshot was captured when this fix ran, so there is no recorded state to ' +
-        'restore.',
+      reason: rollbackData.snapshotId
+        ? 'This fix was made before Backenly recorded each change with its own restore point. Undoing it ' +
+          'now would mean restoring the whole schema to how it was then, which would also undo every change ' +
+          'made since, so it is not done automatically.'
+        : 'No pre-fix snapshot was captured when this fix ran, so there is no recorded state to restore.',
+    }
+  }
+
+  // Format 3 undoes exactly the changes the fix recorded. A fix that ran
+  // statements but recorded no change (the ledger was off, or the lookup
+  // failed) has no restore point to go back to, and "nothing to undo" would be
+  // a false answer.
+  if (
+    rollbackData.schemaTouching === true &&
+    rollbackData.rollbackFormat === 3 &&
+    !(Array.isArray(rollbackData.changeIds) && rollbackData.changeIds.length > 0) &&
+    Array.isArray(rollbackData.statements) && rollbackData.statements.length > 0
+  ) {
+    return {
+      revertible: false,
+      requiresConfirmation: false,
+      reason: 'This fix ran statements that were not recorded as a change with a restore point, so there is no recorded state to restore.',
     }
   }
 
@@ -784,13 +1128,14 @@ export function revertEligibility(
 /**
  * Revert an auto-fixed finding to its recorded pre-fix state.
  *
- * The undo contract (rollbackFormat 2):
- *   • schema-touching fixes → rollbackToSchemaVersion(PRE-fix snapshot), whose
- *     DDL engine now diffs indexes (both directions), FK constraints, RLS
- *     policies, and triggers
+ * The undo contract (rollbackFormat 3):
+ *   • schema-touching fixes → the governed changes the fix made, each restored
+ *     to the state before it (lib/changes/recovery.ts), scoped to what it
+ *     touched and verified
  *   • metadata fixes → the exact pre-fix rows/values from preMetadata
- *   • legacy fixes (pre-contract) are REFUSED honestly — their snapshot is
- *     post-fix, so "reverting" to it would no-op while claiming success
+ *   • older fixes are REFUSED honestly: format 1 because its snapshot is
+ *     post-fix, schema-touching format 2 because its only way back restores the
+ *     whole schema and would undo every later change with it
  *
  * Pure engine logic: does NOT flip finding status or write audit rows — the
  * caller (route / verifier) owns that, because it owns the actor identity.
@@ -837,24 +1182,39 @@ export async function revertAutoFix(
     }
   }
 
-  // ── Schema-side revert (workspace schema = the enforcement truth) ──────────
+  // ── Schema-side revert: the governed changes this fix made ──────────────────
+  //
+  // Each one is restored on its own, newest first, scoped to what it touched,
+  // with the same checks as Restore previous state: refused if a later change
+  // touched the same tables, and never silently setting aside data written
+  // since. A restore that would affect such data is not done from here: it
+  // belongs in Database → Changes, where the person sees exactly what is kept.
   let appliedSteps = 0
   let schemaMessage = ''
   if (rollbackData.schemaTouching === true) {
-    // Non-null by the eligibility gate above, which refuses schemaTouching
-    // fixes that never captured one.
-    const snapshotId = rollbackData.snapshotId as string
-    const snapshot = await prisma.workspaceSchemaSnapshot.findUnique({
-      where: { id: snapshotId },
-      select: { versionNum: true },
-    })
-    if (!snapshot) return { success: false, message: `Rollback snapshot ${snapshotId} no longer exists.` }
-
-    const res = await rollbackToSchemaVersion(projectId, snapshot.versionNum)
-    if (!res.success) return { success: false, message: `Schema rollback failed: ${res.error}` }
-    appliedSteps = res.appliedSteps
-    schemaMessage = `schema restored to pre-fix version ${snapshot.versionNum} ` +
-      `(${res.appliedSteps} step${res.appliedSteps === 1 ? '' : 's'} applied)`
+    const { previewRecovery, recoverChange } = await import('@/lib/changes/recovery')
+    const { currentAttribution } = await import('@/lib/changes/attribution')
+    const ids = Array.isArray(rollbackData.changeIds) ? (rollbackData.changeIds as string[]) : []
+    let restored = 0
+    for (const id of ids) {
+      const preview = await previewRecovery(projectId, id)
+      if (!preview || preview.safety === 'unavailable') continue // already restored, or never in effect
+      if (preview.safety !== 'lossless') {
+        return {
+          success: false,
+          message:
+            `Not undone: ${preview.reason ?? 'it cannot be restored automatically'}. ` +
+            'Open Database → Changes to restore it there, where you can see exactly what would be kept.',
+        }
+      }
+      const out = await recoverChange(projectId, id, { mode: 'manual', actorUserId: currentAttribution()?.actorUserId ?? null })
+      if (!out.ok) return { success: false, message: `Not undone: ${(out as { error: string }).error}` }
+      restored++
+    }
+    appliedSteps = restored
+    schemaMessage = restored > 0
+      ? `restored the state before ${restored === 1 ? 'the change' : `the ${restored} changes`} this fix made, verified`
+      : 'nothing in the schema to undo'
   }
 
   // ── Metadata-side revert (platform rows the snapshot can't see) ────────────
@@ -933,8 +1293,9 @@ export interface ChatResolveResult {
  * tool). Classification-aware, mirroring the autonomy safety contract:
  *
  *   auto        → apply immediately through the governed executor + verify
- *   approval    → only apply when the user has confirmed this turn; otherwise
- *                 return needs_confirmation with the risk so the brain can ask
+ *   approval    → only apply on a human's approval (`confirmed`, which only an
+ *                 approved Review Queue call sets); otherwise return
+ *                 needs_confirmation, naming the risk and where to approve it
  *   notify_only → return the manual-remediation guidance, never auto-act
  *
  * Reuses executeApprovedFix for the actual governed execution (advisory lock +
@@ -966,9 +1327,28 @@ export async function resolveFindingFromChat(
 
   if (cls.decision === 'approval' && !opts.confirmed) {
     const risk = cls.riskNote ? ` (${cls.riskNote})` : ''
+    // No chat message can approve it, so put it where a person can, as the
+    // autonomy loop does: the Review Queue lists pending_approval findings only.
+    // Inviting a reply of "confirm" instead would reach nothing waiting and
+    // change nothing.
+    const queued = await prisma.healthFinding.updateMany({
+      where: { id: findingId, status: 'open' },
+      data: { status: 'pending_approval' },
+    })
+    if (queued.count > 0) {
+      await _writeAuditLog(projectId, 'HEALTH_FIX_AWAITING_APPROVAL', {
+        findingId,
+        findingType: type,
+        reason: cls.reason,
+        via: 'chat',
+      })
+    }
+    const waiting = queued.count > 0 || finding.status === 'pending_approval'
     return {
       outcome: 'needs_confirmation',
-      message: `${cls.reason}${risk} Confirm and I'll apply it.`,
+      message: waiting
+        ? `${cls.reason}${risk} This fix needs a person's approval, so it is waiting in the Review Queue on the Autonomy page, which shows exactly what it changes.`
+        : `${cls.reason}${risk} This fix needs a person's approval in the dashboard; a chat message cannot approve it.`,
       findingId,
       findingType: finding.type,
     }
@@ -1001,12 +1381,17 @@ export async function resolveFindingFromChat(
     },
   })
 
+  // The requester reads the result in full in the reply below; the audit row
+  // keeps it as the record keeps a result (lib/data-plane/residency.ts), so a
+  // held action's row says only that it ran.
+  const keep = { quote: await quotesKeptHere(projectId), held: finding.type === 'ai_action_pending' }
+  const action = typeof details.executorAction === 'string' ? details.executorAction : type
   await _writeAuditLog(projectId, 'HEALTH_FIX_RESOLVED_VIA_CHAT', {
     findingId,
     findingType: type,
     tableName: (details.tableName ?? details.table ?? details.location ?? null) as string | null,
     columnName: (details.columnName ?? details.column ?? null) as string | null,
-    message: result.message,
+    message: recordedResultMessage(result.message, action, keep),
     snapshotId: result.snapshotId ?? null,
   })
 
@@ -1162,14 +1547,19 @@ async function _executeAutoFix(
   // can tell "this fix broke something" from "this was already broken". Without
   // a before-state there is nothing to compare against and a regression is
   // indistinguishable from a pre-existing failure, so the gate degrades to
-  // target-only verification rather than guessing.
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // target-only verification rather than guessing, and the record says so.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   let result
-  installSqlRecorder(prisma as any)
+  installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
+  let changeIds: string[] = []
   try {
-    const captured = await withSqlCapture(() => withBuildLock(
+    const { result: captured, changeIds: madeNow } = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
       projectId,
       'modify',
       async () => {
@@ -1188,9 +1578,10 @@ async function _executeAutoFix(
         return r
       },
       { skipCooldown: opts.skipCooldown },
-    ))
+    )))
     const governed = captured.result
     statements = captured.statements
+    changeIds = madeNow
     if (governed.error) {
       return _isTransientGovernanceError(governed.error)
         ? _deferred(findingId, projectId, type, details, governed.error)
@@ -1213,6 +1604,17 @@ async function _executeAutoFix(
     return _isTransientGovernanceError(reason)
       ? _deferred(findingId, projectId, type, details, full)
       : _escalate(findingId, projectId, type, details, full)
+  }
+
+  // What the finding and the audit rows keep of the call, decided once so they
+  // agree (lib/data-plane/residency.ts): for a project kept in another region
+  // or a held action, the action's name, its arguments' shape and the
+  // statements' text, and not the result's text.
+  const keep = { quote: await quotesKeptHere(projectId), held: type === 'ai_action_pending' }
+  const recorded = {
+    fixAction: recordedFixAction(fixAction, keep),
+    statements: recordedStatements(statements, keep),
+    message: recordedResultMessage(result.message, fixAction.action, keep),
   }
 
   // ── TRUST GUARANTEE: a fix is only "fixed" if the gap actually closed ───────
@@ -1261,6 +1663,7 @@ async function _executeAutoFix(
   // A timeout does not prove the fix failed. It also does not prove it worked.
   // So the error case is its own state and is never success.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     let verifierError: string | null = null
     const outcome = await evaluateFixOutcome(projectId, type, details, baseline).catch(
@@ -1283,10 +1686,11 @@ async function _executeAutoFix(
       // verification retry, using the machinery that already exists rather
       // than re-running a mutation that has already happened.
       return _appliedUnverified(findingId, projectId, type, details, {
-        fixAction,
-        statements,
+        fixAction: recorded.fixAction,
+        statements: recorded.statements,
         preSnapshotId: pre.preSnapshotId,
-        message: result.message,
+        changeIds,
+        message: recorded.message,
         verifierError,
       })
     }
@@ -1308,6 +1712,7 @@ async function _executeAutoFix(
         recovered ? `${outcome.reason} ${recovered}` : outcome.reason)
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history / diff surface only — NEVER the undo
@@ -1317,21 +1722,28 @@ async function _executeAutoFix(
     : null
 
   const rollbackData: Record<string, unknown> = {
-    fixAction,
-    fixResult: { message: result.message, data: result.data },
+    fixAction: recorded.fixAction,
+    fixResult: recordedFixResult(result, keep),
     // The statements the executor actually sent, captured at the driver. This
     // is the half of the audit trail that used to be missing: the change was
     // derivable by diffing two schema snapshots, but the statement itself was
     // never stored, so "show me what it ran" had no answer.
-    statements,
-    // UNDO CONTRACT (rollbackFormat 2): snapshotId is the PRE-fix state.
-    rollbackFormat: 2,
+    statements: recorded.statements,
+    // UNDO CONTRACT (rollbackFormat 3): the governed changes this fix made,
+    // newest first. Undo restores exactly those (lib/changes/recovery.ts).
+    // snapshotId stays as the record of the pre-fix schema; it is not the undo.
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     preMetadata: pre.preMetadata,
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError } : {}),
   }
 
   await prisma.healthFinding.update({
@@ -1340,7 +1752,9 @@ async function _executeAutoFix(
       status: 'auto_fixed',
       autoFixed: true,
       fixAppliedAt: new Date(),
-      details: { ...details, rollbackData } as any,
+      // A baseline's error only as an error code for a project kept in another
+      // region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, { ...details, rollbackData })) as any,
     },
   })
 
@@ -1353,17 +1767,18 @@ async function _executeAutoFix(
     // literal string "a table" and 30 distinct fixes rendered as 30 dupes.
     tableName: (details.tableName ?? details.table ?? details.location ?? null) as string | null,
     columnName: (details.columnName ?? details.column ?? null) as string | null,
-    fixAction,
-    message: result.message,
+    fixAction: recorded.fixAction,
+    message: recorded.message,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     // The statements this fix actually ran. Duplicated onto the audit row rather
     // than left only in finding.details, because the audit log is the record
     // that survives the finding being dismissed or the project's queue being
     // cleared — and "what did it run" is a question asked long after.
-    statements,
+    statements: recorded.statements,
     // Read by the trust scoreboard: only 'confirmed' fixes count as verified.
     verification,
+    regressionCheck,
   })
 
   return { findingId, outcome: 'auto_fixed', message: result.message, rollbackData }
@@ -1394,9 +1809,11 @@ async function _appliedUnverified(
   type: FindingType,
   details: Record<string, unknown>,
   applied: {
+    /** The call and its statements as the record keeps them (lib/data-plane/residency.ts). */
     fixAction: unknown
     statements: unknown
     preSnapshotId: string | null
+    changeIds: string[]
     message: string
     verifierError: string
   },
@@ -1413,7 +1830,9 @@ async function _appliedUnverified(
       // finding whose gap is actually gone, so a fix that worked resolves
       // itself next tick and one that did not stays visible.
       status: 'pending_approval',
-      details: {
+      // The check's error, and the reason that quotes it, only as an error
+      // code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         // The mutation is on the record even though the verdict is not, so a
         // later reader can tell "we changed this and do not know the result"
@@ -1423,6 +1842,7 @@ async function _appliedUnverified(
           fixAction: applied.fixAction,
           statements: applied.statements,
           snapshotId: applied.preSnapshotId,
+          changeIds: applied.changeIds,
           verifierError: applied.verifierError,
         },
         escalation: {
@@ -1430,7 +1850,7 @@ async function _appliedUnverified(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
 
@@ -1520,7 +1940,9 @@ async function _escalate(
       // loop tried, verified, and the fix did not hold" apart from "policy
       // gates this on a human", and renders the guardrail line for both. That
       // mislabel made Autopilot look like it asks permission for safe fixes.
-      details: {
+      // The reason is the executor's or PostgreSQL's own words, kept only as an
+      // error code for a project kept in another region (lib/data-plane/residency.ts).
+      details: (await findingDetailsKeptHere(projectId, type, {
         ...details,
         escalation: {
           // Carry the retry bookkeeping the reconciler wrote before handing this
@@ -1533,7 +1955,7 @@ async function _escalate(
           reason,
           at: new Date().toISOString(),
         },
-      } as any,
+      })) as any,
     },
   })
   await _writeAuditLog(projectId, 'HEALTH_FIX_ESCALATED', {
@@ -1600,17 +2022,31 @@ async function _deferred(
   }
 }
 
+/** Audit payload fields that carry an executor's or PostgreSQL's own words, which can quote rows. */
+const AUDIT_ERROR_TEXTS = new Set(['message', 'error', 'escalationReason', 'verifierError', 'deferReason', 'rejectedBecause'])
+
 async function _writeAuditLog(
   projectId: string,
   action: string,
   payload: Record<string, unknown>,
 ) {
+  // Those words only as an error code for a project kept in another region
+  // (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
+  const kept = quote
+    ? payload
+    : Object.fromEntries(
+        Object.entries(payload).map(([key, value]) => [
+          key,
+          AUDIT_ERROR_TEXTS.has(key) && typeof value === 'string' ? quotedError(value, false) : value,
+        ]),
+      )
   await prisma.auditLog.create({
     data: {
       projectId,
       action,
       type: 'health',
-      details: JSON.stringify(payload),
+      details: JSON.stringify(kept),
       timestamp: new Date(),
     },
   })
