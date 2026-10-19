@@ -648,7 +648,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       tableName: { type: 'string' },
       on: { type: 'string', enum: ['insert', 'update', 'delete'] },
       kind: { type: 'string', enum: ['webhook', 'notify'] },
-      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the HTTP(S) endpoint the trigger calls. Required for webhooks.' },
+      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the https:// endpoint the trigger calls. Required for webhooks.' },
     },
     ['tableName', 'on', 'kind']),
   fn('sync_column',
@@ -2056,6 +2056,26 @@ function preflightValidate(
         }
       }
       return null
+    }
+    case 'create_trigger': {
+      // A webhook trigger posts every matching row to webhookUrl. The schema's
+      // `required` cannot say "required when kind is webhook", so it is checked
+      // here, before anything is stored or shown as started: without it the
+      // trigger was created calling `undefined` and every later write logged a
+      // dead delivery. https only, because the body is the row itself. Whether
+      // the address may be contacted at all is the outbound guard's decision,
+      // made when the trigger is stored and again on every delivery.
+      if (args.kind !== 'webhook') return null
+      const url = typeof args.webhookUrl === 'string' ? args.webhookUrl.trim() : ''
+      if (/^https:\/\//i.test(url)) return null
+      return {
+        ok: false,
+        code: 'INVALID_ARGUMENT',
+        summary: url
+          ? `create_trigger(kind="webhook") needs an https:// \`webhookUrl\`, and "${url.slice(0, 200)}" is not one. Nothing was created.`
+          : 'create_trigger(kind="webhook") needs a `webhookUrl` — the https:// endpoint each matching row is posted to. ' +
+            'Nothing was created. Pass it, or use create_webhook for a signed row webhook.',
+      }
     }
     default:
       return null
