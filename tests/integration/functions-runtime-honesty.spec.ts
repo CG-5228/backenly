@@ -233,6 +233,7 @@ describe('ctx.db uses every name and condition as written, or refuses', () => {
       ['bad-insert-column', "return await ctx.db.insert('items', { label: 'item-new', 'oops-x': 1 })", 'is not a table or column name'],
       ['undefined-where', "return await ctx.db.delete('items', { id: undefined, label: 'item-1' })", 'is undefined'],
       ['bad-query-column', "return await ctx.db.query('items', { 'id; --': 1 })", 'is not a table or column name'],
+      ['map-where', "return await ctx.db.query('items', new Map([['id', 1]]))", 'where must be an object'],
     ] as const) {
       const out = await run(name, [line])
       expect({ name, success: out.success, error: String(out.error ?? '').includes(error) }).toEqual({ name, success: false, error: true })

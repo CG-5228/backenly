@@ -308,6 +308,11 @@ describe.each([
     await expect(tasks().update({ qty: 99 }).gt('qty', undefined).lt('qty', 5).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
     await expect(tasks().delete().eq('qty', Number.NaN).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
     await expect(tasks().delete().in('qty', [1, Number.POSITIVE_INFINITY]).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    // An invalid Date became null, so neq() was IS NOT NULL; a function was left out; a bigint threw uncoded.
+    await expect(tasks().delete().neq('due_at', new Date('not a date')).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(tasks().delete().eq('id', () => 1).eq('done', false).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(tasks().delete().eq('qty', BigInt(3)).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(tasks().delete().in('qty', [[1, undefined]]).execute()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
     expect(await snapshot()).toEqual(before)
   })
 

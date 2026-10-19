@@ -193,7 +193,10 @@ function plainName(name: unknown, what: string): string {
  */
 function whereColumns(where: unknown, what: string): string[] {
   if (where === undefined || where === null) return []
-  if (typeof where !== 'object' || Array.isArray(where)) throw new Error(`${what}: where must be an object of column names and values`)
+  // A plain object only: a Map or a Date has no entries, and an unfiltered read would follow.
+  if (Object.prototype.toString.call(where) !== '[object Object]') {
+    throw new Error(`${what}: where must be an object of column names and values`)
+  }
   return Object.entries(where as Record<string, unknown>).map(([column, value]) => {
     plainName(column, what)
     if (value === undefined) throw new Error(`${what}: the value for "${column}" in where is undefined`)

@@ -370,11 +370,28 @@ export class QueryBuilder<T = any> {
     }
     const conflict = (column: string, what: string, hint: string) =>
       refuse(`Two filters on "${column}" cannot be sent together: ${what}. ${hint}`)
-    const sendable = (column: string, value: unknown): void => {
-      const bad = (v: unknown) => v === undefined || (typeof v === 'number' && !Number.isFinite(v))
-      if (bad(value) || (Array.isArray(value) && value.some(bad))) {
-        throw refuse(`The filter on "${column}" has no value JSON can send (${String(value)}).`)
+    // A value JSON sends as it is. JSON leaves out undefined, a function or a
+    // symbol, and turns NaN, Infinity and an invalid Date into null; inside an
+    // array each of those becomes null. A bigint cannot be sent at all.
+    const carried = (v: unknown): boolean => {
+      let json: string | undefined
+      try {
+        json = JSON.stringify(v)
+      } catch {
+        return false
       }
+      if (json === undefined || (json === 'null' && v !== null)) return false
+      return !Array.isArray(v) || v.every(carried)
+    }
+    const describe = (v: unknown): string => {
+      try {
+        return typeof v === 'object' && v !== null && !Array.isArray(v) ? Object.prototype.toString.call(v) : String(v)
+      } catch {
+        return typeof v
+      }
+    }
+    const sendable = (column: string, value: unknown): void => {
+      if (!carried(value)) throw refuse(`The filter on "${column}" has a value JSON cannot send as it is (${describe(value)}).`)
     }
     // A value compared whole: eq(), isNull().
     const compare = (column: string, value: unknown) => {
