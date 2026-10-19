@@ -111,6 +111,8 @@ export async function POST(request: NextRequest, _props: { params: Promise<{ id:
       return NextResponse.json({ ok: true, ...r })
     }
 
-    return NextResponse.json({ error: 'action must be approve, pause, resume, undo or assess' }, { status: 400 })
-  })
+    return NextResponse.json({ error: 'action must be approve, pause, resume, advance, undo or assess' }, { status: 400 })
+    // Every action here decides what happens to a production table, like
+    // maintenance consent: an organization ADMIN's call, never a VIEWER's.
+  }, { floor: 'administer' })
 }
