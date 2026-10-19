@@ -631,10 +631,13 @@ tests/integration/migration-ownership-recovery.spec.ts
 # It also pins the region's snapshots: a project the application makes there
 # without direct access is dumped and restored by the real snapshot job as
 # backenly_backup, and a workspace made before that fails pg_dump and verify.sql
-# until the procedure is applied again, which the check a launcher runs first
-# reports without refusing. Mutation-checked: the previous code and SQL fail
-# seven of those eight tests, with the exact "permission denied for schema"
-# pg_dump error seen in us-east-1, and the previous check alone fails one.
+# until the procedure is applied again. A check on its own fails on a step that
+# changed and does not verify yet; only the check a launcher runs before its own
+# apply (BOOTSTRAP_PRE_APPLY) reports it without failing. Mutation-checked: the
+# previous code and SQL fail nine of those ten tests, with the exact "permission
+# denied for schema" pg_dump error seen in us-east-1 (the tenth passes on the old
+# verify.sql, which is the gap), and a check that tolerates every changed step
+# fails the three that pin the strict check and the signal.
 tests/integration/regional-bootstrap.spec.ts
 
 # ── Credential rotation ─────────────────────────────────────────────────────

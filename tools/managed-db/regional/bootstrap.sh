@@ -35,6 +35,11 @@
 #                                      password is to be replaced deliberately
 #   BOOTSTRAP_REHEARSAL              true only on a stock PostgreSQL 16 without
 #                                      pgvector or the preload; refused on RDS
+#   BOOTSTRAP_PRE_APPLY              true only for the check a launcher runs just
+#                                      before its own apply (launch.ts). That check
+#                                      reports, without failing on it, what steps
+#                                      changed since they were applied have not
+#                                      converged yet. Refused with an apply.
 #
 # Passwords never reach this script or the database: the operator's machine
 # computes each verifier and keeps the password only long enough to write the
@@ -51,6 +56,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${BOOTSTRAP_ROOT:-$(cd "$HERE/../../.." && pwd)}"
 MODE="${BOOTSTRAP_MODE:-check}"
 REHEARSAL="${BOOTSTRAP_REHEARSAL:-false}"
+PRE_APPLY="${BOOTSTRAP_PRE_APPLY:-false}"
 : "${DATABASE_URL:?DATABASE_URL must name the regional database}"
 
 case "$MODE" in
@@ -62,6 +68,14 @@ case "$REHEARSAL" in
   true | false) ;;
   *) echo "refusing: BOOTSTRAP_REHEARSAL must be true or false, not \"$REHEARSAL\""; exit 2 ;;
 esac
+case "$PRE_APPLY" in
+  true | false) ;;
+  *) echo "refusing: BOOTSTRAP_PRE_APPLY must be true or false, not \"$PRE_APPLY\""; exit 2 ;;
+esac
+if [ "$APPLY" = true ] && [ "$PRE_APPLY" = true ]; then
+  echo "refusing: BOOTSTRAP_PRE_APPLY marks the check a launcher runs before its own apply, never the apply"
+  exit 2
+fi
 
 # Which database did we actually reach? (as tools/managed-db/runner/entrypoint.sh)
 if [ -n "${EXPECT_DATABASE:-}" ]; then
@@ -186,13 +200,14 @@ credentials
 
 # Verification fails the run when the database is not what the steps promise.
 # It is read-only, so a check runs it too once every step is recorded: that is
-# how a live region is audited.
+# how a live region is audited, and a check that does not verify fails.
 #
-# A step whose files changed since it was applied promises something the
-# database has not been given yet, as a pending step does. A check then prints
-# what does not verify and does not fail on it: a launcher checks before it
-# applies (launch.ts), so failing would refuse the one apply that converges it.
-# That apply re-runs every step and fails the run if it still does not verify.
+# One check may pass without verifying: the one a launcher runs just before its
+# own apply (BOOTSTRAP_PRE_APPLY=true, launch.ts), when steps changed since they
+# were applied. What they now promise is exactly what that apply converges, and
+# the apply then fails the run if the database still does not verify. Failing
+# here would refuse the one run that converges it. Every other check, and a
+# pre-apply check whose steps are all current, fails on what does not verify.
 if [ "$APPLY" = true ]; then
   "${PSQL[@]}" -f "$HERE/sql/verify.sql"
   echo "Regional database initialised and verified."
@@ -201,8 +216,15 @@ elif [ "$PENDING" -gt 0 ]; then
 elif [ "$CHANGED" -eq 0 ]; then
   "${PSQL[@]}" -f "$HERE/sql/verify.sql"
   echo "Check only: nothing was written. Every step is recorded, and the database verifies."
-elif "${PSQL[@]}" -f "$HERE/sql/verify.sql"; then
-  echo "Check only: nothing was written. $CHANGED step(s) changed since applied, and the database verifies."
 else
-  echo "Check only: nothing was written. $CHANGED step(s) changed since applied: apply them to converge what does not verify."
+  verified=0
+  "${PSQL[@]}" -f "$HERE/sql/verify.sql" || verified=$?
+  if [ "$verified" -eq 0 ]; then
+    echo "Check only: nothing was written. $CHANGED step(s) changed since applied, and the database verifies."
+  elif [ "$PRE_APPLY" = true ]; then
+    echo "Check only: nothing was written. $CHANGED step(s) changed since applied: the apply that follows converges what does not verify."
+  else
+    echo "Check only: nothing was written. $CHANGED step(s) changed since applied, and the database does not verify."
+    exit "$verified"
+  fi
 fi

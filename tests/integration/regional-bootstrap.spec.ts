@@ -659,15 +659,23 @@ describe('a workspace made before the backup role was given every one', () => {
     expect(result.status).not.toBe(0)
   })
 
-  it('is reported, and does not refuse the apply, by the check of a region whose step files changed', async () => {
-    // As a region that applied an earlier setup-direct-access.sql. A launcher
-    // checks before it applies, so a failing check would refuse the very apply
-    // that converges this workspace.
+  it('fails a check on its own of a region whose step files changed, as a release gate reads it', async () => {
+    // As a region that applied an earlier setup-direct-access.sql.
     await rows(superUrl(), `UPDATE backenly_meta.bootstrap_steps SET checksum = 'an earlier file' WHERE step = 'direct-access'`)
     const result = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', EXPECT_DATABASE: DB })
     expect(result.output).toContain('step direct-access: changed (applied, but its files have changed since)')
     expect(result.output).toContain(`backenly_backup cannot use workspace schema ${schema}, so its snapshots fail`)
-    expect(result.output).toContain('Check only: nothing was written. 1 step(s) changed since applied: apply them to converge what does not verify.')
+    expect(result.output).toContain('Check only: nothing was written. 1 step(s) changed since applied, and the database does not verify.')
+    expect(result.status).not.toBe(0)
+  })
+
+  it('is reported, without refusing it, by the check a launcher runs before its own apply', async () => {
+    // launch.ts checks before it applies, so failing this check would refuse
+    // the very apply that converges the workspace.
+    const result = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', BOOTSTRAP_PRE_APPLY: 'true', EXPECT_DATABASE: DB })
+    expect(result.output).toContain('step direct-access: changed (applied, but its files have changed since)')
+    expect(result.output).toContain(`backenly_backup cannot use workspace schema ${schema}, so its snapshots fail`)
+    expect(result.output).toContain('Check only: nothing was written. 1 step(s) changed since applied: the apply that follows converges what does not verify.')
     expect(result.status).toBe(0)
   })
 
@@ -710,6 +718,15 @@ describe('the procedure refuses', () => {
     const wrong = bootstrap({ DATABASE_URL: superUrl(), BOOTSTRAP_MODE: 'check', EXPECT_DATABASE: 'backenly' })
     expect(wrong.status).toBe(2)
     expect(wrong.output).toContain(`refusing: connected database is "${DB}", expected "backenly"`)
+  })
+
+  it('a pre-apply signal on anything but a check, or one it does not understand', async () => {
+    const onApply = bootstrap({ DATABASE_URL: superUrl(), BOOTSTRAP_MODE: 'apply', BOOTSTRAP_PRE_APPLY: 'true' })
+    expect(onApply.status).toBe(2)
+    expect(onApply.output).toContain('refusing: BOOTSTRAP_PRE_APPLY marks the check a launcher runs before its own apply, never the apply')
+    const unknown = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', BOOTSTRAP_PRE_APPLY: 'yes' })
+    expect(unknown.status).toBe(2)
+    expect(unknown.output).toContain('refusing: BOOTSTRAP_PRE_APPLY must be true or false, not "yes"')
   })
 
   it('but rotates exactly the credential it is asked to', async () => {
