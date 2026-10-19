@@ -36,6 +36,8 @@ export interface EndpointTestInput {
   tableName: string
   operation: 'list' | 'create' | 'get'
   sessionToken?: string
+  /** How long the request may take. Defaults to REQUEST_TIMEOUT_MS; tests shorten it. */
+  timeoutMs?: number
 }
 
 export interface EndpointTestResult {
@@ -48,10 +50,17 @@ export interface EndpointTestResult {
   /** Brief excerpt of the response body for the model to reason over. */
   bodyExcerpt: string
   /** When ok=false, why. */
-  failureKind?: 'not_found' | 'server_error' | 'bad_request' | 'no_endpoint' | 'no_app_url' | 'no_table' | 'fetch_failed' | 'unauthenticated'
+  failureKind?: 'not_found' | 'server_error' | 'bad_request' | 'no_endpoint' | 'no_app_url' | 'no_table' | 'fetch_failed' | 'unauthenticated' | 'timeout'
 }
 
 const APP_URL_ENV = ['NEXT_PUBLIC_APP_URL', 'APP_URL'] as const
+
+/**
+ * How long one request to the runtime may take. run_test runs inside the agent
+ * turn, which MCP caps at 90 seconds, so a connection that hangs must not be
+ * able to spend it. Ten seconds is plenty for one CRUD call.
+ */
+const REQUEST_TIMEOUT_MS = 10_000
 
 function resolveAppUrl(): string | null {
   for (const k of APP_URL_ENV) {
@@ -202,10 +211,29 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
   // whether a 401 means "the route enforces auth" or "this test never ran".
   const authenticated = Boolean(anonKey) || Boolean(input.sessionToken)
 
+  // The deadline covers the whole exchange, body included, since a response
+  // can stall after its status line. A request it cuts off verified nothing,
+  // and that is a different failure from a connection that could not be made.
+  const timeoutMs = input.timeoutMs ?? REQUEST_TIMEOUT_MS
+  const deadline = AbortSignal.timeout(timeoutMs)
+  const timedOut = (statusCode: number | null): EndpointTestResult => ({
+    ok: false,
+    summary:
+      `${method} ${path} ${statusCode === null ? 'did not answer' : `→ ${statusCode}, but did not finish answering`} ` +
+      `within ${timeoutMs / 1000}s, so nothing was verified. A slow or hung runtime says nothing about whether ` +
+      'the endpoint works.',
+    endpoint: path,
+    method,
+    statusCode,
+    bodyExcerpt: '',
+    failureKind: 'timeout',
+  })
+
   let res: Response
   try {
-    res = await fetch(url, { method, headers, body })
+    res = await fetch(url, { method, headers, body, signal: deadline })
   } catch (err) {
+    if (deadline.aborted) return timedOut(null)
     return {
       ok: false,
       summary: `Fetch to ${path} failed: ${err instanceof Error ? err.message : 'unknown'}`,
@@ -218,7 +246,8 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
   }
 
   const status = res.status
-  const text = await res.text().catch(() => '')
+  const text = await res.text().catch(() => (deadline.aborted ? null : ''))
+  if (text === null) return timedOut(status)
   const excerpt = text.length > 320 ? text.slice(0, 320) + '…' : text
 
   // 200 / 201 → endpoint works
