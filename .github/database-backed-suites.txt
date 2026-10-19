@@ -798,6 +798,15 @@ __tests__/usage/usage-ledger.test.ts
 # unknown. Row locks are the property, so it needs a real Postgres.
 tests/integration/ai-spend-ledger.spec.ts
 
+# A project whose backend state could not be read is not taken for a new one:
+# with collectProof failing, the classifier is not told nothing is built, a
+# BUILD goes to the agent loop with the state marked unread, and neither a
+# description the classifier hedged on nor a "go ahead" whose plan was lost is
+# handed to the architect; a state read as empty is still new. It reads and
+# writes the projects, their workspace schemas and their conversations, so it
+# needs a real Postgres.
+tests/integration/brain-unread-state.spec.ts
+
 # The brain on the AI gateway, end to end with a scripted model: what each call
 # sends, every tool call answered in one turn with thinking carried back, credits
 # in cost-weighted tokens, usage rows per call, and the approval gate, cut-off,

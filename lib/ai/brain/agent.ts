@@ -465,8 +465,14 @@ export async function runBrain(
   // message that describes an app is unambiguously a BUILD, never a
   // clarification. Also used later to route BUILD through the architect and to
   // keep the CONFIRM re-architect fallback from firing on a MODIFY confirm.
+  //
+  // Only a state that was read and is empty is fresh. A failed read leaves no
+  // proof, and counting that as empty made a project with 30 tables look brand
+  // new, so its next BUILD had the architect design a whole new backend. An
+  // unread state takes a built project's path, and the understanding block
+  // says the state could not be read.
   const proof = memory.understanding.proof
-  const isFreshProject = !proof || proof.nothingBuilt || (proof.tables?.length ?? 0) === 0
+  const isFreshProject = !!proof && (proof.nothingBuilt || (proof.tables?.length ?? 0) === 0)
 
   // ── CLASSIFY ────────────────────────────────────────────────────────────
   emit({ type: 'phase', phase: 'classify' })
