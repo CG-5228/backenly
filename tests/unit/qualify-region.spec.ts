@@ -343,8 +343,8 @@ describe('a region that cannot be reached', () => {
       'restore-refused-under-a-later-change', 'drill-tables-removed', 'deleted-with-its-history',
       // What a coding agent reads of the schema, after each of them.
       'described-after-undo', 'described-after-a-change', 'described-after-acknowledged-restore', 'described-after-reapply',
-      // And the functions generated for a table a restore removed.
-      'functions-after-undo', 'functions-after-acknowledged-restore',
+      // And the functions generated for a table: gone when a restore removed it, back when a reapply returned it.
+      'functions-after-undo', 'functions-after-acknowledged-restore', 'functions-after-reapply', 'functions-after-drill-restores',
     ]) {
       expect([check, status(check)]).toEqual([check, 'skip'])
     }

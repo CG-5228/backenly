@@ -87,7 +87,10 @@
  *              record and by the table's own indexes. A repair made from home
  *              instead proves nothing about the region and fails the check. The
  *              fault is timed by the service's clock (its Date header), not this
- *              machine's.
+ *              machine's. When the loop froze changes during an incident
+ *              (AUTONOMY_CHANGE_FREEZE in the feed) and nothing repaired, the
+ *              drill is reported as not exercised: a skip that leaves the region
+ *              unqualified until a calm run shows the repair.
  *              The changes the drill made are then restored from the console,
  *              newest first
  *   rollback drills
@@ -107,7 +110,8 @@
  *              minutes once). The rollback check above is held to the same bound.
  *              After the console's restore and the acknowledged restore, no
  *              function generated for the removed table (its `<table>-schema`
- *              endpoint) is still listed
+ *              endpoint) is still listed; after the reapply they are listed
+ *              again; once every drill table is gone, none of theirs is left
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -474,6 +478,12 @@ export function toolData<T>(outcome: ToolOutcome): T | null {
 }
 
 /**
+ * Thrown by a check whose drill this run could not exercise (the region held it back, or the moment it needs never
+ * came). Reported as a skip with the reason, never a pass: the region is not qualified until a run exercises it.
+ */
+export class NotExercised extends Error {}
+
+/**
  * Whether a read_backend_state section's data describes `table`: any value in
  * it names the table (the tables list, relationships, realtime), except the
  * functions list, whose names are the functions' own. A table's generated
@@ -635,6 +645,13 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       log(`  ok    ${phase}/${name}: ${detail}`)
       return true
     } catch (err) {
+      if (err instanceof NotExercised) {
+        // Not a pass: the run is not qualified until a run exercises it, and what depends on it is skipped.
+        results.push({ phase, check: name, status: 'skip', detail: `not exercised: ${err.message}`, ms: Date.now() - started })
+        log(`  skip  ${phase}/${name}: not exercised: ${err.message}`)
+        failed.add(name)
+        return false
+      }
       const detail = describeError(err)
       results.push({ phase, check: name, status: 'fail', detail, ms: Date.now() - started })
       log(`  FAIL  ${phase}/${name}: ${detail}`)
@@ -1297,13 +1314,17 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(!(await indexLeadingWith(probeColumn)), `${probeColumn} was indexed as it was added, so there is no fault to repair`)
       const deadline = since.getTime() + args.repairWaitMinutes * 60_000
       let indexedAt: number | null = null
+      /** The loop's change freeze during an incident, if the feed shows one in the window: it repairs nothing then. */
+      let frozen: { at?: string; full?: string } | null = null
       for (;;) {
         const { events } = await operatorJson(
           `/api/projects/${args.project}/autonomy/events?since=${encodeURIComponent(sinceOnService.toISOString())}&limit=50`,
         )
-        const repair = ((events ?? []) as Array<{ action?: string; tableName?: string; full?: string; verified?: boolean; at?: string }>).find(
+        type Event = { action?: string; tableName?: string; full?: string; verified?: boolean; at?: string }
+        const repair = ((events ?? []) as Event[]).find(
           (e) => e.action === 'HEALTH_AUTO_FIXED' && e.tableName === TABLE && String(e.full ?? '').includes(`${TABLE}.${probeColumn}`),
         )
+        frozen = ((events ?? []) as Event[]).find((e) => e.action === 'AUTONOMY_CHANGE_FREEZE') ?? frozen
         const index = await indexLeadingWith(probeColumn)
         if (repair) {
           must(repair.verified === true, `the repair of ${probeColumn} ran but was not confirmed: ${repair.full}`)
@@ -1327,6 +1348,15 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
           )
         }
         if (Date.now() > deadline) {
+          // A freeze is the loop doing its job (it changes no backend mid-incident), not a failed repair; but the
+          // repair was not shown either, so the drill is reported as not exercised and the region is not qualified.
+          if (frozen) {
+            throw new NotExercised(
+              `held back by an incident freeze: the repair loop froze autonomous changes` +
+                `${frozen.at ? ` at ${frozen.at}` : ''} (${String(frozen.full ?? 'mid-incident').slice(0, 160)}) and ` +
+                `${probeColumn} was not repaired within ${args.repairWaitMinutes} minutes; run again when the project is calm`,
+            )
+          }
           throw new Error(
             `${probeColumn} was not repaired within ${args.repairWaitMinutes} minutes. The region's tasks need ` +
               'ENABLE_AUTONOMY_RECONCILER and ENABLE_AUTONOMY_LIVE_EXECUTION; the autonomy trust report says whether ' +
@@ -1561,6 +1591,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     await check('rollback-drills', 'described-after-reapply', ['reapplied-and-served'], async () => {
       return described('described again', keptTable, await untilDescribed(keptTable, 'listed', keptAt.reapplied), 'the reapply was asked for')
     })
+    await check('rollback-drills', 'functions-after-reapply', ['described-after-reapply'], async () => {
+      // Every table gets a generated `<table>-schema` endpoint; the reapply brought the table back, so it is back too.
+      const listed = await functionsGeneratedFor(keptTable)
+      must(listed.includes(`${keptTable}-schema`), `the reapply brought ${keptTable} back without its generated functions: listed ${listed.join(', ') || 'none'}`)
+      return `the functions generated for ${keptTable} are listed again: ${listed.join(', ')}`
+    })
 
     const parentTable = `qualify_parent_${run}`
     await check('rollback-drills', 'restore-refused-under-a-later-change', ['nothing-waiting'], async () => {
@@ -1592,6 +1628,14 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(res.status === 200 && res.body.status === 'restored', `the final restore answered ${res.status}: ${String(res.body.error ?? '').slice(0, 200)}`)
       must((await columnsOf(keptTable)) === null, `${keptTable} is still in the region's schema`)
       return `${keptTable} is gone again, its rows kept aside in the restore's vault`
+    })
+    await check('rollback-drills', 'functions-after-drill-restores', ['drill-tables-removed'], async () => {
+      // Every drill table is gone: put back automatically (partway), restored newest first (parent), restored again
+      // (kept). None may leave its generated functions behind.
+      const tables = [`qualify_partway_${run}`, parentTable, keptTable]
+      const left = (await Promise.all(tables.map((t) => functionsGeneratedFor(t)))).flat()
+      must(left.length === 0, `the drills removed their tables but left the functions generated for them: ${left.join(', ')}`)
+      return `no function generated for ${tables.join(', ')} is listed once their tables were removed`
     })
 
     // ── recovery ─────────────────────────────────────────────────────────────
