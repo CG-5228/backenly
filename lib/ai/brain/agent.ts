@@ -90,7 +90,7 @@ export interface BlockedCall {
  */
 const CONTROL_TOOLS = new Set<string>([
   'finish', 'propose_plan', 'ask_user', 'answer_question',
-  'apply_proposal', 'run_test', 'rollback',
+  'apply_proposal', 'run_test',
 ])
 
 /**

@@ -6,8 +6,8 @@
  * Design rules:
  *   - Every mutation tool is a thin wrapper over the existing `executeAction`
  *     (the 80-action executor in lib/ai/minimal-executor.ts). We REUSE it.
- *   - New control tools (propose_plan, ask_user, answer_question, run_test,
- *     rollback) live here and orchestrate brain-level concerns.
+ *   - New control tools (propose_plan, ask_user, answer_question, run_test)
+ *     live here and orchestrate brain-level concerns.
  *   - Tools return a compact JSON-safe summary the model can reason over.
  *   - Destructive tools are flagged so the agent loop can gate them.
  */
@@ -187,7 +187,6 @@ export type ToolName =
   | 'ask_user'
   | 'answer_question'
   | 'run_test'
-  | 'rollback'
   | 'finish'
 
 /**
@@ -1481,9 +1480,6 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       operation: { type: 'string', enum: ['list', 'create', 'get'] },
     },
     ['tableName', 'operation']),
-  fn('rollback',
-    'Undo the last N agent actions in this turn when verification fails or the user explicitly asks to rollback. Use sparingly — most failures should be fixed forward.',
-    { steps: { type: 'integer', minimum: 1, maximum: 10 } }),
   fn('finish',
     "End the turn. Call this when the user's request is fully satisfied OR when you need the user to answer a question / provide a credential before continuing. Provide a concise, product-voice summary.",
     {
@@ -3435,21 +3431,6 @@ export async function dispatchTool(
       })
     }
 
-    // ── Rollback ──────────────────────────────────────────────────────────
-    if (name === 'rollback') {
-      const steps = Math.max(1, Math.min(10, Number(args.steps ?? 1)))
-      // There is no undo of "the last N steps of this turn". Schema changes are
-      // recorded and rolled back as whole changes, by a person, which is what
-      // this points at instead of promising something that does not exist.
-      return finalize({
-        ok: false,
-        summary:
-          `Rolling back ${steps} step(s) of this turn is not how undo works here. Every governed change is recorded with a ` +
-          'checkpoint: list_schema_changes shows them, and revert_schema_change { changeId } asks for the state before one; a person approves it.',
-        data: { stepsRequested: steps, supported: false, use: ['list_schema_changes', 'revert_schema_change'] },
-      })
-    }
-
     // ── Mutations ─────────────────────────────────────────────────────────
     const builder = TOOL_TO_ACTION[name]
     if (builder) {
@@ -3724,7 +3705,6 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'ask_user': return 'Asking for clarification'
     case 'answer_question': return 'Answering'
     case 'run_test': return `Testing ${args.operation ?? 'endpoint'} on ${args.tableName ?? ''}`.trim()
-    case 'rollback': return `Rolling back ${args.steps ?? 1} step(s)`
     case 'finish': return 'Wrapping up'
     default: return name
   }

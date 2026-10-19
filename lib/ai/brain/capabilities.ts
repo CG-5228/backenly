@@ -324,12 +324,6 @@ export const TOOL_CAPABILITIES: Capability[] = [
     what: 'Answer questions about what Backenly is, what it can/cannot do, how it compares to other platforms, and general backend concepts — without building anything.',
     tool: 'answer_question',
   },
-  {
-    id: 'rollback',
-    name: 'Roll back recent changes',
-    what: 'Undo the last N agent actions when verification fails or the user asks. Drops created tables, removes generated APIs, etc.',
-    tool: 'rollback',
-  },
 
   // ── Connect Frontend ─────────────────────────────────────────────────────
   {
@@ -592,7 +586,7 @@ export const MANUAL_CAPABILITIES: Capability[] = [
   {
     id: 'history',
     name: 'Change history',
-    what: 'Every mutation is journaled. The History tab shows what changed, when, and supports rollback per change. The chat agent can roll back this turn (via rollback) but does not manage the history view itself.',
+    what: 'Every mutation is journaled. Database → Changes lists every schema change with its checks and offers Restore previous state for each, which a person runs; there is no undo of a whole turn. The chat agent can ask for a restore with revert_schema_change, which waits for a person\'s approval, but does not manage the history view itself.',
     manualOnly: true,
   },
   {
