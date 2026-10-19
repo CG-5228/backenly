@@ -1474,14 +1474,48 @@ async function runAgentLoop(
     const text = textOf(reply.message)
     if (text) emit({ type: 'thinking', text: text.slice(0, 320) })
 
+    const toolCalls = toolUsesOf(reply.message)
+
     // Cut off at the output ceiling: the last block may be a half-written tool
-    // call, so nothing in this answer is run.
+    // call, so nothing in this answer is run. What its stream had parsed can
+    // mean far more than was asked: disable_realtime with no tableName is every
+    // table. Each call is answered as cut off and the turn goes on, so the
+    // model can send it again shorter. Ending the turn here told it nothing,
+    // and a retry could write the same call again.
     if (reply.message.stop_reason === 'max_tokens') {
-      modelFailure = { code: 'MODEL_ERROR', reason: "the AI model's answer was cut off at its output limit", retryable: true }
+      if (toolCalls.length === 0) {
+        modelFailure = { code: 'MODEL_ERROR', reason: "the AI model's answer was cut off at its output limit", retryable: true }
+        break
+      }
+      console.log(`[Brain] answer cut off at the output limit, not run: ${toolCalls.map((c) => c.name).join(', ')}`)
+      messages.push({ role: 'assistant', content: reply.message.content })
+      messages.push({
+        role: 'user',
+        content: toolCalls.map((c) =>
+          toolResultBlock(
+            c.id,
+            {
+              ok: false,
+              summary:
+                `\`${c.name}\` was NOT run: your answer was cut off at the output limit, so this call may be ` +
+                `incomplete. Send it again with shorter arguments, or split the work into smaller calls.`,
+            },
+            true,
+          ),
+        ),
+      })
+      continue
+    }
+
+    // Cut off because this turn filled the model's context window: the last
+    // call may be half-written here too, but answering it would only add to a
+    // context that is already full. Nothing in this answer is run and the turn
+    // ends; a new turn starts from a fresh context, so it can be retried.
+    if (reply.message.stop_reason === 'model_context_window_exceeded') {
+      modelFailure = { code: 'MODEL_ERROR', reason: "the AI model's answer was cut off when this turn filled its context window", retryable: true }
       break
     }
 
-    const toolCalls = toolUsesOf(reply.message)
     if (toolCalls.length === 0) {
       // Preserve a no-tool reply too. When it follows a mutation, the next
       // model call must see the answer it is being asked to substantiate.
@@ -1523,7 +1557,6 @@ async function runAgentLoop(
     const verificationTurn = verificationSteered && mutated && !verifiedAfterMutation
     for (const toolCall of toolCalls) {
       const toolName = toolCall.name as ToolName
-      const args = (toolCall.input && typeof toolCall.input === 'object' ? toolCall.input : {}) as Record<string, unknown>
 
       // The verifier has one bounded turn. Never let a model response in that
       // turn replay or extend a mutation before the requested catalog read has
@@ -1536,6 +1569,29 @@ async function runAgentLoop(
         success = false
         break agentLoop
       }
+
+      // Arguments that are not an object (a string, when a model encodes them
+      // twice and the OpenAI adapter parses them once) are nothing this tool
+      // can take, and running it with `{}` instead can mean far more than was
+      // asked. The call is answered, not run, so the model can send it again.
+      if (!toolCall.input || typeof toolCall.input !== 'object' || Array.isArray(toolCall.input)) {
+        console.log(`[Brain] tool=${toolName} not run: its arguments were not an object`)
+        results.push(
+          toolResultBlock(
+            toolCall.id,
+            {
+              ok: false,
+              summary:
+                `\`${toolName}\` was NOT run: its arguments were not a JSON object. ` +
+                `Send the call again with its arguments as one JSON object.`,
+            },
+            true,
+          ),
+        )
+        continue
+      }
+      const args = toolCall.input as Record<string, unknown>
+
       // Set this before dispatch. If the catalog read throws or returns an
       // unsuccessful ToolResult, a later model iteration must not reopen the
       // bounded verification attempt.

@@ -209,13 +209,13 @@ describe('a turn on the gateway', () => {
     expect(JSON.parse(answered[0].content as string)).toMatchObject({ ok: false, blocked: 'needs_human_approval' })
   }, 60_000)
 
-  it('runs none of the calls in an answer cut off at its output limit', async () => {
+  // A cut-off answer with calls in it goes back to the model, each call
+  // answered as not run (brain-cut-off-tool-calls.spec.ts). One with no call
+  // has nothing to answer, so the turn stops.
+  it('stops on an answer cut off at its output limit before it called anything', async () => {
     const provider = scriptedProvider([
       classified('MODIFY'),
-      scriptedMessage({
-        toolUse: [{ id: 'toolu_create', name: 'create_table', input: { tableName: 'half_written', columns: [] } }],
-        stopReason: 'max_tokens',
-      }),
+      scriptedMessage({ text: 'I will add a half_written table with', stopReason: 'max_tokens' }),
     ])
 
     const { result } = await turn(provider, 'add a half_written table')
