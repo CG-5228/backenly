@@ -91,7 +91,7 @@ import { executeMaintenanceAddStructure } from '@/lib/autonomy/maintenance/primi
 import { dualWriteInstalled, installDualWrite, removeDualWrite } from '@/lib/autonomy/maintenance/primitives/dual-write'
 import { runBackfillBatch } from '@/lib/autonomy/maintenance/primitives/backfill'
 import { estimateDataMigration, executeDataMigration } from '@/lib/execution/data-migration'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { measureProjectDbBytes, snapshotProjectDbStorage } from '@/lib/usage/db-storage'
@@ -2270,5 +2270,62 @@ describe('deleting a project in another region', () => {
     expect(await schemaExists(regionalUrl, regional.schema)).toBe(false)
     expect(await roleExists(regional.role)).toBe(false)
     expect(await prisma.user.findUnique({ where: { id: user.id } })).toBeNull()
+  })
+})
+
+describe('the migration runner works in the project’s own region', () => {
+  // A project kept in another region whose schema name also exists in the home
+  // database, as one provisioned before project rows waited for the region's
+  // schema could leave behind. The home copy must never stand in for it.
+  const originalEngineMode = process.env.ENGINE_MODE
+  let stale = ''
+  const schemaAt = async (url: string, schema: string) =>
+    (await rowsIn<{ n: number }>(url, `SELECT count(*)::int AS n FROM pg_namespace WHERE nspname = '${schema}'`))[0].n > 0
+
+  beforeAll(async () => {
+    process.env.ENGINE_MODE = 'runtime'
+    stale = await createProject('us-east-1')
+    await seedMarker(homeUrl(), schemaOf(stale), 'left at home')
+  })
+
+  afterAll(async () => {
+    process.env.ENGINE_MODE = originalEngineMode
+    delete process.env[REGION_VARIABLE]
+    if (stale) {
+      await run(homeUrl(), `DROP SCHEMA IF EXISTS "${schemaOf(stale)}" CASCADE`).catch(() => {})
+      await prisma.project.deleteMany({ where: { id: stale } }).catch(() => {})
+    }
+  })
+
+  it('checks the region’s tables, not a copy left in the home database', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const { verifyTablesExist } = await import('@/lib/execution/migration-runner')
+    expect(await verifyTablesExist(regionalProject, ['marker'])).toMatchObject({ exists: true, foundTables: ['marker'] })
+    expect(await verifyTablesExist(stale, ['marker'])).toMatchObject({ exists: false, foundTables: [] })
+  })
+
+  it('reads nothing from the home database when the region has no connection', async () => {
+    delete process.env[REGION_VARIABLE]
+    const { verifyTablesExist } = await import('@/lib/execution/migration-runner')
+    expect(await verifyTablesExist(stale, ['marker'])).toMatchObject({ exists: false, foundTables: [] })
+  })
+
+  it('creates nothing in the home database for a project kept in another region', async () => {
+    delete process.env[REGION_VARIABLE]
+    const { runMigration } = await import('@/lib/execution/migration-runner')
+    const dir = mkdtempSync(join(tmpdir(), 'region-migration-'))
+    const schemaPath = join(dir, 'schema.prisma')
+    writeFileSync(schemaPath, 'datasource db {\n  provider = "postgresql"\n  url      = env("DATABASE_URL")\n}\n\nmodel Note {\n  id Int @id\n}\n')
+    const fresh = await createProject('us-east-1')
+    try {
+      const result = await runMigration(fresh, schemaPath, 'region-check')
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/DATABASE_URL_US_EAST_1 is not set/)
+      expect(await schemaAt(homeUrl(), `workspace_${fresh}`)).toBe(false)
+    } finally {
+      await run(homeUrl(), `DROP SCHEMA IF EXISTS "workspace_${fresh}" CASCADE`).catch(() => {})
+      await prisma.project.deleteMany({ where: { id: fresh } }).catch(() => {})
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
