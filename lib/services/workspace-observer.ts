@@ -59,8 +59,9 @@ import { generateFixPlansFromRawFindings, type FixPlan } from '@/lib/core/fix-pl
 import { runBuiltInVerification, type VerificationExecutionResult } from '@/lib/verification/verification-executor'
 import { FLAGS } from '@/lib/config/flags'
 import { watchableProjectsWhere, isWatchableProject } from '@/lib/projects/backend-presence'
-import { skipUnreachable } from '@/lib/autonomy/region-skip'
+import { canReach, skipUnreachable } from '@/lib/autonomy/region-skip'
 import { projectRegion } from '@/lib/data-plane/regional'
+import { partitionServed } from '@/lib/data-plane/serving'
 import { findingDetailsKeptHere } from '@/lib/data-plane/residency'
 import type { CloudRegionId } from '@/lib/regions'
 
@@ -82,6 +83,15 @@ export interface ObserverResult {
   fixPlans?: FixPlan[]
   /** Phase 13 — populated when ENABLE_VERIFICATION_EXECUTION + ENABLE_SAFE_VERIFICATION_MODE are on */
   verificationResult?: VerificationExecutionResult
+  /**
+   * Set when nothing was checked here. `served-elsewhere`: another region's
+   * worker checks and repairs the project on its own schedule. `unreachable`:
+   * this process cannot reach the project's region, and the skip is recorded
+   * (lib/autonomy/region-skip.ts).
+   */
+  skipped?: 'served-elsewhere' | 'unreachable'
+  /** The region whose worker checks the project, when it is served elsewhere. */
+  region?: CloudRegionId
 }
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -364,7 +374,22 @@ export async function runObserverForProject(projectId: string): Promise<Observer
     errors: [],
   }
 
-  // Nothing built means nothing can be wrong. This is the only gate, and it is
+  // A project is checked and repaired only by the region that serves it
+  // (lib/autonomy/region-skip.ts). The scheduled passes keep to their own
+  // projects before they get here, but a mutation's event, the event bus and
+  // the console reach this function for any project, so the rule is kept here,
+  // where every caller passes: nothing here detects or repairs a project
+  // another region serves. One this process cannot reach is skipped and
+  // recorded, as the scheduled passes do.
+  const { served } = await partitionServed([{ id: projectId }])
+  if (served.length === 0) {
+    const region = await projectRegion(projectId)
+    console.log(`[WorkspaceObserver] project=${projectId} is checked by its own region's worker (${region}); nothing was scanned here`)
+    return { ...result, skipped: 'served-elsewhere', region }
+  }
+  if (!(await canReach(projectId, 'observer'))) return { ...result, skipped: 'unreachable' }
+
+  // Nothing built means nothing can be wrong. This gate, like the region's, is
   // here rather than at the callers because five of them reach this function
   // (the dashboard's first-load kick, Re-scan, the event bus, the cron route
   // and the daily sweep) and the one that did not check is the one that
