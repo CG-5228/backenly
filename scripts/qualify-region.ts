@@ -25,6 +25,12 @@
  *     [--settle-wait-minutes 30] [--skip-deletion-drill] \
  *     [--foreign <a project of another region>@<its region>,...]
  *
+ * The home region (--region ap-south-1) is qualified the same way through the
+ * home host, which serves its data plane: --api is then the home host itself.
+ * Its snapshots and restores are taken by the home host while the request
+ * waits, and the two checks only a region's own host can make (no console
+ * paths; the home host's refusal) are reported as not run.
+ *
  * --foreign names projects that live in other regions (the home region's probe
  * project, another region's): the region's host must refuse each of them. No
  * key of theirs is needed, since the refusal comes before any key is read.
@@ -235,10 +241,15 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   }
   const api = url('--api')
   const home = url('--home')
-  if (!api.hostname.startsWith(`${region}.api.`)) {
-    throw new Error(`--api must be the region's host, ${region}.api.<domain>, not ${api.hostname}`)
+  if (region === HOME_REGION) {
+    // The home region's data plane is served by the home host itself.
+    if (api.origin !== home.origin) throw new Error(`--api must be the home host for ${HOME_REGION}, whose projects are served there`)
+  } else {
+    if (!api.hostname.startsWith(`${region}.api.`)) {
+      throw new Error(`--api must be the region's host, ${region}.api.<domain>, not ${api.hostname}`)
+    }
+    if (api.hostname === home.hostname) throw new Error('--api and --home are the same host: the region must be served apart from home')
   }
-  if (api.hostname === home.hostname) throw new Error('--api and --home are the same host: the region must be served apart from home')
 
   const connect: Record<string, string> = {}
   for (const pair of (flags.get('--connect') ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
@@ -753,7 +764,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(res.status === 200, `GET /api/v1/<project>/healthz at the region answered ${res.status}`)
       return 'the region serves the project'
     })
-    await check('region', 'no-console', [], async () => {
+    // The home region is served by the home host, which serves the console and
+    // has no home to refuse its projects: those two checks are a region's.
+    const atHome = args.region === HOME_REGION
+    if (atHome) {
+      notRun.push(`no console at the region host, and the home host's refusal of the project (${HOME_REGION} is served by the home host)`)
+    } else await check('region', 'no-console', [], async () => {
       for (const path of ['/app', '/api/projects', '/login']) {
         const res = await theFetch(apiUrl(path), { redirect: 'manual' })
         const body = await json(res)
@@ -761,7 +777,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       }
       return 'console paths are answered 404 by the region\'s load balancer'
     })
-    await check('region', 'wrong-region-at-home', [], async () => {
+    if (!atHome) await check('region', 'wrong-region-at-home', [], async () => {
       const res = await theFetch(homeUrl(`/api/v1/${args.project}/healthz`), { headers: { 'x-api-key': args.projectKey } })
       const body = await json(res)
       must(res.status === 421, `the home host answered ${res.status} for the regional project, not 421`)
@@ -1479,11 +1495,16 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const started = Date.now()
       const res = await theFetch(homeUrl(snapshotsPath), asOperator({ method: 'POST' }))
       const body = await json(res)
-      // A snapshot of a regional project taken at home would be a full copy of
-      // its data outside its region: home must queue it for the region instead.
-      must(res.status === 202 && body.queued === true, `asking for a snapshot answered ${res.status}, not 202 queued for the region`)
-      must(body.region === args.region, `the snapshot was queued for ${body.region}, not ${args.region}`)
-      await untilRegionDone(body.jobId, 'the snapshot')
+      if (atHome) {
+        // A home project's snapshot is taken by the home host, while it waits.
+        must(res.status === 201 && typeof body.data?.id === 'string', `asking for a snapshot answered ${res.status}, not 201 with the snapshot`)
+      } else {
+        // A snapshot of a regional project taken at home would be a full copy of
+        // its data outside its region: home must queue it for the region instead.
+        must(res.status === 202 && body.queued === true, `asking for a snapshot answered ${res.status}, not 202 queued for the region`)
+        must(body.region === args.region, `the snapshot was queued for ${body.region}, not ${args.region}`)
+        await untilRegionDone(body.jobId, 'the snapshot')
+      }
       const taken = ((await operatorJson(snapshotsPath)).data ?? []).filter((s: { id: string }) => !known.has(s.id))
       must(taken.length === 1 && taken[0].status === 'completed', `expected one new completed snapshot, found ${taken.length}`)
       snapshotId = taken[0].id
@@ -1514,8 +1535,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const started = Date.now()
       const res = await theFetch(homeUrl(snapshotsPath), asOperator({ method: 'PUT', body: JSON.stringify({ backupId: snapshotId }) }))
       const body = await json(res)
-      must(res.status === 202 && body.queued === true && body.region === args.region, `asking for the restore answered ${res.status}, not 202 queued for ${args.region}`)
-      await untilRegionDone(body.jobId, 'the restore')
+      if (atHome) {
+        must(res.status === 200 && body.success === true, `asking for the restore answered ${res.status}: ${String(body.error ?? '').slice(0, 200)}`)
+      } else {
+        must(res.status === 202 && body.queued === true && body.region === args.region, `asking for the restore answered ${res.status}, not 202 queued for ${args.region}`)
+        await untilRegionDone(body.jobId, 'the restore')
+      }
       const took = Date.now() - started
       for (const who of ['a', 'b'] as const) {
         const now = await idsOf(who)
@@ -1703,7 +1728,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         )
         const made = await json(created)
         must(created.status === 201 && typeof made.data?.id === 'string', `creating a project in ${args.region} answered ${created.status}: ${String(made.error ?? '').slice(0, 200)}`)
-        must(made.data.region === args.region, `the new project is in ${made.data.region}, not ${args.region}`)
+        // A home project's region may be recorded as null, which is the home region.
+        must((made.data.region ?? HOME_REGION) === args.region, `the new project is in ${made.data.region}, not ${args.region}`)
         const doomed = made.data.id as string
         const doomedKey = typeof made.apiKey === 'string' ? made.apiKey : null
         let deleted = false

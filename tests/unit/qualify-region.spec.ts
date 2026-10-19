@@ -87,6 +87,16 @@ describe('arguments', () => {
     expect(() => parseArgs([...ARGV, '--surprise', 'x'], ENV)).toThrow(/unknown option/)
   })
 
+  it('qualifies the home region through the home host, and only there', () => {
+    const home = ['--project', PROJECT, '--region', 'ap-south-1', '--api', 'https://staging.example.com',
+      '--home', 'https://staging.example.com', '--operator', 'qualify-operator@example.com']
+    expect(parseArgs(home, ENV)).toMatchObject({ region: 'ap-south-1' })
+    expect(parseArgs(home, ENV).api.origin).toBe('https://staging.example.com')
+    const elsewhere = [...home]
+    elsewhere[elsewhere.indexOf('--api') + 1] = 'https://ap-south-1.api.staging.example.com'
+    expect(() => parseArgs(elsewhere, ENV)).toThrow(/must be the home host/)
+  })
+
   it('runs the rollback drills, with what each needs from the run', () => {
     const plain = parseArgs(ARGV, ENV)
     // Without a member or a kill command those two drills are not run, and say so.
