@@ -47,6 +47,7 @@ import { latestRun, ledgerSteps, readLatestEvolutionApproval } from './consent'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite, reloadDataPlane, runStatements, unregisterTable } from './primitives'
 import { workspaceAt, type WorkspaceAt } from './workspace'
+import { dbWords } from './residency'
 import { closeWritesSql, dropForwardSyncSql, dropSatelliteSql, fq, hostLadderObjects, ladderNames, revokeReadsSql } from './sql'
 
 export interface RollbackAction {
@@ -83,6 +84,9 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   const at = await workspaceAt(projectId)
   const { schema } = at
   const target = { schema }
+  // What this project's records at home may quote (./residency.ts): the
+  // reason and actions below are kept in the ledger and architecture memory.
+  const { quote } = at
   const ledger = await ledgerSteps(projectId, planId)
   // What a rung observed after committing, whatever its final status: a rung
   // that created a table and then failed its postcondition still created it.
@@ -139,7 +143,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     try {
       await runStatements(at, sql)
     } catch (err) {
-      actions.push({ action, outcome: 'failed', detail: databaseWords(err) })
+      actions.push({ action, outcome: 'failed', detail: databaseWords(err, quote) })
       return false
     }
     if (!(await verify())) {
@@ -156,9 +160,11 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     const r = await reconcileExtraction(projectId, facts, spec)
     // A partial view proves nothing either way.
     if (!r.complete) return `${r.summary}; Backenly cannot show that dropping ${spec.satellite} would lose nothing`
+    // The keys are rows' own values: named only where the project's records may quote them.
+    const keys = quote ? `; keys ${[...r.samples.orphaned, ...r.samples.mismatched].join(', ')}` : ''
     return r.orphaned > 0 || r.mismatched > 0
-      ? `${spec.satellite} holds data ${spec.host} does not (${r.orphaned} orphaned, ${r.mismatched} different; ` +
-          `keys ${[...r.samples.orphaned, ...r.samples.mismatched].join(', ')}). Dropping it would lose that; reconcile by hand first.`
+      ? `${spec.satellite} holds data ${spec.host} does not (${r.orphaned} orphaned, ${r.mismatched} different${keys}). ` +
+          'Dropping it would lose that; reconcile by hand first.'
       : null
   }
 
@@ -188,7 +194,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   // The second lossless check, after the satellite stopped taking writes.
   const recheck = async (): Promise<boolean> => {
     if (!sat) return true
-    const problem = await lossless().catch(err => `the lossless check could not run: ${err instanceof Error ? err.message : String(err)}`)
+    const problem = await lossless().catch(err => `the lossless check could not run: ${databaseWords(err, quote)}`)
     if (!problem) return true
     actions.push({ action: 'close_writes', outcome: 'failed', detail: `writes are closed, nothing was dropped: ${problem}` })
     return false
@@ -311,11 +317,11 @@ async function dependentsOf(at: WorkspaceAt, satellite: string): Promise<string[
   return rows.map(r => r.what)
 }
 
-/** A driver error in the database's own words, on one line. */
-function databaseWords(err: unknown): string {
+/** A driver error in the database's own words, on one line, where the project's records may quote them. */
+function databaseWords(err: unknown, quote: boolean): string {
   const raw = err instanceof Error ? err.message : String(err)
   const m = /Message: `(?:ERROR: )?([^`]*)`/.exec(raw)
-  return (m ? m[1] : raw).replace(/\s+/g, ' ').trim().slice(0, 300)
+  return dbWords((m ? m[1] : raw).replace(/\s+/g, ' ').trim().slice(0, 300), quote)
 }
 
 async function withdraw(approvalId: string, by: string, actions: RollbackAction[]): Promise<void> {

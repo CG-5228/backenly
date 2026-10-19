@@ -158,8 +158,7 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
   const start = await startingCursor(payload)
   if ('refusal' in start) return stop(start.refusal)
   // What a result may show of a cursor: nothing, for a project kept elsewhere.
-  const regional = (await projectRegion(payload.projectId)) !== HOME_REGION
-  const shown = (c: string | null) => (regional ? null : c)
+  const shown = (c: string | null) => (at.quote ? c : null)
 
   const sql = backfillBatchSql(host, payload.spec, { schema }, BACKFILL_BATCH_ROWS)
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')

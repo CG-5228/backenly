@@ -87,6 +87,11 @@ export interface EvolutionRequestDetails {
    * must migrate before the old columns could ever be retired.
    */
   technical: {
+    /**
+     * Set for a project kept in another region: its statements are not stored
+     * here, and are shown, when asked for, rendered from its own tables.
+     */
+    sqlWithheld?: boolean
     steps: Array<{ title: string; why: string; tier: number; humanOnly: boolean; sql: string[] }>
     evidence: Array<{ family: string; verdict: string; detail: string }>
     pressure: Array<{ kind: string; class: string; detail: string }>

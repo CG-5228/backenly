@@ -31,32 +31,27 @@ export async function asService<T = any>(sql: string, ...p: unknown[]): Promise<
 }
 
 /**
- * A project whose `orders` carries refunds that arrived together, are set on
- * the same rows, and keep changing — the same shape as the structural
- * evolution suite, which the analysis proposes to extract.
+ * The statements that create and fill `orders` in `schema`, whose refunds
+ * arrived together, are set on the same rows, and keep changing. The schema
+ * must already exist, with its JWT claim function (the policy reads it).
  */
-export async function buildProject(label: string): Promise<Fixture> {
-  const ownerId = (await prisma.user.create({
-    data: { email: `evo-engine-${label}-${randomBytes(6).toString('hex')}@example.test`, password: 'not-a-real-hash', name: 'evo' },
-  })).id
-  const projectId = (await prisma.project.create({ data: { name: `evolution-engine-${label}`, userId: ownerId } })).id
-  const schema = await resolveWorkspaceSchema(projectId)
+export function ordersSql(schema: string): string[] {
   const t = (n: string) => `"${schema}"."${n}"`
-  await q(`CREATE SCHEMA "${schema}"`)
-  await q(jwtClaimFunctionSql(schema))
-  await q(`CREATE TABLE ${t('orders')} (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id uuid NOT NULL,
-    total numeric NOT NULL,
-    status text NOT NULL DEFAULT 'placed',
-    created_at timestamptz NOT NULL DEFAULT now(),
-    refund_amount numeric CHECK (refund_amount >= 0),
-    refund_reason text,
-    refunded_at timestamptz,
-    coupon_code text,
-    discount_amount numeric
-  )`)
-  await q(
+  const svc = `"${schema}"."backenly_jwt_claim"('role') = 'service_role'`
+  const sub = `"${schema}"."backenly_jwt_claim"('sub')`
+  return [
+    `CREATE TABLE ${t('orders')} (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id uuid NOT NULL,
+      total numeric NOT NULL,
+      status text NOT NULL DEFAULT 'placed',
+      created_at timestamptz NOT NULL DEFAULT now(),
+      refund_amount numeric CHECK (refund_amount >= 0),
+      refund_reason text,
+      refunded_at timestamptz,
+      coupon_code text,
+      discount_amount numeric
+    )`,
     `INSERT INTO ${t('orders')} (user_id, total, created_at, refund_amount, refund_reason, refunded_at, coupon_code, discount_amount)
      SELECT gen_random_uuid(), (i % 90) + 10, now() - (i || ' hours')::interval,
             CASE WHEN i % 5 = 0 THEN (i % 40) + 1 END,
@@ -65,14 +60,18 @@ export async function buildProject(label: string): Promise<Fixture> {
             CASE WHEN i % 5 = 1 THEN 'SAVE10' END,
             CASE WHEN i % 5 = 2 THEN 5 END
        FROM generate_series(1, 300) i`,
-  )
-  const svc = `"${schema}"."backenly_jwt_claim"('role') = 'service_role'`
-  const sub = `"${schema}"."backenly_jwt_claim"('sub')`
-  await q(`ALTER TABLE ${t('orders')} ENABLE ROW LEVEL SECURITY`)
-  await q(`ALTER TABLE ${t('orders')} FORCE ROW LEVEL SECURITY`)
-  await q(`CREATE POLICY orders_rw ON ${t('orders')} FOR ALL USING (${svc} OR user_id::text = ${sub}) WITH CHECK (${svc} OR user_id::text = ${sub})`)
-  await q(`ANALYZE ${t('orders')}`)
+    `ALTER TABLE ${t('orders')} ENABLE ROW LEVEL SECURITY`,
+    `ALTER TABLE ${t('orders')} FORCE ROW LEVEL SECURITY`,
+    `CREATE POLICY orders_rw ON ${t('orders')} FOR ALL USING (${svc} OR user_id::text = ${sub}) WITH CHECK (${svc} OR user_id::text = ${sub})`,
+    `ANALYZE ${t('orders')}`,
+  ]
+}
 
+/**
+ * What the platform keeps at home about such a project, wherever its tables
+ * are: the schema history that dates the refund columns, and a day of reads.
+ */
+export async function recordHistory(projectId: string, ownerId: string): Promise<void> {
   const base = ['id', 'user_id', 'total', 'status', 'created_at']
   const snap = (v: number, days: number, cols: string[] | null) =>
     prisma.workspaceSchemaSnapshot.create({
@@ -102,6 +101,23 @@ export async function buildProject(label: string): Promise<Fixture> {
       timestamp: new Date(Date.now() - 86_400_000),
     })),
   })
+}
+
+/**
+ * A project whose `orders` carries refunds that arrived together, are set on
+ * the same rows, and keep changing — the same shape as the structural
+ * evolution suite, which the analysis proposes to extract.
+ */
+export async function buildProject(label: string): Promise<Fixture> {
+  const ownerId = (await prisma.user.create({
+    data: { email: `evo-engine-${label}-${randomBytes(6).toString('hex')}@example.test`, password: 'not-a-real-hash', name: 'evo' },
+  })).id
+  const projectId = (await prisma.project.create({ data: { name: `evolution-engine-${label}`, userId: ownerId } })).id
+  const schema = await resolveWorkspaceSchema(projectId)
+  await q(`CREATE SCHEMA "${schema}"`)
+  await q(jwtClaimFunctionSql(schema))
+  for (const sql of ordersSql(schema)) await q(sql)
+  await recordHistory(projectId, ownerId)
   return { ownerId, projectId, schema }
 }
 

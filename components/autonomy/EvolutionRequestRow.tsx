@@ -284,7 +284,13 @@ export function EvolutionRequestRow({
 
           <p className="mt-1.5 text-[12px] text-zinc-600">{timeAgo(request.detectedAt)}</p>
 
-          <TechnicalDetails ev={ev} open={showTechnical} onToggle={() => setShowTechnical(v => !v)} />
+          <TechnicalDetails
+            ev={ev}
+            projectId={projectId}
+            findingId={request.id}
+            open={showTechnical}
+            onToggle={() => setShowTechnical(v => !v)}
+          />
 
           {state.phase === 'confirm_undo' && (
             <div className="mt-2 flex items-start gap-2 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2">
@@ -370,18 +376,41 @@ function lowerFirst(s: string): string {
 
 // ── Technical details (opt-in) ───────────────────────────────────────────────
 
+/** A regional project's statements, read when asked for (GET /architecture?statements=). */
+type LiveStatements = { phase: 'idle' | 'loading' } | { phase: 'error'; message: string } | { phase: 'shown'; current: boolean; steps: Array<{ sql: string[] }> }
+
 function TechnicalDetails({
   ev,
+  projectId,
+  findingId,
   open,
   onToggle,
 }: {
   ev: EvolutionRequestDetails
+  projectId: string
+  findingId: string
   open: boolean
   onToggle: () => void
 }) {
   const [sqlOpen, setSqlOpen] = useState<Record<number, boolean>>({})
+  const [live, setLive] = useState<LiveStatements>({ phase: 'idle' })
   const t = ev.technical
   if (!t) return null
+  const showLive = async () => {
+    setLive({ phase: 'loading' })
+    try {
+      const res = await fetch(`/api/projects/${projectId}/architecture?statements=${encodeURIComponent(findingId)}`, { credentials: 'include' })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) return setLive({ phase: 'error', message: j.error ?? 'The statements could not be read.' })
+      setLive({ phase: 'shown', current: !!j.current, steps: Array.isArray(j.steps) ? j.steps : [] })
+    } catch {
+      setLive({ phase: 'error', message: 'The statements could not be read.' })
+    }
+  }
+  // A project kept in another region keeps its statements there: read them
+  // when asked, and only while they are still the version being approved.
+  const sqlOf = (i: number, stored: string[] | undefined): string[] =>
+    stored?.length ? stored : live.phase === 'shown' && live.current ? live.steps[i]?.sql ?? [] : []
   const steps = t.steps ?? []
   const evidence = t.evidence ?? []
   const pressure = t.pressure ?? []
@@ -406,6 +435,28 @@ function TechnicalDetails({
           {steps.length > 0 && (
             <div>
               <p className="font-medium text-zinc-400">Steps</p>
+              {t.sqlWithheld && (
+                <p className="mt-0.5 text-zinc-500">
+                  {live.phase === 'shown' && !live.current
+                    ? 'The table changed since this was prepared. Backenly rehearses it again and asks about the new version.'
+                    : live.phase === 'error'
+                      ? live.message
+                      : "This project's exact SQL stays in its region and is not stored outside it."}
+                  {live.phase !== 'shown' && (
+                    <>
+                      {' '}
+                      <button
+                        type="button"
+                        onClick={showLive}
+                        disabled={live.phase === 'loading'}
+                        className="font-medium text-zinc-400 transition-colors hover:text-zinc-200 disabled:opacity-50"
+                      >
+                        {live.phase === 'loading' ? 'Reading it…' : 'Show it'}
+                      </button>
+                    </>
+                  )}
+                </p>
+              )}
               <ol className="mt-1 space-y-2">
                 {steps.map((st, i) => (
                   <li key={i}>
@@ -416,7 +467,7 @@ function TechnicalDetails({
                     {st.humanOnly && (
                       <p className="mt-0.5 text-zinc-500">Left to a person. Backenly never runs this step.</p>
                     )}
-                    {st.sql?.length > 0 && (
+                    {sqlOf(i, st.sql).length > 0 && (
                       <div className="mt-1">
                         <button
                           type="button"
@@ -424,12 +475,12 @@ function TechnicalDetails({
                           aria-expanded={!!sqlOpen[i]}
                           className="inline-flex items-center gap-1 text-[12px] text-zinc-500 transition-colors hover:text-zinc-300"
                         >
-                          SQL{st.sql.length > 1 ? ` (${st.sql.length} statements)` : ''}
+                          SQL{sqlOf(i, st.sql).length > 1 ? ` (${sqlOf(i, st.sql).length} statements)` : ''}
                           <ChevronDown className={`size-3 transition-transform ${sqlOpen[i] ? 'rotate-180' : ''}`} />
                         </button>
                         {sqlOpen[i] && (
                           <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md border border-white/[0.07] bg-[#08090a] px-3 py-2 font-mono text-[12px] leading-relaxed text-zinc-300">
-                            {st.sql.join('\n\n')}
+                            {sqlOf(i, st.sql).join('\n\n')}
                           </pre>
                         )}
                       </div>

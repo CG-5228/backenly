@@ -33,7 +33,7 @@ import {
 import type { PlanTraits } from '@/lib/evolution-engine/policy'
 import { analyzeStructuralEvolution, type ProposalView } from './index'
 import type { ConcernAssessment } from './concerns'
-import { extractionPlanId, requiredTier, type ExtractionPlan, type ExtractionStep, type ExtractionStepKind } from './plan'
+import { extractionPlanId, type ExtractionPlan, type ExtractionStep, type ExtractionStepKind } from './plan'
 import { normaliseSpec, resolveExtractionPlan, isResolveRefusal } from './resolve'
 import { readTableFacts } from './facts'
 import { rehearseExtraction } from './rehearse'
@@ -43,7 +43,7 @@ import { executeExtraction } from './execute'
 import { reconcileExtraction } from './reconcile'
 import { rollbackExtraction } from './rollback'
 import { measureExtraction, observeExtraction, snapshotExtraction } from './telemetry'
-import { ladderNames, type ExtractionSpec } from './sql'
+import type { ExtractionSpec } from './sql'
 
 export const STRUCTURAL_EXTRACTION = 'structural_extraction'
 
@@ -282,27 +282,3 @@ export const structuralExtraction: EvolutionPrimitive<ExtractionSpec, Structural
 }
 
 registerPrimitive(structuralExtraction)
-
-/** For the request's opt-in technical section: what a person may want to read. */
-export function technicalOf(plan: StructuralPlan, opportunity: Opportunity<ExtractionSpec>) {
-  const d = (opportunity.diagnostics ?? {}) as {
-    clientMigration?: Array<{ purpose: string; before: string; after: string }>
-  }
-  return {
-    steps: plan.steps.map(s => ({
-      title: s.title,
-      why: s.why,
-      tier: s.tier,
-      humanOnly: s.capability === 'human_only',
-      sql: s.sql,
-    })),
-    evidence: opportunity.evidence,
-    pressure: opportunity.pressure,
-    semanticBoundary: opportunity.semanticBoundary,
-    contractBlockers: plan.contractBlockers,
-    caveats: plan.caveats,
-    clientMigration: d.clientMigration ?? [],
-    requiredTier: requiredTier(plan as unknown as ExtractionPlan),
-    names: { satellite: plan.spec.satellite, parentKey: ladderNames(plan.spec).fkColumn },
-  }
-}

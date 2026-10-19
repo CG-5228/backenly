@@ -19,6 +19,11 @@
  *                            record at home keeps the catalog's structure and
  *                            digests, never its definitions or the SQL that
  *                            ran; the definitions are kept in the region
+ *
+ * A second project there goes through the engine's own path, proposal to undo,
+ * and every record the platform keeps of it at home is then searched: names,
+ * kinds, counts and ids, never a statement, a definition, or a row's value
+ * (lib/structural-evolution/residency.ts).
  */
 
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -42,6 +47,8 @@ import { rollbackExtraction } from '@/lib/structural-evolution/rollback'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
 import { workspaceAt } from '@/lib/structural-evolution/workspace'
 import { ladderNames, type ExtractionSpec } from '@/lib/structural-evolution/sql'
+import { advance, approveRequest, isApprovalRefusal, liveStatements, observe, proposeChanges, undo } from '@/lib/evolution-engine/engine'
+import { ordersSql, recordHistory, requestsOf, stateOf } from '../helpers/evolution-engine-fixture'
 
 jest.setTimeout(300_000)
 
@@ -138,23 +145,29 @@ beforeAll(async () => {
   await inRegion(`GRANT SELECT, UPDATE ON ${t('orders')} TO "${ROLE}"`)
 }, 120_000)
 
+/** Every row the platform keeps at home for a project of this suite. */
+async function forgetAtHome(id: string, owner: string): Promise<void> {
+  await prisma.backendChange.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.maintenanceStepExecution.deleteMany({ where: { execution: { projectId: id } } }).catch(() => {})
+  await prisma.maintenanceExecution.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.maintenanceApproval.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.backgroundJob.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.healthFinding.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.auditLog.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.apiRequestLog.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.workspaceSchemaSnapshot.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.table.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.workspace.deleteMany({ where: { projectId: id } }).catch(() => {})
+  await prisma.project.deleteMany({ where: { id } }).catch(() => {})
+  await prisma.user.delete({ where: { id: owner } }).catch(() => {})
+}
+
 afterAll(async () => {
   for (const [k, v] of [['ENABLE_EVOLUTION_MUTATIONS', saved.mutations], ['ENGINE_MODE', saved.engineMode]] as const) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v
   }
-  if (projectId) {
-    await prisma.backendChange.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.maintenanceStepExecution.deleteMany({ where: { execution: { projectId } } }).catch(() => {})
-    await prisma.maintenanceExecution.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.maintenanceApproval.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.backgroundJob.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.workspaceSchemaSnapshot.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.table.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.workspace.deleteMany({ where: { projectId } }).catch(() => {})
-    await prisma.project.deleteMany({ where: { id: projectId } }).catch(() => {})
-  }
-  if (ownerId) await prisma.user.delete({ where: { id: ownerId } }).catch(() => {})
+  if (ownerId) await forgetAtHome(projectId, ownerId)
   await closeChangeLockPool()
   await closeMaintenanceLockPool()
   await closeAllWorkspacePools()
@@ -283,5 +296,116 @@ describe('a project kept in us-east-1', () => {
       select: { status: true, source: true, actorUserId: true, statements: true },
     })
     expect(undo).toMatchObject({ status: 'healthy', source: 'dashboard', actorUserId: ownerId, statements: [] })
+  })
+})
+
+/** Every string in `value` that `quotes` matches, with where it is: `findings[0].details.evolution...`. */
+function leaks(value: unknown, quotes: (text: string) => boolean, path = ''): string[] {
+  if (typeof value === 'string') return quotes(value) ? [`${path}: ${value.slice(0, 160)}`] : []
+  if (value instanceof Date || value === null || typeof value !== 'object') return []
+  return Object.entries(value).flatMap(([k, v]) => leaks(v, quotes, Array.isArray(value) ? `${path}[${k}]` : path ? `${path}.${k}` : k))
+}
+
+describe('the engine, for a project kept in us-east-1', () => {
+  const p = { ownerId: '', projectId: '', schema: '' }
+  let findingId = ''
+  let decisionId = ''
+  let planVersion = ''
+  /** Every id and user id in the project's rows: values no record at home may carry. */
+  let rowValues: string[] = []
+
+  beforeAll(async () => {
+    p.ownerId = (await prisma.user.create({
+      data: { email: `evo-rg-engine-${randomBytes(6).toString('hex')}@example.test`, password: 'not-a-real-hash', name: 'evo region engine' },
+    })).id
+    p.projectId = (await prisma.project.create({ data: { name: 'evolution-regional-engine', userId: p.ownerId, region: 'us-east-1' } })).id
+    p.schema = getWorkspaceDatabaseNames(p.projectId).postgresSchema
+    await prisma.workspace.create({ data: { name: 'evolution regional engine', projectId: p.projectId, postgresSchema: p.schema, databaseProvisioned: true } })
+    await inRegion(`CREATE SCHEMA "${p.schema}"`)
+    await inRegion(jwtClaimFunctionSql(p.schema))
+    for (const sql of ordersSql(p.schema)) await inRegion(sql)
+    await recordHistory(p.projectId, p.ownerId)
+    const rows = await inRegion<{ id: string; user_id: string }>(`SELECT id::text, user_id::text FROM "${p.schema}"."orders"`)
+    rowValues = rows.flatMap(r => [r.id, r.user_id])
+    expect(rowValues).toHaveLength(600)
+  }, 120_000)
+  afterAll(async () => {
+    if (p.ownerId) await forgetAtHome(p.projectId, p.ownerId)
+  }, 60_000)
+
+  it('proposes from the region, and the request at home carries no statement', async () => {
+    const pass = await proposeChanges(p.projectId)
+    expect(pass.requested).toBe(1)
+    const [req] = await requestsOf(p.projectId)
+    expect(req.ev).toMatchObject({ ask: 'approve', subject: 'orders', level: 'executable_proposal' })
+    expect(req.ev.rehearsal).toMatchObject({ passed: true })
+    expect(req.ev.technical.sqlWithheld).toBe(true)
+    expect(req.ev.technical.steps.length).toBeGreaterThan(0)
+    expect(req.ev.technical.steps.every(st => st.sql.length === 0)).toBe(true)
+    findingId = req.id
+    decisionId = req.ev.decisionId
+    planVersion = req.ev.planVersion
+  })
+
+  it('shows the exact statements to a person who opens them, rendered in the region, of the version they approve', async () => {
+    const live = await liveStatements(p.projectId, findingId)
+    expect(live).toMatchObject({ planVersion, current: true })
+    const sql = live!.steps.flatMap(st => st.sql).join('\n')
+    expect(sql).toMatch(/CREATE TABLE/)
+    expect(sql).toContain(`"${p.schema}"`)
+  })
+
+  it('is approved, expanded and backfilled in the region, and its step ledger at home keeps no statement', async () => {
+    const r = await approveRequest({ projectId: p.projectId, findingId, planVersion, userId: p.ownerId })
+    if (isApprovalRefusal(r)) throw new Error(r.error)
+    expect(r.state).toBe('backfilling')
+    const steps = await prisma.maintenanceStepExecution.findMany({ where: { execution: { projectId: p.projectId } } })
+    expect(steps.length).toBeGreaterThan(0)
+    for (const st of steps) {
+      expect(st.preconditionEvidence).toMatchObject({ sql: [], sqlWithheld: true })
+      if (st.rollback) expect(st.rollback).toMatchObject({ sql: [] })
+    }
+    expect(await drainInRegion()).toBeGreaterThan(0)
+    expect((await advance({ projectId: p.projectId, decisionId })).state).toBe('observing')
+    const [{ n }] = await inRegion<{ n: string }>(`SELECT count(*)::text AS n FROM "${p.schema}"."order_refunds"`)
+    expect(n).toBe('60')
+  })
+
+  it('is watched from the region until it is stable', async () => {
+    const cutoverAt = (await stateOf(p.projectId, decisionId)).cutoverAt!
+    const at = (h: number) => new Date(cutoverAt.getTime() + h * 3_600_000)
+    expect((await observe({ projectId: p.projectId, decisionId, now: at(1) })).verdict).toBe('continue')
+    await observe({ projectId: p.projectId, decisionId, now: at(12) })
+    expect((await observe({ projectId: p.projectId, decisionId, now: at(25) })).verdict).toBe('stable')
+  })
+
+  it('is undone in the region', async () => {
+    const r = await undo({ projectId: p.projectId, decisionId, userId: p.ownerId })
+    expect(r.ok).toBe(true)
+    expect((await stateOf(p.projectId, decisionId)).state).toBe('rolled_back')
+    expect(await inRegion(`SELECT to_regclass($1) AS r`, [`"${p.schema}"."order_refunds"`])).toEqual([{ r: null }])
+  })
+
+  it('left nothing at home that quotes a statement, a definition, or a row', async () => {
+    const id = p.projectId
+    const home = {
+      findings: await prisma.healthFinding.findMany({ where: { projectId: id } }),
+      memory: await prisma.auditLog.findMany({ where: { projectId: id } }),
+      approvals: await prisma.maintenanceApproval.findMany({ where: { projectId: id } }),
+      executions: await prisma.maintenanceExecution.findMany({ where: { projectId: id } }),
+      steps: await prisma.maintenanceStepExecution.findMany({ where: { execution: { projectId: id } } }),
+      jobs: await prisma.backgroundJob.findMany({ where: { projectId: id } }),
+      changes: await prisma.backendChange.findMany({ where: { projectId: id } }),
+      events: await prisma.backendChangeEvent.findMany({ where: { projectId: id } }),
+    }
+    // The whole life is there, by names and counts.
+    expect(JSON.stringify(home)).toContain('order_refunds')
+    const statement = /CREATE (TABLE|POLICY|TRIGGER|FUNCTION|INDEX)|INSERT INTO|ALTER TABLE|DROP (TABLE|TRIGGER|FUNCTION)/i
+    const definition = /refund_amount >= 0|backenly_jwt_claim\(|SECURITY DEFINER|set_config/i
+    const values = new Set(rowValues)
+    const found = leaks(home, text =>
+      statement.test(text) || definition.test(text) || /\bdamaged\b|SAVE10/.test(text) || [...values].some(v => text.includes(v)),
+    )
+    expect(found).toEqual([])
   })
 })

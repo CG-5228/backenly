@@ -89,6 +89,8 @@ import type { WorkspaceAt } from './workspace'
 import type { RlsIdentity } from '@/lib/services/rls-session'
 import { granteesWith, type TableFacts } from './facts'
 import { reconcileWith } from './reconcile'
+import { rowOf, someKeys } from './residency'
+import { quotedError } from '@/lib/data-plane/residency'
 import {
   backfillBatchSql,
   carriedObjects,
@@ -185,6 +187,13 @@ const brief = (err: string) => {
   return (m ? m[1] : err).replace(/\s+/g, ' ').trim().slice(0, 200)
 }
 
+/**
+ * The database's words, for a report the project's records at home may keep:
+ * they can quote a row ("Failing row contains ..."), so for a project kept in
+ * another region they are the platform's sentence instead (./residency.ts).
+ */
+const said = (err: unknown, quote: boolean) => quotedError(brief(message(err)), quote)
+
 const SERVICE: RlsIdentity = { userId: '', isServiceRole: true, userRole: 'service' }
 
 export async function rehearseExtraction(
@@ -263,7 +272,7 @@ export async function rehearseExtraction(
 
         // ── The live host's access, given to the copy ───────────────────────
         // After the rows are in, so the copy itself is not filtered twice.
-        const access = await reproduceHostAccess(tx, facts, spec, scratch)
+        const access = await reproduceHostAccess(tx, facts, spec, scratch, at.quote)
 
         // ── The ladder, exactly as rendered for production ──────────────────
         for (const s of createSatelliteSql(facts, spec, scratch, carried, planId)) await exec(s)
@@ -351,6 +360,7 @@ export async function rehearseExtraction(
                   policyText: access.policyText,
                   session: { sql: rlsSessionSql, params: rlsSessionParams },
                   notes: accessNotes,
+                  quote: at.quote,
                 })
               : {
                   status: 'unavailable',
@@ -435,7 +445,7 @@ export async function rehearseExtraction(
   } catch (err) {
     if (!(err instanceof RolledBack) && message(err) !== 'bkn_rehearsal_rollback') {
       report.passed = false
-      report.error = message(err)
+      report.error = quotedError(message(err), at.quote)
       if (report.authorization.detail === 'not reached') {
         report.authorization.detail = `not rehearsed: the rehearsal could not run (${brief(report.error)})`
       }
@@ -477,6 +487,7 @@ async function reproduceHostAccess(
   facts: TableFacts,
   spec: ExtractionSpec,
   scratch: RenderTarget,
+  quote: boolean,
 ): Promise<{ problem: string | null; policyText: string }> {
   const exec = (sql: string, ...p: unknown[]) => tx.$executeRawUnsafe(sql, ...p)
   const rows = <T>(sql: string, ...p: unknown[]) => tx.$queryRawUnsafe<T[]>(sql, ...p)
@@ -562,7 +573,7 @@ async function reproduceHostAccess(
     // Rolling back to the savepoint also restores the search path.
     await exec('ROLLBACK TO SAVEPOINT bkn_rehearse_access')
     await exec('RELEASE SAVEPOINT bkn_rehearse_access')
-    return { problem: brief(message(err)), policyText: '' }
+    return { problem: said(err, quote), policyText: '' }
   }
 }
 
@@ -582,6 +593,8 @@ interface AccessScope {
   session: { sql: (from?: number) => string; params: (identity: RlsIdentity) => unknown[] }
   /** Lines for `notRehearsed` about identities that were not exercised. */
   notes: string[]
+  /** Whether the report may name rows by key and quote the database (./residency.ts). */
+  quote: boolean
 }
 
 interface ClaimContext {
@@ -610,7 +623,7 @@ const TEXTUAL = new Set(['text', 'varchar', 'bpchar', 'citext', 'name'])
 const INTEGRAL = new Set(['int2', 'int4', 'int8'])
 
 async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsal> {
-  const { tx, facts, spec, scratch, session } = scope
+  const { tx, facts, spec, scratch, session, quote } = scope
   const exec = (sql: string, ...p: unknown[]) => tx.$executeRawUnsafe(sql, ...p)
   const rows = <T>(sql: string, ...p: unknown[]) => tx.$queryRawUnsafe<T[]>(sql, ...p)
   const names = ladderNames(spec)
@@ -624,6 +637,8 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
   const types = spec.members.map(n => facts.columns.find(c => c.name === n)!.type)
   const anySet = `(${m.map(c => `${c} IS NOT NULL`).join(' OR ')})`
   const key = (i: number) => `($${i}::text)::${pkType}`
+  /** A host row in a check's words: by its key only where the report may quote it. */
+  const row = (k: string) => rowOf(spec.host, k, quote)
   const value = (i: number) => `($${i}::text)::${types[i - 2]}`
   const unavailable = (detail: string): AuthorizationRehearsal => ({ status: 'unavailable', detail, identities: 0, checks: [] })
 
@@ -658,7 +673,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
       await exec(`SET LOCAL ROLE ${qi(role)}`)
       assumable.push(role)
     } catch (err) {
-      refusedRoles.push(`${role} (${brief(message(err))})`)
+      refusedRoles.push(`${role} (${said(err, quote)})`)
     }
     await exec('ROLLBACK TO SAVEPOINT bkn_auth_role')
     await exec('RELEASE SAVEPOINT bkn_auth_role')
@@ -704,7 +719,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
     } catch (err) {
       await exec('ROLLBACK TO SAVEPOINT bkn_auth_probe')
       await exec('RELEASE SAVEPOINT bkn_auth_probe')
-      return { rows: null, error: brief(message(err)) }
+      return { rows: null, error: said(err, quote) }
     }
   }
 
@@ -725,7 +740,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
     try {
       count = Number(await exec(sql, ...params))
     } catch (err) {
-      error = brief(message(err))
+      error = said(err, quote)
     }
     if (error === null && inspect) {
       try {
@@ -734,7 +749,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
         await exec(ladderAccessSql(spec))
         problem = await inspect(count > 0)
       } catch (err) {
-        problem = `could not be inspected: ${brief(message(err))}`
+        problem = `could not be inspected: ${said(err, quote)}`
       }
     }
     // Also returns to the identity's role and claims.
@@ -761,8 +776,8 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
   const expect = async (k: string, want: { h: string | null; s: string | null }, what: string): Promise<string | null> => {
     const now = await stateOf(k)
     const wrong = [
-      ...(now.h !== want.h ? [`${spec.host} row ${k} does not hold ${what}`] : []),
-      ...(now.s !== want.s ? [`${spec.satellite} does not hold ${what} for ${k}`] : []),
+      ...(now.h !== want.h ? [`${row(k)} does not hold ${what}`] : []),
+      ...(now.s !== want.s ? [`${spec.satellite} does not hold ${what} for ${quote ? k : 'that row'}`] : []),
     ]
     return wrong.length > 0 ? wrong.join('; ') : null
   }
@@ -820,24 +835,24 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
         allowed ? expect(k, landed, 'what was written') : expect(k, unchanged, 'what it held before'),
       )
       if (parentMay && r.allowed && r.problem === null) {
-        lines.push(`may change ${spec.host} row ${k}: ${verb} through ${spec.satellite} was allowed, and the write reached ${spec.host}`)
+        lines.push(`may change ${row(k)}: ${verb} through ${spec.satellite} was allowed, and the write reached ${spec.host}`)
       } else if (parentMay && r.allowed) {
         ok = false
         lines.push(`${verb} through ${spec.satellite} was allowed, but ${r.problem}`)
       } else if (parentMay) {
         ok = false
-        lines.push(`may change ${spec.host} row ${k}, but ${verb} through ${spec.satellite} was REFUSED (narrower than the parent): ${r.refusal}`)
+        lines.push(`may change ${row(k)}, but ${verb} through ${spec.satellite} was REFUSED (narrower than the parent): ${r.refusal}`)
       } else if (r.allowed) {
         ok = false
         lines.push(
-          `may NOT change ${spec.host} row ${k} (${parentRefusal}), but ${verb} through ${spec.satellite} was ALLOWED (wider than the parent)`,
+          `may NOT change ${row(k)} (${parentRefusal}), but ${verb} through ${spec.satellite} was ALLOWED (wider than the parent)`,
         )
       } else if (r.problem !== null) {
         ok = false
         lines.push(`${verb} through ${spec.satellite} was refused, but it still changed something: ${r.problem}`)
       } else {
         lines.push(
-          `may not change ${spec.host} row ${k}: ${verb} through ${spec.satellite} was refused too ` +
+          `may not change ${row(k)}: ${verb} through ${spec.satellite} was refused too ` +
             `(${r.raised ? `${r.refusal}; undone whole` : r.refusal})`,
         )
       }
@@ -876,7 +891,6 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
       const extra = [...s.keys()].filter(k => !h.has(k))
       const missing = [...h.keys()].filter(k => !s.has(k))
       const differ = [...h.keys()].filter(k => s.has(k) && s.get(k) !== h.get(k))
-      const sample = (ks: string[]) => ks.slice(0, 3).join(', ')
       out.push(
         extra.length + missing.length + differ.length === 0
           ? {
@@ -890,9 +904,9 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
               check: 'read',
               outcome: 'failed',
               detail: [
-                ...(extra.length > 0 ? [`${spec.satellite} shows ${extra.length} row(s) this identity cannot see in ${spec.host} (${sample(extra)})`] : []),
-                ...(missing.length > 0 ? [`${spec.satellite} hides ${missing.length} row(s) it can see in ${spec.host} (${sample(missing)})`] : []),
-                ...(differ.length > 0 ? [`${differ.length} row(s) read differently through the two tables (${sample(differ)})`] : []),
+                ...(extra.length > 0 ? [`${spec.satellite} shows ${extra.length} row(s) this identity cannot see in ${spec.host}${someKeys(extra, quote)}`] : []),
+                ...(missing.length > 0 ? [`${spec.satellite} hides ${missing.length} row(s) it can see in ${spec.host}${someKeys(missing, quote)}`] : []),
+                ...(differ.length > 0 ? [`${differ.length} row(s) read differently through the two tables${someKeys(differ, quote)}`] : []),
               ].join('; '),
             },
       )
@@ -922,7 +936,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
               outcome: 'failed',
               detail:
                 `${leaked.length} of the ${hidden.length} row(s) of ${spec.satellite} whose ${spec.host} row is hidden from this identity ` +
-                `ARE visible to it (${leaked.slice(0, 3).join(', ')})`,
+                `ARE visible to it${someKeys(leaked, quote)}`,
             },
       )
     }
@@ -982,7 +996,7 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
         for (const c of await checkIdentity()) result.checks.push({ identity, ...c })
       } catch (err) {
         // Fail closed: a check that could not finish proves nothing.
-        result.checks.push({ identity, check: 'identity', outcome: 'failed', detail: `the checks could not complete: ${brief(message(err))}` })
+        result.checks.push({ identity, check: 'identity', outcome: 'failed', detail: `the checks could not complete: ${said(err, quote)}` })
       } finally {
         await exec('ROLLBACK TO SAVEPOINT bkn_auth_identity')
         await exec('RELEASE SAVEPOINT bkn_auth_identity')

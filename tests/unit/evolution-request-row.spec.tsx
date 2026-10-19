@@ -257,6 +257,42 @@ describe('technical details', () => {
     expect(pre?.textContent).toBe(SQL_CREATE)
   })
 
+  it("for a project kept in another region, reads the exact SQL from it when asked, and stores none", async () => {
+    const withheld = evolution({
+      technical: {
+        ...evolution().technical,
+        sqlWithheld: true,
+        steps: evolution().technical.steps.map(st => ({ ...st, sql: [] })),
+      },
+    })
+    const fetchFn = mockFetch(url =>
+      url.includes('?statements=f-1') ? json(200, { planVersion: 'pv-1', current: true, steps: [{ title: 'Create order_refunds', sql: [SQL_CREATE] }, { title: 'Retire', sql: [SQL_CONTRACT] }] }) : json(404, {}),
+    )
+    const { container } = mountRow(withheld)
+    fireEvent.click(button(/Technical details/))
+    expect(screen.getByText(/exact SQL stays in its region and is not stored outside it/)).toBeTruthy()
+    expect(screen.queryAllByRole('button', { name: /^SQL/ })).toHaveLength(0)
+
+    await act(async () => {
+      fireEvent.click(button('Show it'))
+    })
+    expect(fetchFn).toHaveBeenCalledWith('/api/projects/p1/architecture?statements=f-1', expect.anything())
+    fireEvent.click(screen.getAllByRole('button', { name: /^SQL/ })[0])
+    expect(container.querySelector('pre')?.textContent).toBe(SQL_CREATE)
+  })
+
+  it('does not show statements of another version than the one being approved', async () => {
+    const withheld = evolution({ technical: { ...evolution().technical, sqlWithheld: true, steps: evolution().technical.steps.map(st => ({ ...st, sql: [] })) } })
+    mockFetch(() => json(200, { planVersion: 'pv-2', current: false, steps: [] }))
+    mountRow(withheld)
+    fireEvent.click(button(/Technical details/))
+    await act(async () => {
+      fireEvent.click(button('Show it'))
+    })
+    expect(screen.getByText(/The table changed since this was prepared/)).toBeTruthy()
+    expect(screen.queryAllByRole('button', { name: /^SQL/ })).toHaveLength(0)
+  })
+
   it('never offers a control to retire or drop the old columns, even fully expanded', () => {
     mountRow(evolution())
     expandEverything()

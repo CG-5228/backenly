@@ -40,6 +40,7 @@ import { inspectEvolutionChain, queueEvolutionBackfill } from './backfill-job'
 import type { StopReason } from '@/lib/evolution-engine/primitive'
 import { resolveExtractionPlan, isResolveRefusal } from './resolve'
 import { workspaceAt } from './workspace'
+import { dbWords, keptStatements } from './residency'
 
 export type ExtractionRunStatus =
   | 'completed'
@@ -124,8 +125,10 @@ async function runLadder(input: {
 
   const executionId = await openExecution(projectId, plan, 'running', null, approval.id)
   const steps: ExtractionStepOutcome[] = []
-  // The project's tables, where they live (./workspace.ts).
+  // The project's tables, where they live (./workspace.ts), and what its
+  // records at home may quote of the work (./residency.ts).
   const at = await workspaceAt(projectId)
+  const { quote } = at
   // Every rung's schema change is a governed change (lib/changes/ledger.ts),
   // recorded as the person whose consent is bound to this exact plan version,
   // and grouped with the rest of this extraction's changes.
@@ -229,8 +232,15 @@ async function runLadder(input: {
         idempotencyKey: step.idempotencyKey,
         status: 'running',
         startedAt: new Date(),
-        preconditionEvidence: { declared: step.preconditions, tier: step.tier, sql: step.sql },
-        rollback: step.rollback ? { ...step.rollback } : undefined,
+        // For a project kept elsewhere the statements stay out of this row: the
+        // plan renders them, and planVersion, which consent binds to, hashes them.
+        preconditionEvidence: {
+          declared: step.preconditions,
+          tier: step.tier,
+          sql: keptStatements(step.sql, quote),
+          ...(quote ? {} : { sqlWithheld: true }),
+        },
+        rollback: step.rollback ? { ...step.rollback, sql: keptStatements(step.rollback.sql, quote) } : undefined,
         resourceIdentity: { kind: 'extraction', schema: plan.schema, host: plan.spec.host, satellite: plan.spec.satellite },
       },
       update: { executionId, status: 'running', startedAt: new Date() },
@@ -250,7 +260,7 @@ async function runLadder(input: {
         })
         return { status: 'in_flight_elsewhere', executionId, planVersion: plan.planVersion, haltReason: err.message, stoppedBecause: null, steps }
       }
-      const message = err instanceof Error ? err.message : String(err)
+      const message = dbWords(err, quote)
       await prisma.maintenanceStepExecution.update({
         where: { id: row.id },
         data: { status: 'failed', completedAt: new Date(), result: { error: message } },

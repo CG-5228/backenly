@@ -87,6 +87,7 @@ import { MIN_INCIDENTS } from '@/lib/autonomy/maintenance/outcome'
 import type { ExtractionPlan } from './plan'
 import { readTableFacts } from './facts'
 import { workspaceAt, type WorkspaceAt } from './workspace'
+import { dbWords } from './residency'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite } from './primitives'
 import { columnHistory, readRepairs, readSnapshots, type SnapshotRow } from './sensing'
@@ -207,6 +208,8 @@ const iso = (v: unknown): string | null => (v instanceof Date ? v.toISOString() 
 /** Second precision: what a person reads, and a third shorter than milliseconds. */
 const short = (at: string | Date) => new Date(at).toISOString().replace(/\.\d{3}Z$/, 'Z')
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err)).split('\n')[0].slice(0, 200)
+/** The first line of a failure, as this project's records at home may keep it (./residency.ts). */
+const words = (err: unknown, quote: boolean) => dbWords(errText(err), quote)
 const reEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 function span(ms: number): string {
@@ -383,6 +386,8 @@ export async function readStatementClasses(
   host: string,
   satellite: string,
   run: Query,
+  /** Whether the project's records at home may quote the database's words (./residency.ts). */
+  quote: boolean,
 ): Promise<StatementReading> {
   const none = (state: StatementCapability, detail: string, hidden = 0): StatementReading => ({
     state,
@@ -398,7 +403,7 @@ export async function readStatementClasses(
     )
     if (!ext[0]?.installed) return none('missing', 'pg_stat_statements is not installed in this database')
   } catch (err) {
-    return none('unreadable', `the extension list could not be read: ${errText(err)}`)
+    return none('unreadable', `the extension list could not be read: ${words(err, quote)}`)
   }
 
   const params = [writesTo(schema, host), refersTo(schema, host), writesTo(schema, satellite), refersTo(schema, satellite)]
@@ -411,7 +416,7 @@ export async function readStatementClasses(
     try {
       row = (await run(CLASS_SQL(false), ...params))[0]
     } catch (err) {
-      return none('unreadable', `pg_stat_statements could not be read: ${errText(err)}`)
+      return none('unreadable', `pg_stat_statements could not be read: ${words(err, quote)}`)
     }
   }
   const hidden = num(row?.hidden)
@@ -518,6 +523,7 @@ export async function observeExtraction(
   // Outside the fail-soft reads below: a region this process cannot reach is
   // not an observation that something is unavailable; nothing was observed.
   const at = await workspaceAt(projectId)
+  const { quote } = at
 
   let present: 'ours' | 'gone' | 'foreign' | 'unknown' = 'unknown'
   let satDetail = ''
@@ -525,7 +531,7 @@ export async function observeExtraction(
     const sat = await readTableFacts(at, satellite)
     present = !sat ? 'gone' : isOurSatellite(sat, plan.spec) ? 'ours' : 'foreign'
   } catch (err) {
-    satDetail = errText(err)
+    satDetail = words(err, quote)
   }
   signals.push(
     present === 'ours'
@@ -560,7 +566,7 @@ export async function observeExtraction(
         consistency = { name: CONSISTENCY_SIGNAL, status: !r.complete ? 'unavailable' : r.consistent ? 'ok' : 'regressed', detail: r.summary }
       }
     } catch (err) {
-      consistency = { name: CONSISTENCY_SIGNAL, status: 'unavailable', detail: `reconciliation could not run: ${errText(err)}` }
+      consistency = { name: CONSISTENCY_SIGNAL, status: 'unavailable', detail: `reconciliation could not run: ${words(err, quote)}` }
     }
     signals.unshift(consistency)
   }
@@ -598,14 +604,16 @@ export async function snapshotExtraction(
   const unavailable: Unavailable[] = []
   // Resolved before any fail-soft read below: a region this process cannot
   // reach is not "no statistics yet".
-  const run = onWorkspace(await workspaceAt(projectId))
+  const at = await workspaceAt(projectId)
+  const run = onWorkspace(at)
+  const { quote } = at
 
   const [counters, statements] = await Promise.all([
     readCounters(run, plan.schema, host, satellite).catch(err => {
-      unavailable.push({ metric: 'tables', reason: 'not_yet_measurable', detail: `table statistics could not be read: ${errText(err)}` })
+      unavailable.push({ metric: 'tables', reason: 'not_yet_measurable', detail: `table statistics could not be read: ${words(err, quote)}` })
       return { host: null, satellite: null, statsReset: null }
     }),
-    readStatementClasses(plan.schema, host, satellite, run),
+    readStatementClasses(plan.schema, host, satellite, run, quote),
   ])
   if (statements.state !== 'available') {
     unavailable.push({

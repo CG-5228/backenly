@@ -14,6 +14,11 @@
  * and transaction about the project's tables goes through `db`. Platform
  * records (consent, ledger, findings, architecture memory, request logs) stay
  * on `prisma`, at home, where they always were.
+ *
+ * Where the tables are also decides what those records may say about them: for
+ * a project kept outside the home region, never its SQL, a definition, a row's
+ * value or the database's own words (./residency.ts). The handle carries that
+ * as `quote`, so whatever holds it writes its words accordingly at the source.
  */
 
 import type { WorkspaceRawClient } from '@/lib/data-plane/regional'
@@ -24,6 +29,12 @@ export interface WorkspaceAt {
   readonly schema: string
   /** The project's own region's database. */
   readonly db: WorkspaceRawClient
+  /**
+   * May the platform's records at home quote this workspace: its statements,
+   * definitions, row values and the database's words? Only for a project kept
+   * in the home region, and never when that cannot be told.
+   */
+  readonly quote: boolean
 }
 
 /**
@@ -33,15 +44,23 @@ export interface WorkspaceAt {
  * had looked.
  */
 export async function workspaceAt(projectId: string): Promise<WorkspaceAt> {
-  const [{ workspaceRawClient }, { resolveWorkspaceSchema }] = await Promise.all([
+  const [{ workspaceRawClient }, { resolveWorkspaceSchema }, { quotesKeptHere }] = await Promise.all([
     import('@/lib/data-plane/regional'),
     import('@/lib/services/workspace-pool'),
+    import('@/lib/data-plane/residency'),
   ])
-  const [db, schema] = await Promise.all([workspaceRawClient(projectId), resolveWorkspaceSchema(projectId)])
-  return { projectId, schema, db }
+  const [db, schema, quote] = await Promise.all([
+    workspaceRawClient(projectId),
+    resolveWorkspaceSchema(projectId),
+    quotesKeptHere(projectId),
+  ])
+  return { projectId, schema, db, quote }
 }
 
-/** A schema on a client this process already holds: tests, and scratch schemas on a known connection. */
-export function workspaceOn(db: WorkspaceRawClient, schema: string, projectId = ''): WorkspaceAt {
-  return { projectId, schema, db }
+/**
+ * A schema on a client this process already holds: tests, and scratch schemas
+ * on a known connection. In the home database unless told otherwise.
+ */
+export function workspaceOn(db: WorkspaceRawClient, schema: string, projectId = '', quote = true): WorkspaceAt {
+  return { projectId, schema, db, quote }
 }

@@ -411,7 +411,7 @@ describe('snapshots along the ladder', () => {
   it('reports statement text hidden from a role without pg_read_all_stats, instead of summing nothing', async () => {
     const reading = await prisma.$transaction(async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL ROLE "${ROLE}"`)
-      return readStatementClasses(schema, 'orders', 'order_refunds', (sql, ...p) => tx.$queryRawUnsafe(sql, ...p) as Promise<any>)
+      return readStatementClasses(schema, 'orders', 'order_refunds', (sql, ...p) => tx.$queryRawUnsafe(sql, ...p) as Promise<any>, true)
     })
     expect(reading.classes).toBeNull()
     if (!PGSS) {

@@ -152,7 +152,11 @@ export async function reconcileWith(
   }
 }
 
-/** Reconcile the live tables. */
+/**
+ * Reconcile the live tables. The sample keys are rows' own values: for a
+ * project kept in another region they stay there, and the result carries the
+ * counts alone (./residency.ts).
+ */
 export async function reconcileExtraction(
   projectId: string,
   facts: TableFacts,
@@ -160,8 +164,8 @@ export async function reconcileExtraction(
 ): Promise<ReconcileResult> {
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
   // On the project's own database, where facts were read: both tables, one snapshot.
-  const { db } = await workspaceAt(projectId)
-  return db.$transaction(
+  const { db, quote } = await workspaceAt(projectId)
+  const r = await db.$transaction(
     async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '120s'`)
       await tx.$executeRawUnsafe(
@@ -174,4 +178,5 @@ export async function reconcileExtraction(
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 130_000, maxWait: 10_000 },
   )
+  return quote ? r : { ...r, samples: { missing: [], orphaned: [], mismatched: [] } }
 }

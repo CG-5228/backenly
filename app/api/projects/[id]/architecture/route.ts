@@ -39,6 +39,7 @@ import {
   decisionDetail,
   isActionRefusal,
   isApprovalRefusal,
+  liveStatements,
   pause,
   proposeChanges,
   resume,
@@ -51,6 +52,13 @@ export async function GET(request: NextRequest, _props: { params: Promise<{ id: 
   return withProjectValidation<any>(request, async validated => {
     const { projectId } = validated
     const url = new URL(request.url)
+    // A waiting request's exact statements, rendered now from the project's own
+    // tables: a project kept in another region does not store them at home.
+    const statementsOf = url.searchParams.get('statements')?.trim()
+    if (statementsOf) {
+      const live = await liveStatements(projectId, statementsOf)
+      return live ? NextResponse.json(live) : NextResponse.json({ error: 'No such request' }, { status: 404 })
+    }
     const decisionId = url.searchParams.get('decision')?.trim()
     if (decisionId) {
       const detail = await decisionDetail(projectId, decisionId)

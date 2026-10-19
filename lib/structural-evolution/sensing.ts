@@ -34,6 +34,7 @@
 import { prisma } from '@/lib/db'
 import type { TableFacts } from './facts'
 import type { WorkspaceAt } from './workspace'
+import { dbWords } from './residency'
 import {
   creationColumn,
   timestampColumns,
@@ -110,7 +111,7 @@ export async function samplePresence(at: WorkspaceAt, facts: TableFacts, columns
       },
     }
   } catch (err) {
-    return { unavailable: `rows could not be read: ${err instanceof Error ? err.message : String(err)}` }
+    return { unavailable: `rows could not be read: ${dbWords(err, at.quote)}` }
   }
 }
 

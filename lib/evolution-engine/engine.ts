@@ -94,8 +94,18 @@ import {
 } from './request'
 import type { ArchitectureChangeView, ArchitectureSummary, NoChangeView, RecommendationView } from './views'
 import { prisma } from '@/lib/db'
+import { quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
 import { EVOLUTION_FINDING_TYPE } from '@/lib/core/types'
 import './installed'
+
+/**
+ * A failure in the words a project's records at home may keep. For a project
+ * kept in another region they are the platform's, never the database's, which
+ * can quote its rows (lib/data-plane/residency.ts).
+ */
+async function failureWords(projectId: string, err: unknown): Promise<string> {
+  return quotedError(err instanceof Error ? err.message : String(err), await quotesKeptHere(projectId))
+}
 
 // ── Identity ─────────────────────────────────────────────────────────────────
 
@@ -211,12 +221,12 @@ async function snapshot(
   phase: SnapshotPhase,
   now: Date,
 ): Promise<void> {
-  const snap = await primitive.snapshot(projectId, plan, phase, now).catch(err => ({
+  const snap = await primitive.snapshot(projectId, plan, phase, now).catch(async err => ({
     v: 1 as const,
     phase,
     at: now.toISOString(),
     data: {},
-    unavailable: [{ metric: '*', reason: 'not_yet_measurable' as const, detail: err instanceof Error ? err.message : String(err) }],
+    unavailable: [{ metric: '*', reason: 'not_yet_measurable' as const, detail: await failureWords(projectId, err) }],
   }))
   await remember({
     projectId,
@@ -417,7 +427,7 @@ async function requestApproval(
     // Whatever stopped it part-way, the decision must not be left between
     // proposing and asking, where nothing would ever pick it up again: it is
     // stopped, and a later pass retries it like a failed rehearsal.
-    const reason = `preparing it failed: ${err instanceof Error ? err.message : String(err)}`
+    const reason = `preparing it failed: ${await failureWords(projectId, err)}`
     await enter(projectId, d, 'blocked', {
       sentence: `Backenly could not finish preparing a change to ${opp.subject}, so it was not proposed.`,
       payload: { reason },
@@ -446,11 +456,11 @@ async function prepareRequest(
   }
   await enter(projectId, d, 'rehearsing', { sentence: `Rehearsing the change to ${opp.subject} on a copy of its data.` })
   const rehearsal = await primitive.rehearse(projectId, plan).catch(
-    (err): Rehearsal => ({
+    async (err): Promise<Rehearsal> => ({
       passed: false,
       authorization: 'unavailable',
       authorizationDetail: '',
-      detail: `the rehearsal could not run: ${err instanceof Error ? err.message : String(err)}`,
+      detail: `the rehearsal could not run: ${await failureWords(projectId, err)}`,
       report: null,
     }),
   )
@@ -484,7 +494,7 @@ async function prepareRequest(
     return `not runnable by software: ${requirement.reason}`
   }
   const summary = primitive.describe(plan, opp)
-  const technical = technicalFor(plan, opp)
+  const technical = technicalFor(plan, opp, await quotesKeptHere(projectId))
   const details: EvolutionRequestDetails = {
     v: 1,
     primitive: primitive.id,
@@ -517,10 +527,17 @@ async function prepareRequest(
   return 'requested'
 }
 
-function technicalFor(plan: EnginePlan, opp: Opportunity): EvolutionRequestDetails['technical'] {
+/**
+ * The request's opt-in technical section. For a project kept in another region
+ * the statements are not stored here: a person who opens them is shown them
+ * rendered from the project's own tables (liveStatements), and consent binds to
+ * the plan version that hashes them either way.
+ */
+function technicalFor(plan: EnginePlan, opp: Opportunity, quote: boolean): EvolutionRequestDetails['technical'] {
   const d = (opp.diagnostics ?? {}) as { clientMigration?: EvolutionRequestDetails['technical']['clientMigration'] }
   return {
-    steps: plan.steps.map(s => ({ title: s.title, why: s.why, tier: s.tier, humanOnly: s.capability === 'human_only', sql: s.sql })),
+    ...(quote ? {} : { sqlWithheld: true }),
+    steps: plan.steps.map(s => ({ title: s.title, why: s.why, tier: s.tier, humanOnly: s.capability === 'human_only', sql: quote ? s.sql : [] })),
     evidence: opp.evidence.map(e => ({ family: e.family, verdict: e.verdict, detail: e.detail })),
     pressure: opp.pressure.map(p => ({ kind: p.kind, class: p.class, detail: p.detail })),
     semanticBoundary: opp.semanticBoundary,
@@ -985,9 +1002,9 @@ export async function undo(input: { projectId: string; decisionId: string; userI
   // the change is being removed must find it being undone, not "removed
   // outside Backenly".
   await enter(projectId, d, 'rolling_back', { sentence: `Undoing the change to ${summary.subject}.`, userId })
-  const result: RollbackResult = await primitive.rollback(projectId, summary.planId, userId).catch(err => ({
+  const result: RollbackResult = await primitive.rollback(projectId, summary.planId, userId).catch(async err => ({
     status: 'failed' as const,
-    reason: err instanceof Error ? err.message : String(err),
+    reason: await failureWords(projectId, err),
     // Not known what ran before it threw: treated as part-way, so only undo
     // (which re-reads the catalog and skips what is already gone) is offered.
     actions: [{ action: 'unknown', outcome: 'done' as const, detail: 'the undo stopped part-way' }],
@@ -1350,6 +1367,32 @@ export async function architectureSummary(projectId: string): Promise<Architectu
     watching: p.watching ?? 0,
     execution: executionEnabled(),
     analyzedAt: lastPass ? lastPass.at.toISOString() : null,
+  }
+}
+
+/**
+ * The exact statements of a waiting request, rendered now from the project's
+ * own tables, for a person who opens them. A project kept in another region
+ * does not store them outside it (technicalFor), so they are read where they
+ * are, shown, and not kept. `current` says whether they are still the version
+ * consent would bind to: a table that changed since gives another version,
+ * which approval refuses until it is rehearsed and asked about again.
+ */
+export async function liveStatements(
+  projectId: string,
+  findingId: string,
+): Promise<{ planVersion: string; current: boolean; steps: Array<{ title: string; sql: string[] }> } | null> {
+  const req = await requestById(projectId, findingId)
+  if (!req) return null
+  const primitive = primitiveById(req.evolution.primitive)
+  const spec = primitive?.normaliseSpec(req.evolution.spec)
+  const resolved = primitive && spec ? await primitive.resolvePlan(projectId, spec) : null
+  if (!resolved || 'refusal' in resolved) return { planVersion: req.evolution.planVersion, current: false, steps: [] }
+  const { plan } = resolved
+  return {
+    planVersion: plan.planVersion,
+    current: plan.planVersion === req.evolution.planVersion,
+    steps: plan.steps.map(st => ({ title: st.title, sql: st.sql })),
   }
 }
 
