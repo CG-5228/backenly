@@ -1614,6 +1614,21 @@ async function runAgentLoop(
       // bounded verification attempt.
       if (verificationTurn) verificationReadAttempted = true
 
+      // A question only reads. Its list offers nothing else, but a model can
+      // send a tool it was not offered or ask a read to write (get_readiness
+      // with autoFix), so a call that is neither a read nor one of the tools
+      // that end the turn is answered here: not run, counted or queued. That
+      // is wider than isMutationCall, which counts no control tool, because
+      // apply_proposal and run_test write too.
+      if (classification.intent === 'QUESTION' && !isReadOnlyCall(toolName, args) && !QUESTION_CONTROL_TOOLS.has(toolName)) {
+        results.push(toolResultBlock(toolCall.id, {
+          ok: false,
+          blocked: 'read_only_turn',
+          summary: `\`${toolName}\` was NOT run: this turn answers a question and only reads. Finish with the answer, and say in it what would need to change.`,
+        }, true))
+        continue
+      }
+
       // Approval gate — one rule for every door. `needsApproval` is the same
       // judgement the MCP tool route uses: the brain's destructive set OR an
       // executor rated high-risk, so the two doors can never disagree about
@@ -1860,6 +1875,17 @@ async function runAgentLoop(
 const CONFIRM_TOOL_BLOCKLIST = new Set<string>(['propose_plan'])
 
 /**
+ * What a QUESTION turn is offered besides the reads (tools.READ_ONLY_TOOLS):
+ * the tools that end it with an answer or a question back. The hint's "Do NOT
+ * mutate anything" was all that stood between a question and create_table or
+ * drop_table. As with CONFIRM_TOOL_BLOCKLIST, the model picks from what it is
+ * offered, and the loop refuses any call it sends anyway that is neither a
+ * read nor one of these. The shorter list is also cheaper and faster on every
+ * question.
+ */
+const QUESTION_CONTROL_TOOLS = new Set<string>(['finish', 'ask_user', 'answer_question'])
+
+/**
  * The catalog as the brain's model is offered it, translated once at load so
  * every call sends byte-identical tools and the cached prefix holds across
  * turns. BRAIN_MODEL_TOOLS, not BRAIN_TOOLS: tools only an MCP agent calls are
@@ -1867,9 +1893,14 @@ const CONFIRM_TOOL_BLOCKLIST = new Set<string>(['propose_plan'])
  */
 const MODEL_TOOLS: Anthropic.Tool[] = BRAIN_MODEL_TOOLS.map(toModelTool)
 const CONFIRM_MODEL_TOOLS: Anthropic.Tool[] = MODEL_TOOLS.filter((t) => !CONFIRM_TOOL_BLOCKLIST.has(t.name))
+const QUESTION_MODEL_TOOLS: Anthropic.Tool[] = MODEL_TOOLS.filter(
+  (t) => isReadOnlyTool(t.name) || QUESTION_CONTROL_TOOLS.has(t.name),
+)
 
 function toolsForIntent(intent: BrainIntent): Anthropic.Tool[] {
-  return intent === 'CONFIRM' ? CONFIRM_MODEL_TOOLS : MODEL_TOOLS
+  if (intent === 'CONFIRM') return CONFIRM_MODEL_TOOLS
+  if (intent === 'QUESTION') return QUESTION_MODEL_TOOLS
+  return MODEL_TOOLS
 }
 
 /** "I stopped before changing anything because …", ending with what can be done next. */
@@ -1928,7 +1959,7 @@ function buildIntentHint(intent: BrainIntent): string {
         'No message approves it, including a "yes" or "confirm" in this turn or the next. Describing the operation without calling the tool queues nothing, so the owner has nothing to approve.',
       ].join(' ')
     case 'QUESTION':
-      return 'Hint: this is a QUESTION about the project state. Call read_backend_state and then finish with the answer. Do NOT mutate anything.'
+      return 'Hint: this is a QUESTION about the project state. Call read_backend_state and then finish with the answer. Do NOT mutate anything: this turn is offered only the read tools, so if something should change, say what in your answer.'
     case 'CONFIRM':
       return [
         'Hint: the user has CONFIRMED the plan you proposed in the previous assistant turn (e.g. "go ahead", "yes", "do it").',
