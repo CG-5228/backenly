@@ -1318,7 +1318,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       let frozen: { at?: string; full?: string } | null = null
       for (;;) {
         const { events } = await operatorJson(
-          `/api/projects/${args.project}/autonomy/events?since=${encodeURIComponent(sinceOnService.toISOString())}&limit=50`,
+          // include=held adds the loop's change-freeze rows (AUTONOMY_CHANGE_FREEZE) to the feed; a server
+          // without it ignores the parameter, and a freeze then reads as a repair that never came.
+          `/api/projects/${args.project}/autonomy/events?since=${encodeURIComponent(sinceOnService.toISOString())}&limit=50&include=held`,
         )
         type Event = { action?: string; tableName?: string; full?: string; verified?: boolean; at?: string }
         const repair = ((events ?? []) as Event[]).find(
