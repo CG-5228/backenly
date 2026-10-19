@@ -3570,6 +3570,10 @@ function clip(s: string, max = 800): string {
 export function humanTitle(name: string, args: Record<string, unknown>): string {
   switch (name) {
     case 'read_backend_state': return 'Reading backend state'
+    case 'get_instructions': return 'Reading the agent instructions'
+    case 'get_backend_metadata': return 'Reading backend metadata'
+    case 'get_project_overview': return 'Reading the project overview'
+    case 'get_table_schema': return `Reading the schema of ${args.tableName ?? 'a table'}`
     case 'list_findings': return 'Checking open issues'
     case 'resolve_finding': return 'Resolving the issue'
     case 'get_pending_incidents': return 'Preparing your backend briefing'
@@ -3633,6 +3637,15 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'create_cron_job': return `Scheduling job (${args.schedule ?? ''})`.trim()
     case 'set_rate_limit': return `Setting rate limit on ${args.tableName ?? ''}`.trim()
     case 'generate_aggregate_api': return `Generating ${args.name ?? 'stats'} stats endpoint`.trim()
+    case 'run_data_migration': {
+      // It rewrites live rows, so the title names the tables it touches and
+      // says when the call is only the dry run that counts them.
+      const tables = Array.isArray(args.operations)
+        ? [...new Set(args.operations.map((op) => op?.table).filter((t) => typeof t === 'string' && t !== ''))]
+        : []
+      const scope = tables.length ? ` in ${tables.join(', ')}` : ''
+      return args.dryRun ? `Previewing a data migration${scope}` : `Migrating data${scope}`
+    }
     case 'enable_teams': return 'Setting up team multi-tenancy'
     case 'enable_push_notifications': return 'Connecting OneSignal'
     case 'send_push': return `Sending push${args.title ? `: ${args.title}` : ''}`.trim()
@@ -3670,7 +3683,16 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'drop_column': return `Dropping column ${args.columnName ?? ''} from ${args.tableName ?? ''}`.trim()
     case 'disable_realtime': return args.tableName ? `Disabling realtime on ${args.tableName}` : 'Disabling realtime project-wide'
     case 'rename_column': return `Renaming ${args.oldName ?? ''} → ${args.newName ?? ''} on ${args.tableName ?? ''}`.trim()
-    case 'add_constraint': return `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''}.${args.columnName ?? ''}`
+    case 'add_constraint': {
+      // `columns` wins over `columnName`, as it does in the executor. Reading
+      // only columnName titled a composite UNIQUE "Adding unique on
+      // conversations." with both of its columns missing.
+      const columns = Array.isArray(args.columns) && args.columns.length ? args.columns.join(', ') : ''
+      return columns
+        ? `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''} (${columns})`
+        : `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''}.${args.columnName ?? ''}`
+    }
+    case 'run_query': return 'Running a read-only query'
     case 'list_tables': return 'Listing tables'
     case 'list_apis': return 'Listing REST endpoints'
     case 'list_buckets': return 'Listing storage buckets'
@@ -3682,6 +3704,12 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'list_triggers': return 'Listing triggers'
     case 'list_ai_functions': return 'Listing AI functions'
     case 'list_cron_jobs': return 'Listing scheduled jobs'
+    case 'create_branch': return `Creating preview branch ${args.name ?? ''}`.trim()
+    case 'connect_branch': return `Issuing a ${args.serviceRole === true ? 'service-role' : 'client'} key for branch ${args.branchId ?? ''}`.trim()
+    case 'list_branches': return 'Listing preview branches'
+    case 'diff_branch': return `Diffing branch ${args.branchId ?? ''}`.trim()
+    case 'merge_branch': return `Merging branch ${args.branchId ?? ''} into production`.replace(/\s+/g, ' ')
+    case 'discard_branch': return `Discarding branch ${args.branchId ?? ''}`.trim()
     case 'list_integration_keys': return 'Listing integrations'
     case 'list_connected_apps': return 'Listing connected frontends'
     case 'get_deploy_status': return 'Reading deployment status'
