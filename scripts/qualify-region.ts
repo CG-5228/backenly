@@ -33,7 +33,8 @@
  *
  * --foreign names projects that live in other regions (the home region's probe
  * project, another region's): the region's host must refuse each of them. No
- * key of theirs is needed, since the refusal comes before any key is read.
+ * key of theirs is needed, since the refusal comes before any key is read, so
+ * name projects that exist: an id with no project resolves to the home region.
  * Without it, that check is reported as not run.
  *
  * The member's password comes from BACKENLY_QUALIFY_MEMBER_PASSWORD (and its
@@ -98,10 +99,10 @@
  *              rows back. A restore is refused, changing nothing, while a later
  *              change depends on what it would undo. PostgREST at the region
  *              serves a new table, stops serving a restored one and serves a
- *              reapplied one within --freshness-seconds, each timed, and so does
- *              read_backend_state's schema section, what a coding agent reads
- *              to learn the backend (it lagged a restore by 12 minutes once).
- *              The rollback check above is held to the same bound
+ *              reapplied one within --freshness-seconds, each timed, and so do
+ *              read_backend_state's tables and schema sections, what a coding
+ *              agent reads to learn the backend (one lagged a restore by 12
+ *              minutes once). The rollback check above is held to the same bound
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -679,27 +680,38 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
   /**
-   * Milliseconds from `since` until read_backend_state's schema section lists
-   * `table`, or stops listing it, within --freshness-seconds. That section is
-   * what a coding agent reads to learn the backend, and it answers from the
-   * platform's record of the schema, which a change or a restore refreshes when
-   * it settles: once, it went on describing a restored table for 12 minutes.
+   * How long after `since` both of what a coding agent reads to learn the
+   * backend list `table`, or stop listing it, within --freshness-seconds:
+   * read_backend_state's "tables" section, which answers from the platform's
+   * table registry that a change or a restore refreshes when it settles (once
+   * it went on describing a restored table for 12 minutes), and its "schema"
+   * section, which reads the region's live catalog. `firstRead` says the very
+   * first read already agreed, so the time is an upper bound set by the checks
+   * before this one, not a measured lag.
    */
-  async function untilDescribed(table: string, want: 'listed' | 'gone', since: number): Promise<number> {
+  async function untilDescribed(table: string, want: 'listed' | 'gone', since: number): Promise<{ ms: number; firstRead: boolean }> {
     const named = new RegExp(`\\b${table}\\b`)
     const bound = since + args.freshnessSeconds * 1_000
-    for (;;) {
-      const listed = named.test((await mcp!.call('read_backend_state', { section: 'schema' })).text)
-      if (want === 'listed' ? listed : !listed) return Date.now() - since
+    for (let read = 1; ; read++) {
+      const behind: string[] = []
+      for (const section of ['tables', 'schema'] as const) {
+        const listed = named.test((await mcp!.call('read_backend_state', { section })).text)
+        if (want === 'listed' ? !listed : listed) behind.push(section)
+      }
+      if (behind.length === 0) return { ms: Date.now() - since, firstRead: read === 1 }
       if (Date.now() > bound) {
         throw new Error(
-          `read_backend_state's schema section ${want === 'listed' ? 'still did not list' : 'still listed'} ${table} ` +
-            `${args.freshnessSeconds} s after it was asked for`,
+          `read_backend_state's ${behind.join(' and ')} section${behind.length > 1 ? 's' : ''} ` +
+            `${want === 'listed' ? 'still did not list' : 'still listed'} ${table} ${args.freshnessSeconds} s after it was asked for`,
         )
       }
       await new Promise((r) => setTimeout(r, 1_000))
     }
   }
+  /** The detail of a passing freshness check. */
+  const described = (what: string, table: string, t: { ms: number; firstRead: boolean }, after: string) =>
+    `read_backend_state's tables and schema sections ${what} ${table} ${t.firstRead ? 'by the first read, ' : ''}` +
+    `${seconds(t.ms)} after ${after}`
 
   /** Wait for a snapshot or restore the home host queued, until its region has done it. */
   async function untilRegionDone(jobId: string, what: string): Promise<void> {
@@ -803,6 +815,13 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
             body.code === 'WRONG_REGION' && body.region === other.region,
             `the refusal on ${route} names ${body.code}/${body.region}, not WRONG_REGION/${other.region}`,
           )
+          // The address is a courtesy (lib/data-plane/serving.ts): a regional host
+          // knows its own and the home host's, so another region's may be null.
+          // When given, it must be the project's and never this host.
+          if (body.apiUrl === null && other.region !== HOME_REGION) {
+            answers.push(`${route} 421 with no address (this host is not given ${other.region}'s)`)
+            continue
+          }
           must(
             typeof body.apiUrl === 'string' && body.apiUrl.includes(other.project) && !body.apiUrl.startsWith(args.api.origin),
             `the refusal on ${route} points to ${body.apiUrl}, not the project's own region`,
@@ -1148,8 +1167,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return `restored the state before #${restorable!.seq} (${restored}): ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
     })
     await check('rollback', 'described-after-undo', ['undone'], async () => {
-      const ms = await untilDescribed(rollbackTable, 'gone', undoneAt)
-      return `read_backend_state's schema section stopped describing ${rollbackTable} ${seconds(ms)} after the restore was asked for`
+      return described('stopped describing', rollbackTable, await untilDescribed(rollbackTable, 'gone', undoneAt), 'the restore was asked for')
     })
 
     // ── autonomy: a fault the region repairs on its own ──────────────────────
@@ -1372,8 +1390,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return `change #${made.seq} applied and verified in ${seconds(applied - started)}; PostgREST at the region served ${keptTable} ${seconds(ms)} later`
     })
     await check('rollback-drills', 'described-after-a-change', ['served-after-a-change'], async () => {
-      const ms = await untilDescribed(keptTable, 'listed', keptAt.applied)
-      return `read_backend_state's schema section described ${keptTable} ${seconds(ms)} after the change applied`
+      return described('described', keptTable, await untilDescribed(keptTable, 'listed', keptAt.applied), 'the change applied')
     })
 
     await check('rollback-drills', 'agent-asks-a-person-decides', ['served-after-a-change'], async () => {
@@ -1425,8 +1442,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return `restored as #${res.body.recoverySeq} and verified, its 3 rows kept aside; PostgREST at the region stopped serving ${keptTable} ${seconds(ms)} after the restore was asked for`
     })
     await check('rollback-drills', 'described-after-acknowledged-restore', ['restored-with-acknowledgement'], async () => {
-      const ms = await untilDescribed(keptTable, 'gone', keptAt.restored)
-      return `read_backend_state's schema section stopped describing ${keptTable} ${seconds(ms)} after the restore was asked for`
+      return described('stopped describing', keptTable, await untilDescribed(keptTable, 'gone', keptAt.restored), 'the restore was asked for')
     })
 
     await check('rollback-drills', 'reapplied-and-served', ['restored-with-acknowledgement'], async () => {
@@ -1447,8 +1463,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return `reapplied and verified, with its 3 rows; PostgREST at the region served ${keptTable} again ${seconds(ms)} after the reapply was asked for`
     })
     await check('rollback-drills', 'described-after-reapply', ['reapplied-and-served'], async () => {
-      const ms = await untilDescribed(keptTable, 'listed', keptAt.reapplied)
-      return `read_backend_state's schema section described ${keptTable} again ${seconds(ms)} after the reapply was asked for`
+      return described('described again', keptTable, await untilDescribed(keptTable, 'listed', keptAt.reapplied), 'the reapply was asked for')
     })
 
     const parentTable = `qualify_parent_${run}`
@@ -1496,8 +1511,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const res = await theFetch(homeUrl(snapshotsPath), asOperator({ method: 'POST' }))
       const body = await json(res)
       if (atHome) {
-        // A home project's snapshot is taken by the home host, while it waits.
-        must(res.status === 201 && typeof body.data?.id === 'string', `asking for a snapshot answered ${res.status}, not 201 with the snapshot`)
+        // A home project's snapshot is taken by the home host, while it waits;
+        // the list below finds it (the answer describes the file, not its row).
+        must(res.status === 201 && body.success === true, `asking for a snapshot answered ${res.status}, not 201 with the snapshot`)
       } else {
         // A snapshot of a regional project taken at home would be a full copy of
         // its data outside its region: home must queue it for the region instead.
@@ -1512,6 +1528,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     })
     await check('recovery', 'download-from-region', ['snapshot'], async () => {
       const res = await theFetch(homeUrl(`${snapshotsPath}/${snapshotId}/download`), asOperator({ redirect: 'manual' }))
+      if (atHome) {
+        // The home region's snapshots are kept by the home host, which sends the file itself.
+        const bytes = Buffer.from(await res.arrayBuffer())
+        must(res.status === 200 && bytes[0] === 0x1f && bytes[1] === 0x8b, `the download answered ${res.status} with ${bytes.length} bytes that are not a gzip`)
+        return `${bytes.length} gzip bytes from the home host, which keeps the home region's snapshots`
+      }
       must(res.status === 302, `the download answered ${res.status}, not a redirect to the region's bucket`)
       const link = new URL(res.headers.get('location') ?? 'invalid:')
       must(
