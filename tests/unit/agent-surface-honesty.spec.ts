@@ -235,6 +235,36 @@ describe('preview branches are reachable from an agent (#30)', () => {
   })
 })
 
+// ── #242 — every tool the brain is offered is in the manifest ────────────────
+
+describe('the capability manifest lists every tool the brain is offered (#242)', () => {
+  // The answerer is told that what the manifest does not list, Backenly does
+  // not do. sync_column was offered to the model and missing from the
+  // manifest, so by that rule the answer to "can Backenly keep a counter column
+  // in sync?" was no. A tool that needs no entry is named here with the reason.
+  const NO_ENTRY = new Map([
+    ['finish', 'ends the turn; it does nothing to the backend'],
+    ['get_instructions', 'the workflow guide an MCP agent reads first, not something a user asks for'],
+    ['get_project_overview', 'an alias of get_backend_metadata, which has its own entry'],
+  ])
+
+  it('has an entry for each, or says why it needs none', async () => {
+    const { BRAIN_MODEL_TOOLS } = await import('@/lib/ai/brain/tools')
+    const { TOOL_CAPABILITIES } = await import('@/lib/ai/brain/capabilities')
+    const listed = new Set(TOOL_CAPABILITIES.map((c) => c.tool))
+    const missing = BRAIN_MODEL_TOOLS.map((t) => t.function.name).filter((name) => !listed.has(name) && !NO_ENTRY.has(name))
+    expect(missing).toEqual([])
+  })
+
+  it('excuses only tools the brain is offered that have no entry', async () => {
+    const { BRAIN_MODEL_TOOLS } = await import('@/lib/ai/brain/tools')
+    const { TOOL_CAPABILITIES } = await import('@/lib/ai/brain/capabilities')
+    const offered = new Set(BRAIN_MODEL_TOOLS.map((t) => t.function.name))
+    const listed = new Set(TOOL_CAPABILITIES.map((c) => c.tool))
+    expect([...NO_ENTRY.keys()].filter((name) => !offered.has(name) || listed.has(name))).toEqual([])
+  })
+})
+
 // ── #36 — readiness must not demand an architecture ──────────────────────────
 
 describe('integration readiness does not require tables a product may not need (#36)', () => {
