@@ -714,5 +714,6 @@ tests/integration/structural-evolution-runtime-role.spec.ts
 # What the dual representation must preserve, with the workspace owned by a
 # NOSUPERUSER platform role: the host's own triggers decide the value, its
 # constraints keep their exact meaning, rows hidden from Backenly are never
-# reconciled from a partial view, TRUNCATE, and forged settings.
+# reconciled from a partial view, TRUNCATE, forged settings, and the one
+# function that runs as the owner cannot be fired on another table.
 tests/integration/structural-evolution-semantics.spec.ts

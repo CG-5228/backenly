@@ -25,6 +25,8 @@
  *                 every path, including the trigger that decides when to mirror
  *   forgery       a client that forges the sync's settings in the same statement
  *                 still cannot delete or move a satellite row without the host
+ *   definer       the one function that runs as the owner cannot be fired on a
+ *                 table of anyone else's, even by a role that may only read
  */
 
 import { randomUUID } from 'node:crypto'
@@ -461,5 +463,80 @@ describe('forgery: settings set in the same statement change nothing', () => {
   it('deleting a parent still removes its refund, through the host', async () => {
     await w.as(w.platform, SERVICE, `DELETE FROM ${w.t('orders')} WHERE id = '${aRefund}'`)
     await expectConverged(w, SPEC)
+  })
+})
+
+// ── The one function that runs as the owner ─────────────────────────────────
+
+describe('definer: the forward sync runs as the owner for the host, and for nothing else', () => {
+  const SPEC: ExtractionSpec = { host: 'orders', members: ['refund_amount'], satellite: 'order_refunds', label: 'refund' }
+  const N = ladderNames(SPEC)
+  let w: OwnedWorkspace
+  let reader = ''
+  let theirs = ''
+
+  beforeAll(async () => {
+    w = await ownedWorkspace('dfn', SPEC, w => {
+      const { svc, sub } = claimSql(w)
+      return [
+        `CREATE TABLE ${w.t('orders')} (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL, refund_amount numeric)`,
+        `INSERT INTO ${w.t('orders')} (user_id, refund_amount) VALUES ('${B}', 50), ('${B}', NULL)`,
+        `ALTER TABLE ${w.t('orders')} ENABLE ROW LEVEL SECURITY`,
+        `ALTER TABLE ${w.t('orders')} FORCE ROW LEVEL SECURITY`,
+        `CREATE POLICY rw ON ${w.t('orders')} FOR ALL USING (${svc} OR user_id::text = ${sub}) WITH CHECK (${svc} OR user_id::text = ${sub})`,
+      ]
+    })
+    await runLadder(w, SPEC, [...ALL_RUNGS])
+    // A role that can run SQL but write nothing here: the shape of a project's
+    // SELECT-only direct-access login, or any login with TEMP on the database.
+    reader = `bkn_evo_ro_${w.schema.slice(-8)}`
+    await prisma.$executeRawUnsafe(`CREATE ROLE "${reader}" NOLOGIN NOSUPERUSER NOBYPASSRLS`)
+    await prisma.$executeRawUnsafe(`GRANT USAGE ON SCHEMA "${w.schema}" TO "${reader}"`)
+    await prisma.$executeRawUnsafe(`GRANT SELECT ON ${w.t('orders')}, ${w.t('order_refunds')} TO "${reader}"`)
+    await prisma.$executeRawUnsafe(`GRANT TEMPORARY ON DATABASE "${(await prisma.$queryRawUnsafe<any[]>('SELECT current_database() AS d'))[0].d}" TO "${reader}"`)
+    theirs = (await prisma.$queryRawUnsafe<any[]>(`SELECT id::text AS id FROM ${w.t('orders')} WHERE refund_amount IS NULL`))[0].id
+  }, 120_000)
+  afterAll(async () => {
+    await w.drop()
+    const db = (await prisma.$queryRawUnsafe<any[]>('SELECT current_database() AS d'))[0].d
+    await prisma.$executeRawUnsafe(`REVOKE TEMPORARY ON DATABASE "${db}" FROM "${reader}"`).catch(() => {})
+    await prisma.$executeRawUnsafe(`DROP ROLE IF EXISTS "${reader}"`).catch(() => {})
+  })
+
+  const hijack = (op: 'INSERT' | 'DELETE', key: string) => [
+    `CREATE TEMP TABLE hijack (id uuid, refund_amount numeric) ON COMMIT DROP`,
+    `CREATE TRIGGER hijack AFTER ${op} ON hijack FOR EACH ROW EXECUTE FUNCTION ${w.t(N.forward)}()`,
+    `INSERT INTO hijack VALUES ('${key}', 999)`,
+    ...(op === 'DELETE' ? [`DELETE FROM hijack`] : []),
+  ]
+
+  it('a role that may only read cannot fire it on a table of its own to write the new table', async () => {
+    await expect(w.as(reader, asUser(A), hijack('INSERT', theirs))).rejects.toThrow(/permission denied for function/)
+    await expect(w.as(reader, asUser(A), hijack('DELETE', theirs))).rejects.toThrow(/permission denied for function/)
+    await expectConverged(w, SPEC)
+    expect(await prisma.$queryRawUnsafe(`SELECT 1 FROM ${w.t('order_refunds')} WHERE order_id = '${theirs}'`)).toEqual([])
+  })
+
+  it('nor can a role that may write the new table, through the same door', async () => {
+    await expect(w.as(w.client, asUser(B), hijack('INSERT', theirs))).rejects.toThrow(/permission denied for function/)
+    await expectConverged(w, SPEC)
+  })
+
+  it('and fired on any table but the host, even by its owner, it refuses before writing anything', async () => {
+    await expect(w.as(w.platform, SERVICE, hijack('INSERT', theirs))).rejects.toThrow(/fires only for/)
+    await expectConverged(w, SPEC)
+  })
+
+  it('no function the ladder installs is executable by anyone but its owner', async () => {
+    const rows = await prisma.$queryRawUnsafe<Array<{ name: string; acl: string | null }>>(
+      `SELECT p.proname AS name, p.proacl::text AS acl FROM pg_proc p
+        WHERE p.pronamespace = '"${w.schema}"'::regnamespace AND p.proname LIKE 'bkn\\_evo\\_%' ORDER BY 1`,
+    )
+    expect(rows.length).toBeGreaterThanOrEqual(4)
+    for (const r of rows) {
+      // An ACL that names only the owner; NULL would mean the default, which includes PUBLIC.
+      expect(r.acl).not.toBeNull()
+      expect(r.acl).toMatch(new RegExp(`^\\{"?${w.platform}"?=X/"?${w.platform}"?\\}$`))
+    }
   })
 })

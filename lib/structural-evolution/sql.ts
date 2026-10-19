@@ -140,6 +140,13 @@
  *                  cascade of truncating the host. Only the owner may truncate
  *                  the satellite at all; the guard stops accidents, not owners.
  *
+ * The forward sync is the one function that runs as the owner, so it is the
+ * one door worth guarding: EXECUTE on every function the ladder installs is
+ * the owner's alone (PostgreSQL grants it to PUBLIC by default, and a role that
+ * may EXECUTE a trigger function may attach it to a TEMP table of its own), and
+ * the forward sync refuses to run for any table but the one its satellite's
+ * foreign key references.
+ *
  * ── Concurrency, case by case ──────────────────────────────────────────────
  *
  * Lock order: an old writer locks host row → satellite row; a new writer
@@ -475,6 +482,33 @@ function grantList(roles: string[]): string {
   return roles.map(r => (r === 'PUBLIC' ? 'PUBLIC' : qi(r))).join(', ')
 }
 
+/**
+ * Only the owner may EXECUTE a function the ladder installs. PostgreSQL grants
+ * EXECUTE to PUBLIC on every new function, and a role that may EXECUTE a
+ * trigger function may attach it to a table of its own — a TEMP table needs
+ * nothing but the database's default TEMP privilege. For the SECURITY DEFINER
+ * forward sync that would be a door into the satellite as its owner, past its
+ * row-level security, from any role that can run SQL. Firing a trigger checks
+ * no privilege, so the ladder's own triggers are unaffected. Whatever a
+ * schema's default privileges granted is revoked too.
+ */
+function ownerOnlySql(fn: string): string {
+  const sig = `${lit(`${fn}()`)}::regprocedure`
+  return [
+    `DO $bkn$`,
+    `DECLARE g record;`,
+    `BEGIN`,
+    `  EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', ${sig});`,
+    `  FOR g IN SELECT DISTINCT quote_ident(pg_get_userbyid(x.grantee)) AS who`,
+    `             FROM pg_proc p, aclexplode(p.proacl) x`,
+    `            WHERE p.oid = ${sig} AND x.grantee <> p.proowner AND x.grantee <> 0`,
+    `  LOOP`,
+    `    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %s', ${sig}, g.who);`,
+    `  END LOOP;`,
+    `END $bkn$`,
+  ].join('\n')
+}
+
 // ── Step renderers ───────────────────────────────────────────────────────────
 
 export function createSatelliteSql(
@@ -536,6 +570,7 @@ export function createSatelliteSql(
       `END;`,
       `$bkn$`,
     ].join('\n'),
+    ownerOnlySql(fq(target.schema, n.truncateGuard)),
     `CREATE TRIGGER ${qi(n.truncateGuard)} BEFORE TRUNCATE ON ${x.sat} FOR EACH STATEMENT EXECUTE FUNCTION ${fq(target.schema, n.truncateGuard)}()`,
     // Starts closed: undo whatever the schema's default privileges granted at
     // CREATE, so nobody but the owner reaches it until a later rung says so.
@@ -580,6 +615,14 @@ export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: 
     `  -- disagree with, and the customer's write goes through.`,
     `  IF to_regclass(${satRegclass}) IS NULL THEN`,
     `    RETURN NULL;`,
+    `  END IF;`,
+    `  -- Runs as the owner, so it runs for the host and nothing else: the table`,
+    `  -- the satellite's own foreign key references, after each row. EXECUTE is`,
+    `  -- the owner's alone; this holds even if someone grants it again.`,
+    `  IF TG_WHEN <> 'AFTER' OR TG_LEVEL <> 'ROW' OR NOT EXISTS (`,
+    `       SELECT 1 FROM pg_constraint c`,
+    `        WHERE c.conrelid = to_regclass(${satRegclass}) AND c.conname = ${lit(n.fk)} AND c.contype = 'f' AND c.confrelid = TG_RELID) THEN`,
+    `    RAISE EXCEPTION '${n.forward} fires only for ${spec.host}, after each row' USING ERRCODE = '42501';`,
     `  END IF;`,
     `  IF TG_OP = 'INSERT' AND ${allNull('NEW', x.m)} THEN`,
     `    RETURN NULL;`,
@@ -651,6 +694,7 @@ export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: 
     `DROP POLICY IF EXISTS ${qi(n.policies.hostLock)} ON ${x.host}`,
     `CREATE POLICY ${qi(n.policies.hostLock)} ON ${x.host} FOR UPDATE TO CURRENT_USER USING ${ladder} WITH CHECK (false)`,
     body,
+    ownerOnlySql(fn),
     `DROP TRIGGER IF EXISTS ${qi(n.forward)} ON ${x.host}`,
     // Every UPDATE, not only those naming a member: a BEFORE trigger may set
     // one the statement never named. The WHEN keeps unrelated updates cheap
@@ -660,6 +704,7 @@ export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: 
     `DROP TRIGGER IF EXISTS ${qi(n.forwardRows)} ON ${x.host}`,
     `CREATE TRIGGER ${qi(n.forwardRows)} AFTER INSERT OR DELETE ON ${x.host} FOR EACH ROW EXECUTE FUNCTION ${fn}()`,
     truncateBody,
+    ownerOnlySql(truncate),
     `DROP TRIGGER IF EXISTS ${qi(n.hostTruncate)} ON ${x.host}`,
     `CREATE TRIGGER ${qi(n.hostTruncate)} BEFORE TRUNCATE ON ${x.host} FOR EACH STATEMENT EXECUTE FUNCTION ${truncate}()`,
   ]
@@ -819,6 +864,7 @@ export function openWritesSql(
   const parent = followsParent(x)
   return [
     body,
+    ownerOnlySql(fn),
     `DROP TRIGGER IF EXISTS ${qi(n.reverse)} ON ${x.sat}`,
     `CREATE TRIGGER ${qi(n.reverse)} AFTER INSERT OR UPDATE OR DELETE ON ${x.sat} FOR EACH ROW EXECUTE FUNCTION ${fn}()`,
     `DROP POLICY IF EXISTS ${qi(n.policies.insert)} ON ${x.sat}`,

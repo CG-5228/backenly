@@ -31,7 +31,7 @@ import { prisma } from '@/lib/db'
 import { enqueue } from '@/lib/queue'
 import { createHash } from 'node:crypto'
 import { readTableFacts, relationExists, type TableFacts } from './facts'
-import { hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
+import { fq, hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
 import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
 import { inFlightChain } from './backfill-job'
@@ -222,6 +222,17 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       ]
       if (!trig || missing.length > 0) {
         return { status: 'failed', detail: `the statements reported no error but ${spec.host} lacks ${missing.join(', ') || n.forward}` }
+      }
+      // It runs as the owner: nobody else may attach it to a table of theirs.
+      const [acl] = await prisma.$queryRawUnsafe<Array<{ others: string[] }>>(
+        `SELECT ARRAY(SELECT CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END
+                        FROM aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) x
+                       WHERE x.grantee <> p.proowner) AS others
+           FROM pg_proc p WHERE p.oid = $1::regprocedure`,
+        `${fq(schema, n.forward)}()`,
+      )
+      if (!acl || acl.others.length > 0) {
+        return { status: 'failed', detail: `${n.forward} runs as the owner and may be executed by ${acl?.others.join(', ') || 'an unknown role'}` }
       }
       return {
         status: 'completed',
