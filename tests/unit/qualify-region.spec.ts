@@ -254,7 +254,10 @@ describe('what an agent reads about a table', () => {
   it('still sees a table that lingers in relationships or realtime', () => {
     expect(describesTable({ ...afterRestore, realtime: { tables: ['qualify_kept_4e3a9bbd'] } }, 'qualify_kept_4e3a9bbd')).toBe(true)
     expect(
-      describesTable({ ...afterRestore, relationships: [{ from: 'qualify_kept_4e3a9bbd.note', to: 'qualify_notes.id' }] }, 'qualify_kept_4e3a9bbd'),
+      describesTable(
+        { ...afterRestore, relationships: [{ from: 'qualify_kept_4e3a9bbd', column: 'note_id', to: 'qualify_notes', toColumn: 'id' }] },
+        'qualify_kept_4e3a9bbd',
+      ),
     ).toBe(true)
   })
 
@@ -340,6 +343,8 @@ describe('a region that cannot be reached', () => {
       'restore-refused-under-a-later-change', 'drill-tables-removed', 'deleted-with-its-history',
       // What a coding agent reads of the schema, after each of them.
       'described-after-undo', 'described-after-a-change', 'described-after-acknowledged-restore', 'described-after-reapply',
+      // And the functions generated for a table a restore removed.
+      'functions-after-undo', 'functions-after-acknowledged-restore',
     ]) {
       expect([check, status(check)]).toEqual([check, 'skip'])
     }

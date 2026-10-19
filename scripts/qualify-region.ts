@@ -105,8 +105,9 @@
  *              read_backend_state's tables and schema sections, what a coding
  *              agent reads to learn the backend (one lagged a restore by 12
  *              minutes once). The rollback check above is held to the same bound.
- *              After each restore, no function generated for the removed table
- *              (its `<table>-schema` endpoint) is still listed
+ *              After the console's restore and the acknowledged restore, no
+ *              function generated for the removed table (its `<table>-schema`
+ *              endpoint) is still listed
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -771,10 +772,17 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     if (!data) throw new Error(`read_backend_state's ${section} section answered no data: ${outcome.text.slice(0, 160)}`)
     return describesTable(data, table)
   }
-  /** The functions read_backend_state's schema section lists that were generated for `table`. */
+  /**
+   * The functions read_backend_state's schema section lists that were generated for `table`. A section with no
+   * functions list proves nothing either way, so it fails the check rather than passing it.
+   */
   async function functionsGeneratedFor(table: string): Promise<string[]> {
-    const data = toolData<Record<string, unknown>>(await mcp!.call('read_backend_state', { section: 'schema' }))
-    return data ? generatedFunctionsFor(data, table) : []
+    const outcome = await mcp!.call('read_backend_state', { section: 'schema' })
+    const data = toolData<Record<string, unknown>>(outcome)
+    if (!data || !Array.isArray((data.functions as { names?: unknown } | undefined)?.names)) {
+      throw new Error(`read_backend_state's schema section answered no functions list: ${outcome.text.slice(0, 160)}`)
+    }
+    return generatedFunctionsFor(data, table)
   }
   /** The detail of a passing freshness check. */
   const described = (what: string, table: string, t: { ms: number; firstRead: boolean }, after: string) =>
@@ -1301,7 +1309,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
           must(repair.verified === true, `the repair of ${probeColumn} ran but was not confirmed: ${repair.full}`)
           must(index, `the repair was recorded, but ${TABLE} has no index leading with ${probeColumn}`)
           const after = repair.at ? seconds(Date.parse(repair.at) - sinceOnService.getTime()) : 'some time'
-          return `the region's repair loop indexed ${probeColumn} ${after} after the fault, confirmed, with nobody asking`
+          return (
+            `the region's repair loop indexed ${probeColumn} ${after} after the fault, confirmed, with nobody asking ` +
+            `(the service's clock ${seconds(Math.abs(offset))} ${offset >= 0 ? 'ahead of' : 'behind'} this machine's)`
+          )
         }
         if (index && indexedAt === null) indexedAt = Date.now()
         // The loop records its repair once it is verified, moments after the
