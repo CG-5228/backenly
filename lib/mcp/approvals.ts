@@ -321,6 +321,11 @@ export async function listApprovals(projectId: string) {
       status: view.status,
       tool: r.tool,
       target: r.target,
+      // Who asked: a coding agent's key, or Backenly itself (a change that failed
+      // its checks and could not be recovered without a person).
+      requestedBy: r.apiKeyId ? ('agent' as const) : ('backenly' as const),
+      // The change a restore request is about, so the inbox can link to it.
+      changeId: r.tool === 'revert_schema_change' ? ((r.toolArgs as { changeId?: string } | null)?.changeId ?? null) : null,
       rowCount: r.rowCount,
       reversible: r.reversible,
       message: r.message,
@@ -375,12 +380,33 @@ export async function decideApproval(input: {
     return { ok: false, status: current, error: `Request is ${current}, not pending` }
   }
 
+  // A restore rewrites production, so deciding one takes the same authority as
+  // running one from the console: admin rights on the project, not access.
+  // Declining one is a decision too (it keeps a change that failed its checks),
+  // so it takes the same.
+  if (row.tool === 'revert_schema_change') {
+    const { canAdministerProject } = await import('@/lib/edition/guard')
+    if (!(await canAdministerProject(input.approverUserId, input.projectId))) {
+      return { ok: false, status: 'forbidden', error: 'Only a project admin can decide whether to restore a previous state.' }
+    }
+  }
+
   if (input.decision === 'reject') {
     await prisma.agentApprovalRequest.update({
       where: { id: row.id },
       data: { status: 'rejected', decidedBy: input.approverUserId, decidedAt: new Date() },
     })
     await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_REJECTED')
+    // Declining to restore a change that failed its checks is a decision to
+    // keep it. A no-op for a change that was not waiting on one (an agent
+    // asking to restore a healthy change, say).
+    if (row.tool === 'revert_schema_change') {
+      const changeId = (row.toolArgs as { changeId?: string } | null)?.changeId
+      if (changeId) {
+        const { keepChange } = await import('@/lib/changes/recovery')
+        await keepChange(input.projectId, changeId, input.approverUserId, { via: 'approval' }).catch(() => {})
+      }
+    }
     return { ok: true, status: 'rejected' }
   }
 
@@ -431,13 +457,20 @@ export async function decideApproval(input: {
   // The exact call, verbatim. The approver's identity carries the authority;
   // `destructiveConfirmed` tells the executor its own confirmation gate is
   // already satisfied for THIS call, which a human just read and approved.
-  const outcome = await runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
-    projectId: input.projectId,
-    userId: input.approverUserId,
-    sessionToken: undefined,
-    destructiveConfirmed: true,
-    createdThisTurn: new Set<string>(),
-  })
+  // Every change it makes to production is recorded as the approver's decision
+  // on the requester's call (lib/changes/attribution.ts), so the change history
+  // can say both.
+  const { withChangeAttribution } = await import('@/lib/changes/attribution')
+  const outcome = await withChangeAttribution(
+    { source: 'approval', actorUserId: input.approverUserId, apiKeyId: row.apiKeyId },
+    () => runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
+      projectId: input.projectId,
+      userId: input.approverUserId,
+      sessionToken: undefined,
+      destructiveConfirmed: true,
+      createdThisTurn: new Set<string>(),
+    }),
+  )
   // The approver gets the full result now. What is stored for later readers is
   // the status alone for a project kept in another region, whose result can
   // quote its rows (lib/data-plane/residency.ts).

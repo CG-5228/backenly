@@ -80,6 +80,8 @@ jest.mock('@/lib/db/prisma', () => {
         }),
       },
       auditLog: { create: jest.fn(async ({ data }: any) => { mockAudits.push(data); return data }) },
+      // The governed change a repair makes, as its fix group lists it.
+      backendChange: { findMany: jest.fn(async () => [{ id: 'chg-fix' }]) },
       correctionEvent: {
         findFirst: jest.fn(async () => null),
         create: jest.fn(async ({ data }: any) => { mockCorrections.push(data); return data }),
@@ -119,7 +121,12 @@ jest.mock('@/lib/ai/build-runtime/build-lock', () => ({
 }))
 jest.mock('@/lib/services/workspace-schema-snapshot', () => ({
   captureSchemaSnapshot: jest.fn(async (_projectId: string, kind: string) => ({ id: `snap-${kind}` })),
-  rollbackToSchemaVersion: jest.fn(async () => ({ success: true, appliedSteps: 1 })),
+}))
+// Undo restores the governed changes a fix made, by the ids its record keeps
+// (lib/changes/recovery.ts): nothing a regional project's record withholds.
+jest.mock('@/lib/changes/recovery', () => ({
+  previewRecovery: jest.fn(async () => ({ safety: 'lossless', reason: null })),
+  recoverChange: jest.fn(async () => ({ ok: true, status: 'restored' })),
 }))
 // The loop's checks, which this suite drives rather than runs. A proposal
 // starts only on a gap its probe detects now.
@@ -163,7 +170,7 @@ import {
 import { buildFixAction } from '@/lib/core/fix-actions'
 import { executeApprovedProposal, revertAutoFix, runAutoFix } from '@/lib/core/auto-fix-engine'
 import { queuePendingActionFinding } from '@/lib/operational-memory/ledger'
-import { rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
+import { recoverChange } from '@/lib/changes/recovery'
 import { POST as approve } from '@/app/api/projects/[id]/health/approve/route'
 
 const { email: ALICE, ddl: DDL, bound: BOUND, newKey: NEW_KEY } = mockRepair
@@ -268,7 +275,7 @@ describe('the loop\'s repair', () => {
     expect(row.details.rollbackData.fixAction).toEqual(WORKFLOW_SHAPE)
     expect(row.details.rollbackData.fixResult).toEqual({ success: true })
     expect(row.details.rollbackData.statements).toEqual(TEXT_ONLY)
-    expect(row.details.rollbackData).toMatchObject({ rollbackFormat: 2, schemaTouching: true, snapshotId: 'snap-pre_migration' })
+    expect(row.details.rollbackData).toMatchObject({ rollbackFormat: 3, changeIds: ['chg-fix'], schemaTouching: true, snapshotId: 'snap-pre_migration' })
     expect(JSON.stringify(row)).not.toContain(ALICE)
 
     const audit = auditOf('p-use1-loop', 'HEALTH_AUTO_FIXED')
@@ -282,7 +289,7 @@ describe('the loop\'s repair', () => {
     const id = brokenWorkflow('p-use1-undo', 'us-east-1')
     expect((await runAutoFix(id, 'p-use1-undo', loop)).outcome).toBe('auto_fixed')
     expect(await revertAutoFix(id, 'p-use1-undo')).toMatchObject({ success: true, appliedSteps: 1 })
-    expect(rollbackToSchemaVersion).toHaveBeenLastCalledWith('p-use1-undo', 7)
+    expect(recoverChange).toHaveBeenLastCalledWith('p-use1-undo', 'chg-fix', expect.objectContaining({ mode: 'manual' }))
   })
 })
 
