@@ -630,6 +630,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
   globalThis.fetch = theFetch
 
   const failed = new Set<string>()
+  /** The authorization copy's mode the region host reported (off, shadow, enforce), for the latency check's detail. */
+  let authorizationMode: string | null = null
   async function check(phase: string, name: string, needs: string[], body: () => Promise<string>): Promise<boolean> {
     const missing = needs.filter((n) => failed.has(n))
     if (missing.length) {
@@ -862,6 +864,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(body.region === args.region, `the region host reports serving ${body.region}, not ${args.region}`)
       must(body.degraded === false, `the region host is degraded: ${JSON.stringify(body.dependencies ?? {}).slice(0, 300)}`)
       const copy = body.dependencies?.authProjection
+      authorizationMode = typeof copy?.mode === 'string' ? copy.mode : null
       return `the region host is ready and not degraded: its own database answers, home answers, authorization copy ${copy?.mode ?? 'unknown'}${typeof copy?.ageMs === 'number' ? ` ${(copy.ageMs / 1000).toFixed(1)} s old` : ''}`
     })
     await check('region', 'project-health', [], async () => {
@@ -1228,7 +1231,13 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const p50 = percentile(times, 50)
       const p95 = percentile(times, 95)
       must(p95 < 3000, `p95 ${p95} ms is above 3 s`)
-      return `p50 ${p50} ms, p95 ${p95} ms over 20 reads (from where this runs; each still checks the key in the home region)`
+      const where =
+        args.region === HOME_REGION
+          ? 'each key checked at home, where the project lives'
+          : authorizationMode === 'enforce'
+            ? "each key checked against the region's own authorization copy"
+            : `each key still checked in the home region (authorization copy ${authorizationMode ?? 'not reported'})`
+      return `p50 ${p50} ms, p95 ${p95} ms over 20 reads (from where this runs; ${where})`
     })
 
     // ── rollback ─────────────────────────────────────────────────────────────
