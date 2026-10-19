@@ -97,8 +97,9 @@ async function resolveApiKey(req: Request) {
   // In a region whose copy is enforced, a hashed key comes from the copy while it
   // is fresh, from home otherwise (lib/auth-projection/read.ts), and is counted in
   // the region (rate.ts): what the Next-owned routes and dynamic.ts already do, so
-  // a key has one counter whichever route it calls, and no read in Mumbai precedes
-  // the response. A key neither has goes on to the legacy lookup below.
+  // a key has one counter whichever route it calls, and a copied key's request
+  // reads nothing in Mumbai before its response (the gates before this one read
+  // the copy too). A key neither has goes on to the legacy lookup below.
   const region = regionalRateCounting()
   if (region) {
     const key = await authorizingKeyByHash(keyHash)

@@ -42,6 +42,8 @@ import { NextRequest } from 'next/server'
 import { authenticateApiKey } from '@/lib/middleware/apiKeyAuth'
 import { v1ApiMiddleware } from '@/lib/api/v1/middleware'
 import { resolveAuthEnvironment } from '@/lib/branches/auth-environment'
+import { clearBranchKeyCache } from '@/lib/branches/key-scope'
+import { clearKeyPlacementCache } from '@/lib/security/key-placement'
 
 jest.setTimeout(120_000)
 
@@ -285,6 +287,9 @@ describe("the runtime's own v1 routes (database, logs, presence, broadcast, real
     mode('enforce')
     const id = await keyId(publicKey)
     const before = (await regionCount(id)) ?? 0
+    // The gates before the middleware (key placement, branch scope) look the key up too: from nothing cached.
+    clearKeyPlacementCache()
+    clearBranchKeyCache()
     const homeKey = jest.spyOn(prisma.apiKey, 'findFirst')
     const homeCountWrite = jest.spyOn(prisma.apiKey, 'updateMany')
     const homeCountReset = jest.spyOn(prisma.apiKey, 'update')
@@ -298,6 +303,19 @@ describe("the runtime's own v1 routes (database, logs, presence, broadcast, real
     expect(homeCountWrite).not.toHaveBeenCalled()
     expect(homeCountReset).not.toHaveBeenCalled()
     expect(homeProject).not.toHaveBeenCalled()
+  })
+
+  it('keep serving a copied key from a fresh copy while home cannot answer at all', async () => {
+    mode('enforce')
+    clearKeyPlacementCache()
+    clearBranchKeyCache()
+    invalidateProjectServingState(projectId)
+    jest.spyOn(prisma.apiKey, 'findFirst').mockRejectedValue(new Error('home unreachable'))
+    jest.spyOn(prisma.apiKey, 'findUnique').mockRejectedValue(new Error('home unreachable'))
+    jest.spyOn(prisma.project, 'findUnique').mockRejectedValue(new Error('home unreachable'))
+    const res = await broadcast(publicKey)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'channel is required' })
   })
 
   it('keep one counter with the Next-owned routes: past the limit, both refuse', async () => {
