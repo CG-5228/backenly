@@ -602,4 +602,23 @@ describe('the hourly check against home', () => {
     await deliverRegion(REGION)
     expect(JWTSecretManager.resolve((await copiedProject(regionalProject)).jwtSecret as string)).toBe(PLAINTEXT_SECRET)
   })
+
+  it('leaves a change already waiting for delivery to it, and agrees on timestamps once it is delivered', async () => {
+    await deliverRegion(REGION)
+    const [key] = await copiedKeys(regionalProject)
+    await prisma.project.update({ where: { id: regionalProject }, data: { pausedAt: new Date(Date.now() - 60_000), pauseReason: 'reconcile probe' } })
+    await prisma.apiKey.update({ where: { id: key.id }, data: { expiresAt: new Date(Date.now() + 86_400_000) } })
+    try {
+      // Recorded by the capture triggers and not delivered yet: in flight, neither gone nor drifted.
+      expect(await reconcileRegionCopy(REGION)).toMatchObject({ queued: 0, drifted: 0 })
+      await deliverRegion(REGION)
+      expect((await copiedProject(regionalProject)).pausedAt).not.toBeNull()
+      // Delivered: a pause and an expiry, timestamps without a time zone on both sides, compare equal.
+      expect(await reconcileRegionCopy(REGION)).toMatchObject({ queued: 0, drifted: 0 })
+    } finally {
+      await prisma.project.update({ where: { id: regionalProject }, data: { pausedAt: null, pauseReason: null } })
+      await prisma.apiKey.update({ where: { id: key.id }, data: { expiresAt: null } })
+      await deliverRegion(REGION)
+    }
+  })
 })

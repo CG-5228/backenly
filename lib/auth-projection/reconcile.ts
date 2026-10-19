@@ -14,6 +14,7 @@
  * at home: one home no longer has, or no longer copies, is queued for removal;
  * one whose contents differ from what a delivery would write now is queued to
  * be written again. The next delivery carries out both the usual way. A row
+ * with a change already waiting for delivery is in flight, and left to it. A row
  * missing from the copy needs no check, because a reader asks home for it.
  * Finding anything is a defect somewhere else, so it is reported as an error,
  * by counts only: never a value.
@@ -74,10 +75,22 @@ function secretValue(stored: unknown): string | null {
   }
 }
 
-/** The copied rows to deliver again: gone at home, or holding other contents. */
-function stale(rows: Row[], home: Row[], fields: readonly string[], result: Reconciliation, extra?: (copied: Row, atHome: Row) => boolean): Row[] {
+/**
+ * The rows of this kind with a change recorded for the region and not delivered yet: in flight, so neither gone nor
+ * drifted. The next delivery writes them as home has them now.
+ */
+async function inFlight(region: CloudRegionId, entity: Queued['entity'], ids: string[]): Promise<Set<string>> {
+  const rows = await prisma.$queryRaw<{ entityId: string }[]>`
+    SELECT DISTINCT "entityId" FROM "auth_projection_changes"
+     WHERE "region" = ${region} AND "entity" = ${entity} AND "deliveredAt" IS NULL AND "entityId" = ANY(${ids}::text[])`
+  return new Set(rows.map((row) => row.entityId))
+}
+
+/** The copied rows to deliver again: gone at home, or holding other contents, unless a delivery already carries them. */
+function stale(rows: Row[], home: Row[], pending: Set<string>, fields: readonly string[], result: Reconciliation, extra?: (copied: Row, atHome: Row) => boolean): Row[] {
   const byId = new Map(home.map((row) => [row.id, row]))
   return rows.filter((copied) => {
+    if (pending.has(copied.id)) return false
     const atHome = byId.get(copied.id)
     if (!atHome) return true
     const drifted = fields.some((field) => !sameDelivered(copied[field], atHome[field])) || (extra?.(copied, atHome) ?? false)
@@ -100,7 +113,8 @@ export async function reconcileRegionCopy(region: CloudRegionId): Promise<Reconc
     const home = await prisma.$queryRaw<Row[]>`
       SELECT "id", "lockedDownAt", "lockedDownReason", "pausedAt", "pauseReason", "jwtSecret", "userId", "organizationId"
         FROM "projects" WHERE "id" = ANY(${ids}::text[]) AND "region" = ${region}`
-    const queue_ = stale(rows, home, PROJECT_FIELDS, result, (copied, atHome) => secretValue(copied.jwtSecret) !== secretValue(atHome.jwtSecret))
+    const pending = await inFlight(region, 'project', ids)
+    const queue_ = stale(rows, home, pending, PROJECT_FIELDS, result, (copied, atHome) => secretValue(copied.jwtSecret) !== secretValue(atHome.jwtSecret))
     result.queued += await queue(region, queue_.map((row) => ({ entity: 'project', projectId: row.id, entityId: row.id })))
     result.checked += ids.length
     after = ids[ids.length - 1]
@@ -123,7 +137,7 @@ export async function reconcileRegionCopy(region: CloudRegionId): Promise<Reconc
         FROM "api_keys" k JOIN "projects" p ON p."id" = k."projectId"
        WHERE k."id" = ANY(${ids}::text[]) AND p."region" = ${region}
          AND k."scope" = 'runtime' AND k."serviceRole" = false AND k."keyType" = 'public'`
-    const queue_ = stale(rows, home, KEY_FIELDS, result)
+    const queue_ = stale(rows, home, await inFlight(region, 'api_key', ids), KEY_FIELDS, result)
     result.queued += await queue(
       region,
       queue_.map((row) => ({ entity: 'api_key', projectId: String(row.projectId), entityId: row.id })),
@@ -144,7 +158,7 @@ export async function reconcileRegionCopy(region: CloudRegionId): Promise<Reconc
       SELECT b."id", b."projectId", b."name", b."status", b."schemaName"
         FROM "workspace_branches" b JOIN "projects" p ON p."id" = b."projectId"
        WHERE b."id" = ANY(${ids}::text[]) AND p."region" = ${region}`
-    const queue_ = stale(rows, home, BRANCH_FIELDS, result)
+    const queue_ = stale(rows, home, await inFlight(region, 'branch', ids), BRANCH_FIELDS, result)
     result.queued += await queue(
       region,
       queue_.map((row) => ({ entity: 'branch', projectId: String(row.projectId), entityId: row.id })),
