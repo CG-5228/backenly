@@ -1475,7 +1475,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { question: { type: 'string' } },
     ['question']),
   fn('run_test',
-    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure.",
+    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure. get lists one row and fetches it by id, so it needs a row to exist; on an empty table use list.",
     {
       tableName: { type: 'string' },
       operation: { type: 'string', enum: ['list', 'create', 'get'] },
