@@ -85,7 +85,9 @@
  *              indexed by the region's repair loop without anyone asking
  *              (missing_fk_index, Tier 0), confirmed by its HEALTH_AUTO_FIXED
  *              record and by the table's own indexes. A repair made from home
- *              instead proves nothing about the region and fails the check.
+ *              instead proves nothing about the region and fails the check. The
+ *              fault is timed by the service's clock (its Date header), not this
+ *              machine's.
  *              The changes the drill made are then restored from the console,
  *              newest first
  *   rollback drills
@@ -102,7 +104,9 @@
  *              reapplied one within --freshness-seconds, each timed, and so do
  *              read_backend_state's tables and schema sections, what a coding
  *              agent reads to learn the backend (one lagged a restore by 12
- *              minutes once). The rollback check above is held to the same bound
+ *              minutes once). The rollback check above is held to the same bound.
+ *              After each restore, no function generated for the removed table
+ *              (its `<table>-schema` endpoint) is still listed
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -469,6 +473,40 @@ export function toolData<T>(outcome: ToolOutcome): T | null {
 }
 
 /**
+ * Whether a read_backend_state section's data describes `table`: any value in
+ * it names the table (the tables list, relationships, realtime), except the
+ * functions list, whose names are the functions' own. A table's generated
+ * `<table>-schema` endpoint is a function, not the table; generatedFunctionsFor
+ * reads those.
+ */
+export function describesTable(data: Record<string, unknown>, table: string): boolean {
+  const named = new RegExp(`\\b${table}\\b`)
+  const mentions = (value: unknown): boolean =>
+    typeof value === 'string'
+      ? named.test(value)
+      : Array.isArray(value)
+        ? value.some(mentions)
+        : value !== null && typeof value === 'object' && Object.values(value).some(mentions)
+  return Object.entries(data).some(([key, value]) => key !== 'functions' && mentions(value))
+}
+
+/** The functions a schema section lists that were generated for `table`: named `<table>-…`. */
+export function generatedFunctionsFor(data: Record<string, unknown>, table: string): string[] {
+  const names = (data.functions as { names?: unknown } | undefined)?.names
+  return Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string' && name.startsWith(`${table}-`)) : []
+}
+
+/**
+ * A server's clock minus this machine's, in ms, from its Date header (whole
+ * seconds, so its midpoint) and when the request went out and came back. 0
+ * when the header is missing or unreadable.
+ */
+export function clockOffsetFromDate(header: string | null, sent: number, received: number): number {
+  const date = Date.parse(header ?? '')
+  return Number.isFinite(date) ? date + 500 - (sent + received) / 2 : 0
+}
+
+/**
  * A failed call's text for the report. The SDK throws BackenlyError (an Error
  * with code and status beside its message); anything else is shown as JSON, so
  * an object never reads "[object Object]".
@@ -640,6 +678,19 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     return json(res)
   }
 
+  /**
+   * The home host's clock minus this machine's, in ms, from its Date header:
+   * whole seconds, so the header's midpoint against the request's. 0 when the
+   * header is missing, which leaves this machine's clock in charge.
+   */
+  async function serviceClockOffsetMs(): Promise<number> {
+    const sent = Date.now()
+    const res = await theFetch(homeUrl('/api/health'))
+    const received = Date.now()
+    await res.arrayBuffer().catch(() => undefined)
+    return clockOffsetFromDate(res.headers.get('date'), sent, received)
+  }
+
   /** The project's governed changes newer than `seq`, newest first, as the console lists them. */
   async function changesSince(seq: number): Promise<Array<{
     id: string
@@ -688,14 +739,19 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
    * section, which reads the region's live catalog. `firstRead` says the very
    * first read already agreed, so the time is an upper bound set by the checks
    * before this one, not a measured lag.
+   *
+   * A section describes the table when anything in its data names it (the
+   * tables list, relationships, realtime), except the functions list: those
+   * names are functions' own (a table's generated `<table>-schema` endpoint is
+   * a function, not the table), and functionsGeneratedFor checks them on their
+   * own.
    */
   async function untilDescribed(table: string, want: 'listed' | 'gone', since: number): Promise<{ ms: number; firstRead: boolean }> {
-    const named = new RegExp(`\\b${table}\\b`)
     const bound = since + args.freshnessSeconds * 1_000
     for (let read = 1; ; read++) {
       const behind: string[] = []
       for (const section of ['tables', 'schema'] as const) {
-        const listed = named.test((await mcp!.call('read_backend_state', { section })).text)
+        const listed = await sectionDescribes(section, table)
         if (want === 'listed' ? !listed : listed) behind.push(section)
       }
       if (behind.length === 0) return { ms: Date.now() - since, firstRead: read === 1 }
@@ -707,6 +763,18 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       }
       await new Promise((r) => setTimeout(r, 1_000))
     }
+  }
+  /** Whether read_backend_state's `section` describes `table` (describesTable). */
+  async function sectionDescribes(section: 'tables' | 'schema', table: string): Promise<boolean> {
+    const outcome = await mcp!.call('read_backend_state', { section })
+    const data = toolData<Record<string, unknown>>(outcome)
+    if (!data) throw new Error(`read_backend_state's ${section} section answered no data: ${outcome.text.slice(0, 160)}`)
+    return describesTable(data, table)
+  }
+  /** The functions read_backend_state's schema section lists that were generated for `table`. */
+  async function functionsGeneratedFor(table: string): Promise<string[]> {
+    const data = toolData<Record<string, unknown>>(await mcp!.call('read_backend_state', { section: 'schema' }))
+    return data ? generatedFunctionsFor(data, table) : []
   }
   /** The detail of a passing freshness check. */
   const described = (what: string, table: string, t: { ms: number; firstRead: boolean }, after: string) =>
@@ -1169,6 +1237,11 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     await check('rollback', 'described-after-undo', ['undone'], async () => {
       return described('stopped describing', rollbackTable, await untilDescribed(rollbackTable, 'gone', undoneAt), 'the restore was asked for')
     })
+    await check('rollback', 'functions-after-undo', ['described-after-undo'], async () => {
+      const left = await functionsGeneratedFor(rollbackTable)
+      must(left.length === 0, `the restore removed ${rollbackTable} but left the functions generated for it: ${left.join(', ')}`)
+      return `no function generated for ${rollbackTable} is listed once the restore removed it`
+    })
 
     // ── autonomy: a fault the region repairs on its own ──────────────────────
     // Before recovery, so a restore's brief errors cannot hold the repair loop
@@ -1200,10 +1273,14 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       seqBeforeFault = (await changesSince(0))[0]?.seq ?? 0
       // The region's repair loop runs at the top of each minute, and home's
       // observer looks at a project 60 s after an MCP change to it. A fault made
-      // at second 40 or later reaches the region's loop first.
-      const second = new Date().getUTCSeconds()
+      // at second 40 or later reaches the region's loop first. Seconds on the
+      // service's clock: this machine's may be minutes off (a qualification ran
+      // with its clock 3.5 min slow and made the fault at second 9).
+      const offset = await serviceClockOffsetMs()
+      const second = new Date(Date.now() + offset).getUTCSeconds()
       if (second < 40) await new Promise((r) => setTimeout(r, (40 - second) * 1_000))
       const since = new Date()
+      const sinceOnService = new Date(since.getTime() + offset)
       // With a DEFAULT, ADD COLUMN takes the declared-column path, which adds the
       // column exactly as written and indexes it only when it REFERENCES a table.
       // A column named like a reference with no index is the fault
@@ -1214,7 +1291,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       let indexedAt: number | null = null
       for (;;) {
         const { events } = await operatorJson(
-          `/api/projects/${args.project}/autonomy/events?since=${encodeURIComponent(since.toISOString())}&limit=50`,
+          `/api/projects/${args.project}/autonomy/events?since=${encodeURIComponent(sinceOnService.toISOString())}&limit=50`,
         )
         const repair = ((events ?? []) as Array<{ action?: string; tableName?: string; full?: string; verified?: boolean; at?: string }>).find(
           (e) => e.action === 'HEALTH_AUTO_FIXED' && e.tableName === TABLE && String(e.full ?? '').includes(`${TABLE}.${probeColumn}`),
@@ -1223,7 +1300,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         if (repair) {
           must(repair.verified === true, `the repair of ${probeColumn} ran but was not confirmed: ${repair.full}`)
           must(index, `the repair was recorded, but ${TABLE} has no index leading with ${probeColumn}`)
-          const after = repair.at ? seconds(Date.parse(repair.at) - since.getTime()) : 'some time'
+          const after = repair.at ? seconds(Date.parse(repair.at) - sinceOnService.getTime()) : 'some time'
           return `the region's repair loop indexed ${probeColumn} ${after} after the fault, confirmed, with nobody asking`
         }
         if (index && indexedAt === null) indexedAt = Date.now()
@@ -1231,8 +1308,11 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         // index. An index with no such record a while later was made elsewhere.
         if (indexedAt !== null && Date.now() - indexedAt > 90_000) {
           throw new Error(
-            `${probeColumn} was indexed, but the region's repair loop recorded no confirmed repair: home repaired it, ` +
-              `which proves nothing about ${args.region}. Run again`,
+            `${probeColumn} was indexed, but the region's repair loop recorded no confirmed repair: ` +
+              (args.region === HOME_REGION
+                ? 'another path at home made it (the observer that runs 60 s after a change), which proves nothing about the loop'
+                : `home repaired it, which proves nothing about ${args.region}`) +
+              '. Run again',
           )
         }
         if (Date.now() > deadline) {
@@ -1443,6 +1523,11 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     })
     await check('rollback-drills', 'described-after-acknowledged-restore', ['restored-with-acknowledgement'], async () => {
       return described('stopped describing', keptTable, await untilDescribed(keptTable, 'gone', keptAt.restored), 'the restore was asked for')
+    })
+    await check('rollback-drills', 'functions-after-acknowledged-restore', ['described-after-acknowledged-restore'], async () => {
+      const left = await functionsGeneratedFor(keptTable)
+      must(left.length === 0, `the restore removed ${keptTable} but left the functions generated for it: ${left.join(', ')}`)
+      return `no function generated for ${keptTable} is listed once the restore removed it`
     })
 
     await check('rollback-drills', 'reapplied-and-served', ['restored-with-acknowledgement'], async () => {
