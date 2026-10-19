@@ -837,6 +837,14 @@ tests/integration/ai-lab-arm.spec.ts
 # charge. The row and the race are real, so it needs a real Postgres.
 tests/integration/ai-credit-holds.spec.ts
 
+# The calls that only route a brain turn are recorded like every other model
+# call: the classifier and the answer of a CHAT turn, the classifier and the
+# clarifying question of an UNCLEAR one, each reserved, settled and written to
+# the project's usage log under its own name, while the turn charges no AI
+# credits for them. It reads and writes the project, its workspace schema, its
+# conversation and its usage rows, so it needs a real Postgres.
+tests/integration/brain-classify-clarify-spend.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.
