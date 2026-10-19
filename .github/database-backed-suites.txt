@@ -963,6 +963,11 @@ tests/integration/trigger-webhooks-console.spec.ts
 # approved, and narrows with a before/after receipt. Real key rows are the
 # property.
 tests/integration/key-lifecycle-honesty.spec.ts
+
+# The execution timeline keeps how an action went, not what it handed back: a
+# success keeps no message, a failure its error with credential shapes withheld,
+# as do retries, stored arguments and operational memory. Real rows.
+tests/integration/execution-timeline-outcomes.spec.ts
 # The integrations connect door keeps its contract: unknown provider ids are
 # refused with the served list, any alias or casing stores under the one
 # canonical id everything looks up, disconnect clears what the console reads
