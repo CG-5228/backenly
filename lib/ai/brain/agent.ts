@@ -40,6 +40,7 @@ import { classify, type BrainIntent, type Classification } from './classifier'
 import {
   BRAIN_MODEL_TOOLS,
   dispatchTool,
+  isReadOnlyCall,
   isReadOnlyTool,
   humanTitle,
   type ToolDispatchContext,
@@ -86,12 +87,22 @@ export interface BlockedCall {
 
 /**
  * Control-flow tools — neither mutations nor reads of backend state.
- * (Reads are tracked in tools.READ_ONLY_TOOLS; mutations are everything else.)
+ * (Reads are tracked in tools.READ_ONLY_TOOLS, per call by tools.isReadOnlyCall;
+ * mutations are everything else.)
  */
 const CONTROL_TOOLS = new Set<string>([
   'finish', 'propose_plan', 'ask_user', 'answer_question',
   'apply_proposal', 'run_test', 'rollback',
 ])
+
+/**
+ * Whether one call can change the backend: what lists it in the turn's
+ * `applied` and sends a later finish back for verification. Exported so
+ * tests/unit/brain-mutation-accounting.spec.ts can list every tool it counts.
+ */
+export function isMutationCall(name: string, args: Record<string, unknown>): boolean {
+  return !CONTROL_TOOLS.has(name) && !isReadOnlyCall(name, args)
+}
 
 /**
  * Tools that read their own result back out of the live catalog before they
@@ -1591,10 +1602,11 @@ async function runAgentLoop(
       if (toolName === 'read_backend_state' && mutated) verifiedAfterMutation = result.ok
       if (toolName === 'run_test' && mutated) verifiedAfterMutation = true
       // Allowlist-driven: a mutation is anything that is NOT a control tool and
-      // NOT a read-only tool. Adding a new read tool to tools.READ_ONLY_TOOLS
-      // (or a control tool to CONTROL_TOOLS above) keeps this honest without
-      // editing this branch every time.
-      const isMutation = !isReadOnlyTool(toolName) && !CONTROL_TOOLS.has(toolName)
+      // NOT a read. Adding a new read tool to tools.READ_ONLY_TOOLS (or a
+      // control tool to CONTROL_TOOLS above) keeps this honest without editing
+      // this branch every time; a tool whose arguments decide, like a dry-run
+      // migration, has its rule in tools.READ_ONLY_WHEN.
+      const isMutation = isMutationCall(toolName, args)
       if (isMutation) {
         mutated = true
         verificationSteered = false

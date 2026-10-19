@@ -247,7 +247,8 @@ const DESTRUCTIVE_TOOLS = new Set<ToolName>([
 /**
  * Tools that do NOT mutate state. Used by the agent loop to decide whether the
  * turn needs a post-mutation verification pass. Everything not in this set OR
- * the control-tool list is treated as a mutation.
+ * the control-tool list is treated as a mutation, unless a call's arguments
+ * decide (READ_ONLY_WHEN below).
  */
 export const READ_ONLY_TOOLS = new Set<ToolName>([
   'read_backend_state',
@@ -265,6 +266,7 @@ export const READ_ONLY_TOOLS = new Set<ToolName>([
   'list_end_users',
   'list_permissions',
   'list_triggers',
+  'list_synced_columns',
   'list_ai_functions',
   'list_cron_jobs',
   'list_branches',
@@ -301,6 +303,23 @@ export function isDestructiveTool(name: string): boolean {
 
 export function isReadOnlyTool(name: string): boolean {
   return READ_ONLY_TOOLS.has(name as ToolName)
+}
+
+/**
+ * Tools whose arguments decide whether a call changes anything. A rule answers
+ * for its tool in place of READ_ONLY_TOOLS, and it reads the params the tool's
+ * mapper (TOOL_TO_ACTION) sends the executor, so how the agent loop counts a
+ * call and what the call does cannot disagree.
+ */
+const READ_ONLY_WHEN: Partial<Record<ToolName, (args: Record<string, unknown>) => boolean>> = {
+  // A dry run reports the rows it would touch and changes nothing.
+  run_data_migration: (a) => TOOL_TO_ACTION.run_data_migration(a).params.dryRun === true,
+}
+
+/** Whether one call changes nothing: by its tool's rule above, else by READ_ONLY_TOOLS. */
+export function isReadOnlyCall(name: string, args: Record<string, unknown>): boolean {
+  const rule = READ_ONLY_WHEN[name as ToolName]
+  return rule ? rule(args) : isReadOnlyTool(name)
 }
 
 export interface ToolDispatchContext {

@@ -805,6 +805,13 @@ tests/integration/ai-spend-ledger.spec.ts
 # workspace schema and its conversation, so it needs a real Postgres.
 tests/integration/brain-on-gateway.spec.ts
 
+# A brain turn reports as applied only what changed: listing the derived
+# columns and a dry-run data migration are not listed and send no finish back
+# for verification, and the dry run leaves its rows as they were. It reads and
+# writes the project, its workspace schema and a table's rows, so it needs a
+# real Postgres.
+tests/integration/brain-mutation-accounting.spec.ts
+
 # /v1/{projectId}/ai/generate: model names resolve to the deployment's aliases,
 # the output is capped, the project's credits gate and pay for it, and a provider
 # failure answers with a code and plain words. It reads the project and writes
