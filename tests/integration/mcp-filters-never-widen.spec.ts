@@ -155,3 +155,19 @@ it('every MCP operator still applies', async () => {
   expect(await titles({ owner_id: OWNER })).toEqual(['alpha'])
   expect(await titles({ meta: null })).toEqual(['gamma'])
 })
+
+it('a json column takes a $ operator, and refuses one mixed with plain keys', async () => {
+  const titles = async (filter: Record<string, unknown>) =>
+    ((await dbQuery(projectId, { table: 'items', filter, orderBy: { title: 'asc' } })).rows as any[]).map((row) => row.title)
+  // != {"mode":"dark"}: beta's document differs; gamma's NULL compares as unknown.
+  expect(await titles({ meta: { $ne: { mode: 'dark' } } })).toEqual(['beta'])
+  const before = await snapshot()
+  await expect(dbDelete(projectId, { table: 'items', filter: { done: false, meta: { $ne: { mode: 'dark' }, mode: 'x' } } })).rejects.toThrow(/Unknown filter "mode"/)
+  expect(await snapshot()).toEqual(before)
+})
+
+it('a key only an object prototype has is no operator, and is refused by its own name', async () => {
+  const before = await snapshot()
+  await expect(dbDelete(projectId, { table: 'items', filter: { done: false, qty: { constructor: 1 } } })).rejects.toThrow(/Unknown filter "constructor"/)
+  expect(await snapshot()).toEqual(before)
+})

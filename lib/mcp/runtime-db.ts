@@ -249,7 +249,8 @@ function mcpWhere(filter: unknown, bound: TypedParams, types: Map<string, string
         conditions.push(`"${column}"::text ILIKE ${bound.raw(String(operand))}`)
         continue
       }
-      if (!V1_OPERATOR[key]) {
+      // Own keys only: "constructor" is no operator.
+      if (!Object.prototype.hasOwnProperty.call(V1_OPERATOR, key)) {
         throw new FilterError(
           `Unknown filter "${key}" on "${column}". Use $gt, $gte, $lt, $lte, $ne, $in, $contains or $ilike.`,
           column,

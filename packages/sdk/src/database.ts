@@ -354,29 +354,41 @@ export class QueryBuilder<T = any> {
    * range sent only `{ lt: 65 }`, and a ranged update() or delete() reached
    * every row below 65. Two filters that cannot be sent together on one
    * column (eq() or isNull() with any other, or one operator twice) throw
-   * before anything is sent.
+   * before anything is sent, and so does a value JSON cannot carry: an
+   * undefined value left its filter out of the request altogether, and NaN
+   * or Infinity arrived as null.
    */
   private buildWhereClause(): any {
     if (this.filters.length === 0) return undefined
 
     const where = new Map<string, unknown>()
     const comparedWhole = new Set<string>()
-    const conflict = (column: string, what: string) =>
-      new BackenlyError(
-        `Two filters on "${column}" cannot be sent together (${what}). Combine them into one, or use in().`,
-        'VALIDATION_ERROR',
-      )
+    const refuse = (message: string) => new BackenlyError(message, 'VALIDATION_ERROR')
+    /** The methods that write each operator, as the caller wrote them. */
+    const METHODS: Record<string, string> = {
+      in: 'in()', gt: 'gt()', gte: 'gte()', lt: 'lt()', lte: 'lte()', not: 'neq() or isNotNull()', contains: 'like() or ilike()',
+    }
+    const conflict = (column: string, what: string, hint: string) =>
+      refuse(`Two filters on "${column}" cannot be sent together: ${what}. ${hint}`)
+    const sendable = (column: string, value: unknown): void => {
+      const bad = (v: unknown) => v === undefined || (typeof v === 'number' && !Number.isFinite(v))
+      if (bad(value) || (Array.isArray(value) && value.some(bad))) {
+        throw refuse(`The filter on "${column}" has no value JSON can send (${String(value)}).`)
+      }
+    }
     // A value compared whole: eq(), isNull().
     const compare = (column: string, value: unknown) => {
-      if (where.has(column)) throw conflict(column, 'eq() or isNull() with another filter')
+      sendable(column, value)
+      if (where.has(column)) throw conflict(column, 'eq() or isNull() with another filter', 'For several values, use in().')
       comparedWhole.add(column)
       where.set(column, value)
     }
     // One operator among the column's others.
     const operator = (column: string, key: string, operand: unknown, extra: Record<string, unknown> = {}) => {
-      if (comparedWhole.has(column)) throw conflict(column, 'eq() or isNull() with another filter')
+      sendable(column, operand)
+      if (comparedWhole.has(column)) throw conflict(column, 'eq() or isNull() with another filter', 'For several values, use in().')
       const operators = (where.get(column) as Record<string, unknown> | undefined) ?? {}
-      if (Object.prototype.hasOwnProperty.call(operators, key)) throw conflict(column, `${key} twice`)
+      if (Object.prototype.hasOwnProperty.call(operators, key)) throw conflict(column, `${METHODS[key] ?? key} twice`, 'Keep one of them.')
       where.set(column, { ...operators, [key]: operand, ...extra })
     }
 
