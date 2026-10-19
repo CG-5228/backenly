@@ -318,6 +318,20 @@ describe('delivery', () => {
     expect((await copiedKeys(regionalProject)).map((k) => k.id)).toContain(promoted.id)
   })
 
+  it('copies a key whose lists are NULL at home as empty lists, as home reads them, instead of failing every delivery', async () => {
+    // A create that omits a list leaves its column NULL. The copy's columns are NOT NULL, so one such key made
+    // every delivery to the region fail (23502) and the copy never filled.
+    const listless = await makeKey(regionalProject)
+    await run(homeUrl(), `UPDATE "api_keys" SET "permissions" = NULL, "capabilities" = NULL WHERE "id" = $1`, [listless.id])
+    expect(await deliverRegion(REGION)).toMatchObject({ outcome: 'delivered' })
+    const [copied] = await rowsIn<{ permissions: string[]; capabilities: string[] }>(
+      regionalUrl,
+      `SELECT "permissions", "capabilities" FROM public.auth_projection_keys WHERE "id" = $1`,
+      [listless.id],
+    )
+    expect(copied).toEqual({ permissions: [], capabilities: [] })
+  })
+
   it('takes a deleted project out of the copy with its keys and branches', async () => {
     const doomed = (await prisma.project.create({ data: { name: `authcopy-doomed-${randomUUID()}`, userId: ownerId, region: REGION }, select: { id: true } })).id
     await makeKey(doomed)
