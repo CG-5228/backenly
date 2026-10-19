@@ -69,6 +69,7 @@ import {
 } from './memory'
 import {
   allPrimitives,
+  AUTOMATIC_REQUESTER,
   primitiveById,
   type EnginePlan,
   isConsentRefusal,
@@ -1137,7 +1138,7 @@ async function stopForRegression(
     payload: { reason, verdict: 'regressed' },
   })
   if (shouldAutoRollback(policy, true)) {
-    const r = await undo({ projectId, decisionId: input.decisionId, userId: 'evolution-engine', automatic: true })
+    const r = await undo({ projectId, decisionId: input.decisionId, userId: AUTOMATIC_REQUESTER, automatic: true })
     if (r.ok) return
   }
   await askToResumeOrUndo(projectId, d, reason)

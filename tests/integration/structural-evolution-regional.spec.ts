@@ -11,14 +11,20 @@
  *   analysis, the plan, the rehearsal, every rung, the backfill, reconciliation
  *   and undo                 read and write the regional database; the home
  *                            database never holds the project's schema
+ *   every schema change      a governed change (lib/changes/ledger.ts) whose
+ *                            record at home keeps the catalog's structure and
+ *                            digests, never its definitions or the SQL that
+ *                            ran; the definitions are kept in the region
  */
 
 import { randomBytes, randomUUID } from 'node:crypto'
+import fs from 'node:fs'
 import { Client } from 'pg'
 import { prisma } from '@/lib/db'
 import { jwtClaimFunctionSql } from '@/lib/postgrest/rls-translation'
 import { disconnectRegionalClients } from '@/lib/data-plane/regional'
 import { closeMaintenanceLockPool } from '@/lib/autonomy/maintenance/single-flight'
+import { closeChangeLockPool } from '@/lib/changes/lock'
 import { closeAllWorkspacePools } from '@/lib/services/workspace-pool'
 import { getWorkspaceDatabaseNames } from '@/lib/services/databaseProvisioning'
 import { analyzeStructuralEvolution } from '@/lib/structural-evolution'
@@ -46,7 +52,7 @@ let ownerId = ''
 let projectId = ''
 let schema = ''
 let planId = ''
-const saved = { mutations: process.env.ENABLE_EVOLUTION_MUTATIONS }
+const saved = { mutations: process.env.ENABLE_EVOLUTION_MUTATIONS, engineMode: process.env.ENGINE_MODE }
 
 const homeUrl = () => process.env.DATABASE_URL as string
 
@@ -87,12 +93,19 @@ async function drainBackfill(): Promise<number> {
 
 beforeAll(async () => {
   if (process.env.NODE_ENV !== 'test') throw new Error('Refusing: NODE_ENV is not test')
+  // Schema changes are governed changes, which jest.setup.js switches off.
+  process.env.ENGINE_MODE = 'runtime'
   process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
 
   regionalUrl = urlFor(REGIONAL_DB)
   await atHome(`CREATE DATABASE "${REGIONAL_DB}"`)
   regionalDbCreated = true
   process.env[REGION_VARIABLE] = regionalUrl
+  // What the region's database procedure installs, as project-region.spec.ts
+  // sets it up: the table a region keeps its projects' bodies in, a governed
+  // change's catalogs among them.
+  await inRegion(`CREATE FUNCTION public.backenly_app_role() RETURNS text LANGUAGE sql AS $$ SELECT current_user::text $$`)
+  await inRegion(fs.readFileSync('scripts/sql/regional-bodies.sql', 'utf8'))
 
   ownerId = (await prisma.user.create({
     data: { email: `evo-rg-${randomBytes(6).toString('hex')}@example.test`, password: 'not-a-real-hash', name: 'evo region' },
@@ -126,11 +139,12 @@ beforeAll(async () => {
 }, 120_000)
 
 afterAll(async () => {
-  for (const [k, v] of [['ENABLE_EVOLUTION_MUTATIONS', saved.mutations]] as const) {
+  for (const [k, v] of [['ENABLE_EVOLUTION_MUTATIONS', saved.mutations], ['ENGINE_MODE', saved.engineMode]] as const) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v
   }
   if (projectId) {
+    await prisma.backendChange.deleteMany({ where: { projectId } }).catch(() => {})
     await prisma.maintenanceStepExecution.deleteMany({ where: { execution: { projectId } } }).catch(() => {})
     await prisma.maintenanceExecution.deleteMany({ where: { projectId } }).catch(() => {})
     await prisma.maintenanceApproval.deleteMany({ where: { projectId } }).catch(() => {})
@@ -141,6 +155,7 @@ afterAll(async () => {
     await prisma.project.deleteMany({ where: { id: projectId } }).catch(() => {})
   }
   if (ownerId) await prisma.user.delete({ where: { id: ownerId } }).catch(() => {})
+  await closeChangeLockPool()
   await closeMaintenanceLockPool()
   await closeAllWorkspacePools()
   await disconnectRegionalClients()
@@ -196,10 +211,37 @@ describe('a project kept in us-east-1', () => {
     expect(r).toMatchObject({ consistent: true, complete: true, present: 30, satelliteRows: 30 })
   })
 
-  it('is undone in the region', async () => {
+  it('records every schema change at home by its structure, with the definitions kept in the region', async () => {
+    const changes = await prisma.backendChange.findMany({
+      where: { projectId },
+      orderBy: { seq: 'asc' },
+      select: { id: true, title: true, status: true, source: true, statements: true, checkpoint: true },
+    })
+    expect(changes.map(c => c.status)).toEqual(['healthy', 'healthy', 'healthy', 'healthy'])
+    for (const c of changes) {
+      expect(c.source).toBe('approval')
+      // Names only in the title; no SQL kept at home; the definitions in the region.
+      expect(c.title).toMatch(/^Architecture change \(refund of orders\), step \d+: /)
+      expect(c.statements).toEqual([])
+      expect((c.checkpoint as { definitionsInRegion?: boolean }).definitionsInRegion).toBe(true)
+      expect(JSON.stringify(c.checkpoint)).not.toMatch(/refund_amount >= 0|backenly_jwt_claim\(/)
+    }
+    const kept = await inRegion<{ id: string }>(
+      `SELECT id FROM public.regional_bodies WHERE kind = 'change_catalog' AND "projectId" = $1 ORDER BY id`,
+      [projectId],
+    )
+    expect(kept.map(k => k.id).sort()).toEqual(changes.map(c => c.id).sort())
+  })
+
+  it('is undone in the region, as one governed change', async () => {
     const out = await rollbackExtraction({ projectId, planId, requestedBy: ownerId })
     expect(out.status).toBe('rolled_back')
     expect(await inRegion(`SELECT to_regclass($1) AS r`, [t('order_refunds')])).toEqual([{ r: null }])
     expect(await inRegion(`SELECT tgname FROM pg_trigger WHERE tgrelid = $1::regclass AND NOT tgisinternal`, [t('orders')])).toEqual([])
+    const undo = await prisma.backendChange.findFirst({
+      where: { projectId, title: { startsWith: 'Undo architecture change' } },
+      select: { status: true, source: true, actorUserId: true, statements: true },
+    })
+    expect(undo).toMatchObject({ status: 'healthy', source: 'dashboard', actorUserId: ownerId, statements: [] })
   })
 })

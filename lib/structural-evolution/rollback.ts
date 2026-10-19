@@ -40,6 +40,7 @@
  */
 
 import { prisma } from '@/lib/db'
+import { AUTOMATIC_REQUESTER } from '@/lib/evolution-engine/primitive'
 import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-flight'
 import { readTableFacts, type TableFacts } from './facts'
 import { latestRun, ledgerSteps, readLatestEvolutionApproval } from './consent'
@@ -193,42 +194,83 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     return false
   }
 
-  const okSoFar =
-    (await step(
-      'close_writes',
-      !!sat && (sat.triggers.some(t => t.name === n.reverse) || sat.policies.some(p => [n.policies.insert, n.policies.update, n.policies.delete].includes(p.name))),
-      closeWritesSql(spec, target, writers),
-      async () => {
-        const f = await satNow()
-        return !!f && !f.triggers.some(t => t.name === n.reverse) && !f.policies.some(p => [n.policies.insert, n.policies.update, n.policies.delete].includes(p.name))
-      },
-      `writes to ${spec.satellite} closed; ${writers.length} role grant(s) revoked`,
-    )) &&
-    (await recheck()) &&
-    (await step(
-      'revoke_reads',
-      !!sat && sat.policies.some(p => p.name === n.policies.select),
-      revokeReadsSql(spec, target, readers),
-      async () => {
-        const f = await satNow()
-        return !!f && !f.policies.some(p => p.name === n.policies.select)
-      },
-      `reads of ${spec.satellite} closed; ${readers.length} role grant(s) revoked`,
-    )) &&
-    // The last step is ONE transaction: the host stops mirroring and the
-    // satellite goes together, or neither does. Split in two, a failure in
-    // between left a satellite nothing kept current, which every later
-    // lossless check then refused to drop.
-    (await step(
-      'remove',
-      forwardLive || !!sat,
-      [...dropForwardSyncSql(spec, target), ...(sat ? dropSatelliteSql(spec, target) : [])],
-      async () => {
-        const h = await readTableFacts(at, spec.host)
-        return !!h && !onHost(h) && (await satNow()) === null
-      },
-      `${spec.host} no longer mirrors into ${spec.satellite}, and ${spec.satellite} is dropped; ${spec.host} is as it was before the extraction`,
-    ))
+  // The whole undo is ONE governed change (lib/changes/ledger.ts): under the
+  // project's change lock, between two catalog checkpoints, on its change
+  // history, its removals of the ladder's own objects declared as what it was
+  // asked to do. Never recovered automatically: an undo that stops part-way
+  // stays closed, exactly as the engine reports it, until undo is asked again.
+  const { withGovernedChange, withChangeAttribution, expectEffect } = await import('@/lib/changes/ledger')
+  const { ChangeInProgressError } = await import('@/lib/changes/lock')
+  const attribution =
+    input.requestedBy === AUTOMATIC_REQUESTER
+      ? { source: 'autonomy' as const, groupId: `evolution:${planId}` }
+      : { source: 'dashboard' as const, actorUserId: input.requestedBy, groupId: `evolution:${planId}` }
+  let governed: { result: boolean; change: { status: string; verification: { checks: Array<{ outcome: string; label: string; detail: string }> } | null } | null }
+  try {
+    governed = await withChangeAttribution(attribution, () =>
+      withGovernedChange(
+        { projectId, title: `Undo architecture change (${spec.label} of ${spec.host}): remove ${spec.satellite}`, kind: 'change', autoRecover: false },
+        async () => {
+          // What it was asked to do: drop the satellite, and remove Backenly's
+          // own read and lock policies from the host. (Nothing is declared for
+          // the satellite's access rules: once it is dropped they are not
+          // checked, and an undo that stops part-way is never verified.)
+          expectEffect(projectId, { action: 'DROP_TABLE', table: spec.satellite })
+          expectEffect(projectId, { action: 'REMOVE_PERMISSION', table: spec.host })
+          return (
+            (await step(
+              'close_writes',
+              !!sat && (sat.triggers.some(t => t.name === n.reverse) || sat.policies.some(p => [n.policies.insert, n.policies.update, n.policies.delete].includes(p.name))),
+              closeWritesSql(spec, target, writers),
+              async () => {
+                const f = await satNow()
+                return !!f && !f.triggers.some(t => t.name === n.reverse) && !f.policies.some(p => [n.policies.insert, n.policies.update, n.policies.delete].includes(p.name))
+              },
+              `writes to ${spec.satellite} closed; ${writers.length} role grant(s) revoked`,
+            )) &&
+            (await recheck()) &&
+            (await step(
+              'revoke_reads',
+              !!sat && sat.policies.some(p => p.name === n.policies.select),
+              revokeReadsSql(spec, target, readers),
+              async () => {
+                const f = await satNow()
+                return !!f && !f.policies.some(p => p.name === n.policies.select)
+              },
+              `reads of ${spec.satellite} closed; ${readers.length} role grant(s) revoked`,
+            )) &&
+            // The last step is ONE transaction: the host stops mirroring and the
+            // satellite goes together, or neither does. Split in two, a failure in
+            // between left a satellite nothing kept current, which every later
+            // lossless check then refused to drop.
+            (await step(
+              'remove',
+              forwardLive || !!sat,
+              [...dropForwardSyncSql(spec, target), ...(sat ? dropSatelliteSql(spec, target) : [])],
+              async () => {
+                const h = await readTableFacts(at, spec.host)
+                return !!h && !onHost(h) && (await satNow()) === null
+              },
+              `${spec.host} no longer mirrors into ${spec.satellite}, and ${spec.satellite} is dropped; ${spec.host} is as it was before the extraction`,
+            ))
+          )
+        },
+        ok => (ok ? { ok: true } : { ok: false, error: actions.find(a => a.outcome === 'failed')?.detail ?? 'a removal failed' }),
+      ),
+    )
+  } catch (err) {
+    // Another governed change holds the project's change lock: nothing here ran.
+    if (err instanceof ChangeInProgressError) return { status: 'in_flight_elsewhere', reason: err.message, actions }
+    throw err
+  }
+  const okSoFar = governed.result
+  // What the change history says of it, when that is not simply "healthy".
+  const recordedAs =
+    governed.change && !['healthy', 'unverified'].includes(governed.change.status)
+      ? ` The change history records it as ${governed.change.status.replace(/_/g, ' ')}` +
+        (governed.change.verification?.checks.filter(c => c.outcome === 'contradicted').map(c => `: ${c.label} (${c.detail})`).join('') ?? '') +
+        '.'
+      : ''
 
   if (!okSoFar) {
     await markLedger(projectId, planId, 'failed', actions)
@@ -239,7 +281,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   const reload = await reloadDataPlane(at)
   await withdraw(approval.id, input.requestedBy, actions)
   await markLedger(projectId, planId, 'verified', actions)
-  return { status: 'rolled_back', reason: reload, actions }
+  return { status: 'rolled_back', reason: `${reload}${recordedAs}`, actions }
 }
 
 /**

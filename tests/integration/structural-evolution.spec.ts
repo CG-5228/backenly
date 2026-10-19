@@ -33,6 +33,7 @@ import { jwtClaimFunctionSql } from '@/lib/postgrest/rls-translation'
 import { rlsSessionParams, rlsSessionSql } from '@/lib/services/rls-session'
 import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
 import { closeMaintenanceLockPool } from '@/lib/autonomy/maintenance/single-flight'
+import { closeChangeLockPool, withChangeLock } from '@/lib/changes/lock'
 import { analyzeStructuralEvolution } from '@/lib/structural-evolution'
 import { resolveExtractionPlan, isResolveRefusal } from '@/lib/structural-evolution/resolve'
 import { rehearseExtraction } from '@/lib/structural-evolution/rehearse'
@@ -64,6 +65,7 @@ let schema = ''
 let planId = ''
 let planVersion = ''
 const originalFlag = process.env.ENABLE_EVOLUTION_MUTATIONS
+const originalEngineMode = process.env.ENGINE_MODE
 
 const q = (sql: string, ...p: unknown[]) => prisma.$executeRawUnsafe(sql, ...p)
 const rows = <T = any>(sql: string, ...p: unknown[]) => prisma.$queryRawUnsafe<T[]>(sql, ...p)
@@ -131,6 +133,10 @@ const hostSnapshot = () =>
   )
 
 beforeAll(async () => {
+  // Every rung that changes the schema is a governed change (lib/changes/ledger.ts),
+  // which jest.setup.js switches off for every suite. On here, as the change
+  // ledger's own suites switch it on.
+  process.env.ENGINE_MODE = 'runtime'
   ownerId = (await prisma.user.create({
     data: { email: `evo-${randomBytes(6).toString('hex')}@example.test`, password: 'not-a-real-hash', name: 'evo' },
   })).id
@@ -240,6 +246,9 @@ beforeAll(async () => {
 afterAll(async () => {
   if (originalFlag === undefined) delete process.env.ENABLE_EVOLUTION_MUTATIONS
   else process.env.ENABLE_EVOLUTION_MUTATIONS = originalFlag
+  if (originalEngineMode === undefined) delete process.env.ENGINE_MODE
+  else process.env.ENGINE_MODE = originalEngineMode
+  await prisma.backendChange.deleteMany({ where: { projectId } }).catch(() => {})
   await q(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {})
   await q(`DROP OWNED BY "${ROLE}"`).catch(() => {})
   await q(`DROP ROLE IF EXISTS "${ROLE}"`).catch(() => {})
@@ -250,6 +259,7 @@ afterAll(async () => {
   await prisma.project.deleteMany({ where: { userId: ownerId } }).catch(() => {})
   await prisma.user.delete({ where: { id: ownerId } }).catch(() => {})
   await closeMaintenanceLockPool()
+  await closeChangeLockPool()
 }, 60_000)
 
 // ── Detect ───────────────────────────────────────────────────────────────────
@@ -399,16 +409,43 @@ describe('the governed executor', () => {
     }
   })
 
-  it('resumes after the backfill and finishes everything software may do', async () => {
+  it('waits for another governed change, and does not count a busy project as a failed step', async () => {
     expect(await drainBackfill()).toBeGreaterThanOrEqual(1)
+    // Another change holds the project's change lock for as long as the rung
+    // is willing to wait for it.
+    let release!: () => void
+    const gate = new Promise<void>(r => (release = r))
+    const holding = withChangeLock(projectId, () => gate)
+    try {
+      const out = await executeExtraction({ projectId, planId })
+      expect(out.status).toBe('in_flight_elsewhere')
+      expect(out.haltReason).toMatch(/Another schema change is being applied/)
+      expect(out.steps.map(s => [s.kind, s.status])).toEqual([
+        ['rehearse', 'skipped'],
+        ['create_satellite', 'skipped'],
+        ['sync_forward', 'skipped'],
+        ['backfill', 'completed'],
+        ['verify', 'completed'],
+      ])
+    } finally {
+      release()
+      await holding
+    }
+    const sat = (await readTableFacts(workspaceOn(prisma, schema), 'order_refunds'))!
+    expect(sat.grants.filter(g => g.grantee !== sat.owner)).toEqual([])
+    const reads = await prisma.maintenanceStepExecution.findFirst({ where: { execution: { projectId }, stepKind: 'expose_reads' } })
+    expect(reads?.status).toBe('pending')
+  }, 120_000)
+
+  it('resumes after the backfill and finishes everything software may do', async () => {
     const out = await executeExtraction({ projectId, planId })
     expect(out.status).toBe('completed')
     expect(out.steps.map(s => [s.kind, s.status])).toEqual([
       ['rehearse', 'skipped'],
       ['create_satellite', 'skipped'],
       ['sync_forward', 'skipped'],
-      ['backfill', 'completed'],
-      ['verify', 'completed'],
+      ['backfill', 'skipped'],
+      ['verify', 'skipped'],
       ['expose_reads', 'completed'],
       ['open_writes', 'completed'],
       ['verify', 'completed'],
@@ -419,6 +456,24 @@ describe('the governed executor', () => {
     expect(mine).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE'])
     const r = await reconcileExtraction(projectId, (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!, SPEC)
     expect(r).toMatchObject({ consistent: true, present: 60, satelliteRows: 60 })
+  })
+
+  it('recorded each schema change as a governed change, made on the consent of the person who approved it', async () => {
+    const changes = await prisma.backendChange.findMany({
+      where: { projectId },
+      orderBy: { seq: 'asc' },
+      select: { title: true, status: true, source: true, actorUserId: true, groupId: true, kind: true },
+    })
+    // The backfill and both verifications change no schema, so they are not changes.
+    expect(changes.map(c => [c.title.replace(/^.*, step \d+: /, ''), c.status])).toEqual([
+      ['Create order_refunds', 'healthy'],
+      ['Mirror every write to orders into order_refunds', 'healthy'],
+      ['Let clients read order_refunds', 'healthy'],
+      ['Let clients write refund data through order_refunds', 'healthy'],
+    ])
+    for (const c of changes) {
+      expect(c).toMatchObject({ kind: 'change', source: 'approval', actorUserId: ownerId, groupId: `evolution:${planId}` })
+    }
   })
 })
 
@@ -584,6 +639,16 @@ describe('rollback', () => {
 
     const report = await analyzeStructuralEvolution(projectId)
     expect(report.proposals.find(p => p.planId === planId)!.state).toBe('rolled_back')
+
+    // Each undo is one governed change, on the person's own decision; the one
+    // that stopped part-way is on the history as exactly that.
+    const undos = await prisma.backendChange.findMany({
+      where: { projectId, title: { startsWith: 'Undo architecture change' } },
+      orderBy: { seq: 'asc' },
+      select: { status: true, source: true, actorUserId: true, groupId: true },
+    })
+    expect(undos.map(u => u.status)).toEqual(['partially_applied', 'healthy'])
+    for (const u of undos) expect(u).toMatchObject({ source: 'dashboard', actorUserId: ownerId, groupId: `evolution:${planId}` })
   })
 
   it('has nothing left to undo the second time', async () => {

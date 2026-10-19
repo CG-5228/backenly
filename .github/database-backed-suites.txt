@@ -1159,7 +1159,7 @@ tests/integration/structural-evolution-semantics.spec.ts
 # An extraction of a project kept in another region happens in that region: a
 # second database stands in for us-east-1, holds the project's tables alone, and
 # analysis, rehearsal, every rung, the backfill, reconciliation and undo run
-# there, and nothing is ever found at home.
+# there; each schema change's record at home keeps structure and digests only.
 tests/integration/structural-evolution-regional.spec.ts
 
 # Whether a user's coding agent is connected: an MCP key or OAuth connection

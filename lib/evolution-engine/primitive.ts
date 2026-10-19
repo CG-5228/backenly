@@ -55,6 +55,9 @@ import type { EvolutionLevel, PriorOutcome } from './levels'
 /** Which lifecycle stage a rung belongs to. */
 export type RungStage = 'rehearsal' | 'expand' | 'backfill' | 'verify' | 'cutover' | 'contract'
 
+/** Who asks for an undo the engine's own regression policy started, rather than a person. */
+export const AUTOMATIC_REQUESTER = 'evolution-engine'
+
 export interface EngineRung {
   ordinal: number
   kind: string
@@ -305,7 +308,10 @@ export interface EvolutionPrimitive<Spec = unknown, Plan extends EnginePlan<Spec
    * only a measurement of one of those may count as a benefit.
    */
   measure(projectId: string, plan: Plan, snapshots: TelemetrySnapshot[], context: { firedBy: string[]; now: Date }): Promise<Measurement[]>
-  /** Undo. Refuses rather than lose a write; see the primitive's own rollback contract. */
+  /**
+   * Undo. Refuses rather than lose a write; see the primitive's own rollback
+   * contract. `requestedBy` is the person who asked, or AUTOMATIC_REQUESTER.
+   */
   rollback(projectId: string, planId: string, requestedBy: string): Promise<RollbackResult>
   describe(plan: Plan, opportunity?: Opportunity<Spec>): UserFacingSummary
 }

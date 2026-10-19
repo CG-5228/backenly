@@ -127,6 +127,13 @@ async function runLadder(input: {
   const steps: ExtractionStepOutcome[] = []
   // The project's tables, where they live (./workspace.ts).
   const at = await workspaceAt(projectId)
+  // Every rung's schema change is a governed change (lib/changes/ledger.ts),
+  // recorded as the person whose consent is bound to this exact plan version,
+  // and grouped with the rest of this extraction's changes.
+  const { withChangeAttribution } = await import('@/lib/changes/attribution')
+  const { ChangeInProgressError } = await import('@/lib/changes/lock')
+  const asApproved = <T>(fn: () => Promise<T>) =>
+    withChangeAttribution({ source: 'approval', actorUserId: approval.approvedBy, groupId: `evolution:${planId}` }, fn)
 
   for (const step of plan.steps) {
     if (step.capability === 'human_only') {
@@ -231,8 +238,18 @@ async function runLadder(input: {
 
     let outcome
     try {
-      outcome = await runStep(projectId, plan, step)
+      outcome = await asApproved(() => runStep(projectId, plan, step))
     } catch (err) {
+      if (err instanceof ChangeInProgressError) {
+        // Another governed change holds the project's change lock, so this rung
+        // did not start. Not a failure of the rung: it runs after that change.
+        await prisma.maintenanceStepExecution.update({ where: { id: row.id }, data: { status: 'pending', startedAt: null } })
+        await prisma.maintenanceExecution.update({
+          where: { id: executionId },
+          data: { status: 'halted', haltReason: err.message, completedAt: new Date() },
+        })
+        return { status: 'in_flight_elsewhere', executionId, planVersion: plan.planVersion, haltReason: err.message, stoppedBecause: null, steps }
+      }
       const message = err instanceof Error ? err.message : String(err)
       await prisma.maintenanceStepExecution.update({
         where: { id: row.id },

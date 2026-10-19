@@ -37,6 +37,7 @@ import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
 import { inFlightChain } from './backfill-job'
 import type { ExtractionPlan, ExtractionStep } from './plan'
+import type { Expectation } from '@/lib/changes/verify'
 
 export const LOCK_TIMEOUT_MS = 3_000
 export const STATEMENT_TIMEOUT_MS = 60_000
@@ -51,23 +52,77 @@ export interface StepRunResult {
   observed?: Record<string, unknown>
 }
 
-/** One transaction on the project's own database. */
-export async function runStatements(at: WorkspaceAt, statements: string[]): Promise<void> {
-  const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
-  await at.db.$transaction(
-    async tx => {
-      await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`)
-      await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms'`)
-      await tx.$executeRawUnsafe(
-        rlsSessionSql(1),
-        ...rlsSessionParams({ userId: '', isServiceRole: true, userRole: 'service' }),
-      )
-      for (const s of statements) await tx.$executeRawUnsafe(s)
-    },
-    { timeout: STATEMENT_TIMEOUT_MS + 10_000, maxWait: 10_000 },
-  )
+/** What the change ledger records a rung as (lib/changes/ledger.ts). */
+export interface RungChange {
+  /** Names only, so the record may keep it for a project in any region. */
+  title: string
+  /** What the statements were asked to do, for protected verification (lib/changes/verify.ts). */
+  expectations?: Expectation[]
 }
 
+/** A governed change's ending in which what the rung did stands. */
+const STANDS = new Set(['healthy', 'unverified'])
+
+/**
+ * Refused by the change ledger after it ran: protected verification did not
+ * confirm it, or it failed part-way. Nothing recovers it automatically: the
+ * extraction's own undo, bound to a person's decision and refused unless
+ * lossless, is the one thing that removes what a ladder built.
+ */
+export class GovernedChangeRefused extends Error {
+  constructor(readonly status: string, readonly failing: string[]) {
+    super(`the change ledger recorded this step as ${status.replace(/_/g, ' ')}${failing.length ? `: ${failing.join('; ')}` : ''}`)
+    this.name = 'GovernedChangeRefused'
+  }
+}
+
+/**
+ * One transaction on the project's own database, as one governed change to
+ * its production backend (lib/changes/ledger.ts): under the project's change
+ * lock, between two catalog checkpoints, verified by the control plane, and
+ * on the project's change history. Statements of a change already open for
+ * the project (an undo's steps) join it.
+ */
+export async function runStatements(at: WorkspaceAt, statements: string[], change?: RungChange): Promise<void> {
+  const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
+  const run = () =>
+    at.db.$transaction(
+      async tx => {
+        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`)
+        await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms'`)
+        await tx.$executeRawUnsafe(
+          rlsSessionSql(1),
+          ...rlsSessionParams({ userId: '', isServiceRole: true, userRole: 'service' }),
+        )
+        for (const s of statements) await tx.$executeRawUnsafe(s)
+      },
+      { timeout: STATEMENT_TIMEOUT_MS + 10_000, maxWait: 10_000 },
+    )
+  if (!change) {
+    await run()
+    return
+  }
+  const { withGovernedChange, expectEffect } = await import('@/lib/changes/ledger')
+  const { change: closed } = await withGovernedChange(
+    { projectId: at.projectId, title: change.title.slice(0, 300), kind: 'change', autoRecover: false },
+    async () => {
+      for (const e of change.expectations ?? []) expectEffect(at.projectId, e)
+      await run()
+    },
+  )
+  if (closed && !STANDS.has(closed.status)) {
+    const failing = (closed.verification?.checks ?? []).filter(c => c.outcome === 'contradicted').map(c => `${c.label}: ${c.detail}`)
+    throw new GovernedChangeRefused(closed.status, failing)
+  }
+}
+
+/** How the change ledger names a rung: the plan's own step title, and the change it belongs to. */
+export function rungChange(plan: ExtractionPlan, step: ExtractionStep): RungChange {
+  return {
+    title: `Architecture change (${plan.spec.label} of ${plan.spec.host}), step ${step.ordinal}: ${step.title}`,
+    expectations: step.kind === 'create_satellite' ? [{ action: 'CREATE_TABLE', table: plan.spec.satellite }] : [],
+  }
+}
 
 /**
  * Why the satellite's policies could admit a row its parent would not, or null.
@@ -190,7 +245,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       if (await relationExists(at, spec.satellite)) {
         return { status: 'failed', detail: `${spec.satellite} already exists; nothing was created` }
       }
-      await runStatements(at, step.sql)
+      await runStatements(at, step.sql, rungChange(plan, step))
       const sat = await readTableFacts(at, spec.satellite)
       if (!sat || !isOurSatellite(sat, spec)) {
         return { status: 'failed', detail: `the statements committed but ${spec.satellite} is not in the catalog as expected` }
@@ -218,7 +273,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
     case 'sync_forward': {
       const sat = await readTableFacts(at, spec.satellite)
       if (!isOurSatellite(sat, spec)) return { status: 'failed', detail: `${spec.satellite} is not this ladder's table` }
-      await runStatements(at, step.sql)
+      await runStatements(at, step.sql, rungChange(plan, step))
       const after = await readTableFacts(at, spec.host)
       const trig = after?.triggers.find(t => t.name === n.forward)
       const expected = hostLadderObjects(spec)
@@ -282,7 +337,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       // Granting reads would also open whatever policy someone else put here.
       const foreign = widerThanParent(sat!, spec)
       if (foreign) return { status: 'failed', detail: `not opened: ${foreign}` }
-      await runStatements(at, step.sql)
+      await runStatements(at, step.sql, rungChange(plan, step))
       const after = (await readTableFacts(at, spec.satellite))!
       const missing = plan.access.readers.filter(
         r => !after.grants.some(g => g.grantee === r && g.privilege === 'SELECT'),
@@ -315,7 +370,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       if (!isOurSatellite(sat, spec)) return { status: 'failed', detail: `${spec.satellite} is not this ladder's table` }
       const foreign = widerThanParent(sat!, spec)
       if (foreign) return { status: 'failed', detail: `not opened: ${foreign}` }
-      await runStatements(at, step.sql)
+      await runStatements(at, step.sql, rungChange(plan, step))
       const after = (await readTableFacts(at, spec.satellite))!
       const wider = widerThanParent(after, spec)
       if (wider) return { status: 'failed', detail: `write access is not as planned: ${wider}` }
