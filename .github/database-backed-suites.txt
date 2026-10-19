@@ -1294,3 +1294,10 @@ tests/integration/sdk-data-routes.spec.ts
 # route-module function on its own login. What PostgreSQL refuses is the
 # property, so it needs a real Postgres.
 tests/integration/workspace-sql-cached-plan.spec.ts
+
+# A home project's governed change records the statements it ran. Its
+# workspace SQL runs on the home workspace client, not the platform client, so
+# the SQL recorder has to be on that client too: a change runs its DDL through
+# executeWithUserContext, and its record must carry that statement. The change
+# ledger, its lock and its record are the property, so it needs a real Postgres.
+tests/integration/home-workspace-sql-recorded.spec.ts
