@@ -11,6 +11,9 @@
  *     wired and enforcing security.
  *   - CREATE verification: POST a synthesised sample row, accept 201/401/403,
  *     fail on 400/500. 400 means schema mismatch — flagged for the brain.
+ *   - GET verification: list one row, then GET it by id, accept 200/401/403,
+ *     fail on 404/500. With no row to fetch the route was not exercised,
+ *     which is a fail, never a pass.
  *
  * Auth: the project's ANON key. It is public by design (Project.anonKey), so
  * using it here does not require any secret credential to be recoverable from
@@ -49,8 +52,10 @@ export interface EndpointTestResult {
   statusCode: number | null
   /** Brief excerpt of the response body for the model to reason over. */
   bodyExcerpt: string
+  /** For a list that answered with a row: that row's id, which get then fetches. */
+  firstRowId?: string
   /** When ok=false, why. */
-  failureKind?: 'not_found' | 'server_error' | 'bad_request' | 'no_endpoint' | 'no_app_url' | 'no_table' | 'fetch_failed' | 'unauthenticated' | 'timeout'
+  failureKind?: 'not_found' | 'server_error' | 'bad_request' | 'no_endpoint' | 'no_app_url' | 'no_table' | 'fetch_failed' | 'unauthenticated' | 'no_rows' | 'timeout'
 }
 
 const APP_URL_ENV = ['NEXT_PUBLIC_APP_URL', 'APP_URL'] as const
@@ -166,6 +171,35 @@ function sampleValueFor(type: string, name: string): unknown {
  * and behaving — including auth-required responses, which prove it's wired.
  */
 export async function runEndpointTest(input: EndpointTestInput): Promise<EndpointTestResult> {
+  if (input.operation !== 'get') return requestEndpoint(input)
+
+  // get is the get-by-id route, so it needs the id of a row that exists: list
+  // one row, then fetch that row. A list that fails is reported as that
+  // failure. A list that answers without a row to fetch leaves the route
+  // unexercised, and an unexercised route is not a pass.
+  const listed = await requestEndpoint({ ...input, operation: 'list' })
+  if (!listed.ok) return listed
+  if (listed.firstRowId === undefined) {
+    return {
+      ok: false,
+      summary:
+        `${listed.summary} The list gave no row to fetch by id, so the get route was not exercised ` +
+        'and nothing about it was verified.',
+      endpoint: listed.endpoint,
+      method: listed.method,
+      statusCode: listed.statusCode,
+      bodyExcerpt: listed.bodyExcerpt,
+      failureKind: 'no_rows',
+    }
+  }
+  return requestEndpoint(input, listed.firstRowId)
+}
+
+/**
+ * One request to the table's endpoint, judged by its status. Given a rowId it
+ * fetches that row; any other read lists a single row.
+ */
+async function requestEndpoint(input: EndpointTestInput, rowId?: string): Promise<EndpointTestResult> {
   const { projectId, tableName, operation } = input
 
   const appUrl = resolveAppUrl()
@@ -181,7 +215,9 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
     }
   }
 
-  const path = `/api/v1/${projectId}/db/${encodeURIComponent(tableName)}`
+  const path =
+    `/api/v1/${projectId}/db/${encodeURIComponent(tableName)}` +
+    (rowId === undefined ? '' : `/${encodeURIComponent(rowId)}`)
 
   // Build payload for create. If columns can't be introspected, DON'T report
   // failure — that is a false negative that makes the agent thrash
@@ -200,7 +236,10 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
     }
   }
   const method = effectiveOp === 'create' ? 'POST' : 'GET'
-  const url = `${appUrl}${path}${effectiveOp === 'list' ? '?limit=1' : ''}`
+  // A GET that names no row is a list, and a list asks for one row: that is
+  // all a test needs, and the whole body is read into memory below.
+  const listing = method === 'GET' && rowId === undefined
+  const url = `${appUrl}${path}${listing ? '?limit=1' : ''}`
 
   // Headers
   const headers: Record<string, string> = { 'content-type': 'application/json' }
@@ -259,6 +298,7 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
       method,
       statusCode: status,
       bodyExcerpt: excerpt,
+      ...(listing ? { firstRowId: firstRowIdOf(text) } : {}),
     }
   }
   // 401 / 403
@@ -291,11 +331,16 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
       bodyExcerpt: excerpt,
     }
   }
-  // 404 → not routed
+  // 404 → not routed. Not for a row the list just returned, though: the list
+  // answering proves the table is routed, and blaming generate_api would send
+  // the agent to regenerate an API that works.
   if (status === 404) {
     return {
       ok: false,
-      summary: `${method} ${path} → 404. The endpoint is not routed — generate_api may not have run, or the table name is wrong.`,
+      summary:
+        rowId === undefined
+          ? `${method} ${path} → 404. The endpoint is not routed — generate_api may not have run, or the table name is wrong.`
+          : `${method} ${path} → 404 for a row the list had just returned: the table is routed, but fetching a row by its id does not work. Body: ${excerpt.slice(0, 120)}`,
       endpoint: path,
       method,
       statusCode: status,
@@ -377,4 +422,20 @@ function looksLikeRlsDenied(body: string): boolean {
     /permission denied/i.test(lower) ||
     /insufficient[_\s]?privilege/i.test(lower)
   )
+}
+
+/**
+ * The id of the first row in a list body (`{ data: [row, …] }`), as the path
+ * segment the get-by-id route takes, or undefined when there is none to use.
+ * An empty id is none: it would turn the get path back into the bare table
+ * path, which is a list with no limit.
+ */
+function firstRowIdOf(body: string): string | undefined {
+  try {
+    const id = JSON.parse(body)?.data?.[0]?.id
+    if (typeof id === 'number' && Number.isFinite(id)) return String(id)
+    return typeof id === 'string' && id !== '' ? id : undefined
+  } catch {
+    return undefined
+  }
 }
