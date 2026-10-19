@@ -11,6 +11,10 @@
  *   analysis, the plan, the rehearsal, every rung, the backfill, reconciliation
  *   and undo                 read and write the regional database; the home
  *                            database never holds the project's schema
+ *   the backfill             regional jobs, run by the region's own worker
+ *                            (processRegionalJobs), never by the home queue;
+ *                            each batch's starting key is kept in the region,
+ *                            and no row at home quotes one
  *   every schema change      a governed change (lib/changes/ledger.ts) whose
  *                            record at home keeps the catalog's structure and
  *                            digests, never its definitions or the SQL that
@@ -31,7 +35,8 @@ import { analyzeStructuralEvolution } from '@/lib/structural-evolution'
 import { resolveExtractionPlan, isResolveRefusal } from '@/lib/structural-evolution/resolve'
 import { grantEvolutionApproval, isGrantRefusal } from '@/lib/structural-evolution/consent'
 import { executeExtraction } from '@/lib/structural-evolution/execute'
-import { handleEvolutionBackfillJob } from '@/lib/structural-evolution/backfill-job'
+import { processRegionalJobs } from '@/lib/queue/worker'
+import { queueEvolutionBackfill } from '@/lib/structural-evolution/backfill-job'
 import { reconcileExtraction } from '@/lib/structural-evolution/reconcile'
 import { rollbackExtraction } from '@/lib/structural-evolution/rollback'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
@@ -75,18 +80,13 @@ const inRegion = <T = any>(sql: string, params: unknown[] = []) => on<T>(regiona
 const atHome = <T = any>(sql: string, params: unknown[] = []) => on<T>(homeUrl(), sql, params)
 const t = (name: string) => `"${schema}"."${name}"`
 
-/** The project's backfill batches, run where the job queue would run them. */
-async function drainBackfill(): Promise<number> {
+/** The region's own worker, as its scheduler runs it every minute, until the chain ends. */
+async function drainInRegion(): Promise<number> {
   let ran = 0
-  for (let i = 0; i < 50; i++) {
-    const job = await prisma.backgroundJob.findFirst({
-      where: { projectId, type: 'evolution_backfill', status: { in: ['queued', 'regional_pending'] } },
-      orderBy: { createdAt: 'asc' },
-    })
-    if (!job) break
-    const result = await handleEvolutionBackfillJob(job.payload as any)
-    await prisma.backgroundJob.update({ where: { id: job.id }, data: { status: 'completed', result: result as object, completedAt: new Date() } })
-    ran++
+  for (let i = 0; i < 20; i++) {
+    const { processed } = await processRegionalJobs('us-east-1')
+    if (processed === 0) break
+    ran += processed
   }
   return ran
 }
@@ -127,7 +127,7 @@ beforeAll(async () => {
   )`)
   await inRegion(
     `INSERT INTO ${t('orders')} (user_id, total, refund_amount, refund_reason)
-     SELECT $1::uuid, i, CASE WHEN i % 4 = 0 THEN i END, CASE WHEN i % 4 = 0 THEN 'late' END FROM generate_series(1, 120) i`,
+     SELECT $1::uuid, i, CASE WHEN i % 4 = 0 THEN i END, CASE WHEN i % 4 = 0 THEN 'late' END FROM generate_series(1, 2400) i`,
     [USER_A],
   )
   await inRegion(`ALTER TABLE ${t('orders')} ENABLE ROW LEVEL SECURITY`)
@@ -196,19 +196,59 @@ describe('a project kept in us-east-1', () => {
       ['sync_forward', 'completed'],
       ['backfill', 'dispatched'],
     ])
-    expect(await drainBackfill()).toBeGreaterThanOrEqual(1)
+    // Asked of the region, never of the home queue's generic workers.
+    const queued = await prisma.backgroundJob.findMany({ where: { projectId, type: 'evolution_backfill' } })
+    expect(queued.map(j => [j.status, (j.payload as any).region])).toEqual([['regional_pending', 'us-east-1']])
+    expect(await drainInRegion()).toBe(3)
     const done = await executeExtraction({ projectId, planId })
     expect(done.status).toBe('completed')
 
     const [{ n }] = await inRegion<{ n: string }>(`SELECT count(*)::text AS n FROM ${t('order_refunds')}`)
-    expect(n).toBe('30')
+    expect(n).toBe('600')
     const fwd = await inRegion(`SELECT tgname FROM pg_trigger WHERE tgrelid = $1::regclass AND tgname = $2`, [t('orders'), ladderNames(SPEC).forward])
     expect(fwd).toHaveLength(1)
     expect(await atHome(`SELECT to_regnamespace($1) AS ns`, [schema])).toEqual([{ ns: null }])
 
     const at = await workspaceAt(projectId)
     const r = await reconcileExtraction(projectId, (await readTableFacts(at, 'orders'))!, SPEC)
-    expect(r).toMatchObject({ consistent: true, complete: true, present: 30, satelliteRows: 30 })
+    expect(r).toMatchObject({ consistent: true, complete: true, present: 600, satelliteRows: 600 })
+  })
+
+  it("kept every batch's starting key in the region, and quoted none at home", async () => {
+    const jobs = await prisma.backgroundJob.findMany({ where: { projectId, type: 'evolution_backfill' }, orderBy: { createdAt: 'asc' } })
+    expect(jobs.map(j => j.status)).toEqual(['completed', 'completed', 'completed'])
+    for (const j of jobs) {
+      expect((j.payload as any).cursor).toBeNull()
+      expect((j.result as any).cursor).toBeNull()
+    }
+    // The second and third batches start where the one before stopped: kept there.
+    const keys = jobs.map(j => (j.payload as any).cursorKey).filter(Boolean)
+    expect(keys).toHaveLength(2)
+    const kept = await inRegion<{ id: string; cursor: string }>(
+      `SELECT id, payload->>'cursor' AS cursor FROM public.regional_bodies WHERE kind = 'backfill_cursor' AND "projectId" = $1`,
+      [projectId],
+    )
+    expect(kept.map(k => k.id).sort()).toEqual([...keys].sort())
+    // Whatever those keys are, no row at home carries one.
+    const home = JSON.stringify(await prisma.backgroundJob.findMany({ where: { projectId } })) +
+      JSON.stringify(await prisma.maintenanceStepExecution.findMany({ where: { execution: { projectId } } }))
+    for (const k of kept) expect(home).not.toContain(k.cursor)
+  })
+
+  it('re-queues a batch stopped by a withdrawn consent exactly where it stopped, in the region', async () => {
+    // A paused chain's last payload names its cursor in the region; resuming
+    // queues that payload again (execute.ts) and must not lose the key.
+    await inRegion(
+      `INSERT INTO public.regional_bodies (kind, id, "projectId", payload) VALUES ('backfill_cursor', 'resume-probe', $1, '{"cursor": "k"}')`,
+      [projectId],
+    )
+    const job = await queueEvolutionBackfill({
+      projectId, planId, planVersion: 'v-probe', basisFingerprint: 'x', spec: SPEC, cursor: null, cursorKey: 'resume-probe',
+    })
+    const row = await prisma.backgroundJob.findUnique({ where: { id: job.id } })
+    expect(row).toMatchObject({ status: 'regional_pending' })
+    expect(row!.payload).toMatchObject({ region: 'us-east-1', cursor: null, cursorKey: 'resume-probe' })
+    await prisma.backgroundJob.delete({ where: { id: job.id } })
   })
 
   it('records every schema change at home by its structure, with the definitions kept in the region', async () => {

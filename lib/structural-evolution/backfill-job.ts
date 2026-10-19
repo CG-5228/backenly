@@ -28,10 +28,25 @@
  * a few times, briefly, and then thrown to BackgroundJob's backoff. Waiting
  * instead would queue every later writer of that row behind the backfill, and
  * would make the backfill one side of a possible deadlock.
+ *
+ * ── Where it runs, and where its cursor is kept ─────────────────────────────
+ *
+ * As the maintenance backfill does (lib/autonomy/maintenance/primitives/
+ * backfill-job.ts): a home project's batches go to the home queue; a regional
+ * project's are regional jobs (lib/queue REGIONAL_JOB_TYPES), run by its own
+ * region's scheduler, where its tables are. The cursor is the last primary key
+ * a batch scanned, which for a natural key is a customer's own value, so for a
+ * regional project it is kept in the region (lib/data-plane/regional-bodies.ts,
+ * kind backfill_cursor), written before the job that reads it, and the
+ * platform row carries only the key it is kept under. A result never shows it.
  */
 
 import { prisma } from '@/lib/db'
-import { enqueue } from '@/lib/queue'
+import { randomUUID } from 'node:crypto'
+import { enqueue, enqueueRegionalJob, REGIONAL_STATUS } from '@/lib/queue'
+import { projectRegion } from '@/lib/data-plane/regional'
+import { regionalBodiesFor } from '@/lib/data-plane/regional-bodies'
+import { HOME_REGION } from '@/lib/regions'
 import { backgroundJobState } from '@/lib/autonomy/maintenance/execute'
 import { basisFingerprint, readTableFacts } from './facts'
 import { backfillBatchSql, ladderAccessSql, type ExtractionSpec } from './sql'
@@ -61,7 +76,10 @@ export interface EvolutionBackfillPayload {
   planVersion: string
   basisFingerprint: string
   spec: ExtractionSpec
+  /** The previous batch's last key; always null on a regional project's job. */
   cursor: string | null
+  /** Where a regional project's job finds its starting cursor in the region. */
+  cursorKey?: string | null
   batches?: number
   scannedTotal?: number
   updatedTotal?: number
@@ -72,8 +90,38 @@ export interface EvolutionBackfillResult {
   batches: number
   scanned: number
   updated: number
+  /** The last key scanned. Null for a regional project, whose cursor stays in its region. */
   cursor: string | null
   refusal?: string
+}
+
+/** The sentence a batch stops with when its region no longer keeps where it starts. */
+export const CURSOR_NOT_KEPT =
+  'Where this copy stopped is no longer kept in its region; resuming the change starts the copy again from the beginning, which is safe.'
+
+/** Queue a batch where its project's tables are: the home queue, or the project's own region. */
+export async function queueEvolutionBackfill(payload: EvolutionBackfillPayload): Promise<{ id: string }> {
+  const region = await projectRegion(payload.projectId)
+  if (region === HOME_REGION) {
+    return enqueue('evolution_backfill', payload as unknown as Record<string, unknown>, { projectId: payload.projectId })
+  }
+  // A batch resumed as it stopped already names its cursor in the region.
+  let cursorKey = payload.cursorKey ?? null
+  if (payload.cursor !== null) {
+    // Written before the job that reads it, like every regional body.
+    cursorKey = randomUUID()
+    const bodies = await regionalBodiesFor(payload.projectId)
+    await bodies.set('backfill_cursor', cursorKey, { payload: { cursor: payload.cursor } })
+  }
+  const kept: EvolutionBackfillPayload = { ...payload, cursor: null, cursorKey }
+  return enqueueRegionalJob('evolution_backfill', payload.projectId, region, kept as unknown as Record<string, unknown>)
+}
+
+async function startingCursor(payload: EvolutionBackfillPayload): Promise<{ cursor: string | null } | { refusal: string }> {
+  if (!payload.cursorKey) return { cursor: payload.cursor }
+  const bodies = await regionalBodiesFor(payload.projectId)
+  const kept = (await bodies.get('backfill_cursor', payload.cursorKey))?.payload as { cursor?: unknown } | undefined
+  return typeof kept?.cursor === 'string' ? { cursor: kept.cursor } : { refusal: CURSOR_NOT_KEPT }
 }
 
 class IncompleteView extends Error {
@@ -107,6 +155,12 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
     return stop(`${PAUSED_REFUSAL} consent for this change was withdrawn; the backfill stopped at its cursor and resumes from it`)
   }
 
+  const start = await startingCursor(payload)
+  if ('refusal' in start) return stop(start.refusal)
+  // What a result may show of a cursor: nothing, for a project kept elsewhere.
+  const regional = (await projectRegion(payload.projectId)) !== HOME_REGION
+  const shown = (c: string | null) => (regional ? null : c)
+
   const sql = backfillBatchSql(host, payload.spec, { schema }, BACKFILL_BATCH_ROWS)
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
   type BatchRow = { scanned: bigint; upserted: bigint; removed: bigint; next_cursor: string | null }
@@ -125,7 +179,7 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
       // Same transaction, same connection: SET LOCAL bounds the batch below it.
       // NOWAIT covers the host rows; this bounds the satellite side.
       await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`)
-      return tx.$queryRawUnsafe<BatchRow[]>(sql, payload.cursor)
+      return tx.$queryRawUnsafe<BatchRow[]>(sql, start.cursor)
     })
   let rows: BatchRow[] = []
   for (let attempt = 0; ; attempt++) {
@@ -147,14 +201,13 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
   const scannedNow = Number(r?.scanned ?? 0)
   const scanned = (payload.scannedTotal ?? 0) + scannedNow
   const updated = (payload.updatedTotal ?? 0) + Number(r?.upserted ?? 0) + Number(r?.removed ?? 0)
-  const cursor = r?.next_cursor ?? payload.cursor
+  const cursor = r?.next_cursor ?? start.cursor
   const done = scannedNow < BACKFILL_BATCH_ROWS
 
   if (!done) {
-    const next: EvolutionBackfillPayload = { ...payload, cursor, batches, scannedTotal: scanned, updatedTotal: updated }
-    await enqueue('evolution_backfill', next as unknown as Record<string, unknown>, { projectId: payload.projectId })
+    await queueEvolutionBackfill({ ...payload, cursor, cursorKey: null, batches, scannedTotal: scanned, updatedTotal: updated })
   }
-  return { done, batches, scanned, updated, cursor }
+  return { done, batches, scanned, updated, cursor: shown(cursor) }
 }
 
 export interface ChainState {
@@ -200,7 +253,7 @@ export async function inFlightChain(projectId: string, planVersion: string): Pro
       where: {
         projectId,
         type: 'evolution_backfill',
-        status: { in: ['queued', 'running'] },
+        status: { in: ['queued', 'running', REGIONAL_STATUS.pending, REGIONAL_STATUS.running] },
         payload: { path: ['planVersion'], equals: planVersion },
       },
       orderBy: { createdAt: 'desc' },

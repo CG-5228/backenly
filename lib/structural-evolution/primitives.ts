@@ -28,14 +28,13 @@
  */
 
 import { prisma } from '@/lib/db'
-import { enqueue } from '@/lib/queue'
 import { createHash } from 'node:crypto'
 import { readTableFacts, relationExists, type TableFacts } from './facts'
 import { workspaceAt, type WorkspaceAt } from './workspace'
 import { fq, hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
 import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
-import { inFlightChain } from './backfill-job'
+import { inFlightChain, queueEvolutionBackfill } from './backfill-job'
 import type { ExtractionPlan, ExtractionStep } from './plan'
 import type { Expectation } from '@/lib/changes/verify'
 
@@ -309,18 +308,15 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
       if (running) {
         return { status: 'dispatched', detail: `backfill already running as job ${running}`, backgroundJobId: running }
       }
-      const job = await enqueue(
-        'evolution_backfill',
-        {
-          projectId,
-          planId: plan.planId,
-          planVersion: plan.planVersion,
-          basisFingerprint: plan.basisFingerprint,
-          spec,
-          cursor: null,
-        },
-        { projectId },
-      )
+      // Where the project's tables are: its region's own queue for a regional project.
+      const job = await queueEvolutionBackfill({
+        projectId,
+        planId: plan.planId,
+        planVersion: plan.planVersion,
+        basisFingerprint: plan.basisFingerprint,
+        spec,
+        cursor: null,
+      })
       return { status: 'dispatched', detail: `backfill queued as job ${job.id}`, backgroundJobId: job.id }
     }
 

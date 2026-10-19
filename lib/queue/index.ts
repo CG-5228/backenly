@@ -469,17 +469,19 @@ export async function failPurgeJob(id: string, error: string) {
 // A maintenance backfill of a regional project is the same kind of work: its
 // ladder runs in the project's region (lib/autonomy/region-skip.ts), and the
 // batches it dispatches belong there too, not to the home queue, where a
-// failed batch's database error, which can quote a row, would be recorded.
+// failed batch's database error, which can quote a row, would be recorded. So
+// is the copy an architecture change makes into its new table
+// (lib/structural-evolution/backfill-job.ts).
 
 /** Snapshots taken and restored for another region: what the console's snapshot panel lists. */
 export const SNAPSHOT_JOB_TYPES = ['workspace_backup', 'workspace_restore'] as const
 
 /** The work one region may ask another to do. */
-export const REGIONAL_JOB_TYPES = [...SNAPSHOT_JOB_TYPES, 'maintenance_backfill'] as const
+export const REGIONAL_JOB_TYPES = [...SNAPSHOT_JOB_TYPES, 'maintenance_backfill', 'evolution_backfill'] as const
 export type RegionalJobType = (typeof REGIONAL_JOB_TYPES)[number]
 
 /** Work that writes the project's data, and so waits while the project is paused. */
-const REGIONAL_WRITES_HELD_WHILE_PAUSED: readonly RegionalJobType[] = ['maintenance_backfill']
+const REGIONAL_WRITES_HELD_WHILE_PAUSED: readonly RegionalJobType[] = ['maintenance_backfill', 'evolution_backfill']
 
 export const REGIONAL_STATUS = {
   /** Waiting for its region's scheduler. Invisible to every generic query. */

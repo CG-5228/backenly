@@ -33,11 +33,10 @@
 import { prisma } from '@/lib/db'
 import { FLAGS } from '@/lib/config/flags'
 import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-flight'
-import { enqueue } from '@/lib/queue'
 import { readLiveEvolutionApproval } from './consent'
 import { requiredTier, type ExtractionPlan, type ExtractionStep } from './plan'
 import { runStep, rungAlreadyApplied } from './primitives'
-import { inspectEvolutionChain } from './backfill-job'
+import { inspectEvolutionChain, queueEvolutionBackfill } from './backfill-job'
 import type { StopReason } from '@/lib/evolution-engine/primitive'
 import { resolveExtractionPlan, isResolveRefusal } from './resolve'
 import { workspaceAt } from './workspace'
@@ -163,9 +162,10 @@ async function runLadder(input: {
         if (!mutationsEnabled) {
           return halt(executionId, plan, steps, `step ${step.ordinal} (${step.kind}) is paused and mutations are disabled for this run`, 'mutations_disabled')
         }
-        const resumed = await enqueue('evolution_backfill', job.resumeFrom as unknown as Record<string, unknown>, { projectId })
+        const resumed = await queueEvolutionBackfill(job.resumeFrom)
         await prisma.maintenanceStepExecution.update({ where: { id: existing.id }, data: { backgroundJobId: resumed.id } })
-        steps.push({ ordinal: step.ordinal, kind: step.kind, status: 'dispatched', detail: `resumed from key ${job.resumeFrom.cursor ?? 'start'} as job ${resumed.id}` })
+        // The key it stopped at is a row's own value: not quoted in the ledger.
+        steps.push({ ordinal: step.ordinal, kind: step.kind, status: 'dispatched', detail: `resumed where it stopped, as job ${resumed.id}` })
         return awaiting(executionId, plan, steps, `step ${step.ordinal} (${step.kind}) resumed as job ${resumed.id}`)
       }
       if (job.state === 'pending') {
