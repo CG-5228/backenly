@@ -31,6 +31,7 @@ import { prisma } from '@/lib/db'
 import { enqueue } from '@/lib/queue'
 import { createHash } from 'node:crypto'
 import { readTableFacts, relationExists, type TableFacts } from './facts'
+import { workspaceAt, type WorkspaceAt } from './workspace'
 import { fq, hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
 import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
@@ -50,9 +51,10 @@ export interface StepRunResult {
   observed?: Record<string, unknown>
 }
 
-export async function runStatements(statements: string[]): Promise<void> {
+/** One transaction on the project's own database. */
+export async function runStatements(at: WorkspaceAt, statements: string[]): Promise<void> {
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
-  await prisma.$transaction(
+  await at.db.$transaction(
     async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`)
       await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms'`)
@@ -65,6 +67,7 @@ export async function runStatements(statements: string[]): Promise<void> {
     { timeout: STATEMENT_TIMEOUT_MS + 10_000, maxWait: 10_000 },
   )
 }
+
 
 /**
  * Why the satellite's policies could admit a row its parent would not, or null.
@@ -92,13 +95,14 @@ const nonOwnerGrants = (f: TableFacts) => f.grants.filter(g => g.grantee !== f.o
  * exists where the data plane is provisioned, and NOTIFY is the protocol it
  * wraps.
  */
-export async function reloadDataPlane(): Promise<string> {
+export async function reloadDataPlane(at: WorkspaceAt): Promise<string> {
+  // The REST API that serves the project listens on its own region's database.
   try {
-    await prisma.$executeRawUnsafe(`SELECT public.backenly_pgrst_reload()`)
+    await at.db.$executeRawUnsafe(`SELECT public.backenly_pgrst_reload()`)
     return 'schema cache reloaded'
   } catch {
     try {
-      await prisma.$executeRawUnsafe(`NOTIFY pgrst, 'reload schema'`)
+      await at.db.$executeRawUnsafe(`NOTIFY pgrst, 'reload schema'`)
       return 'schema cache reload requested'
     } catch (err) {
       return `schema cache not reloaded: ${err instanceof Error ? err.message : String(err)}`
@@ -133,10 +137,10 @@ export async function unregisterTable(projectId: string, schema: string, name: s
  * name, closed exactly as the rung leaves it, every member column present, the
  * truncate guard in place.
  */
-export async function rungAlreadyApplied(plan: ExtractionPlan, step: ExtractionStep): Promise<StepRunResult | null> {
+export async function rungAlreadyApplied(at: WorkspaceAt, plan: ExtractionPlan, step: ExtractionStep): Promise<StepRunResult | null> {
   if (step.kind !== 'create_satellite') return null
-  const { spec, schema } = plan
-  const sat = await readTableFacts(schema, spec.satellite)
+  const { spec } = plan
+  const sat = await readTableFacts(at, spec.satellite)
   if (!sat || !isOurSatellite(sat, spec)) return null
   const n = ladderNames(spec)
   const closed =
@@ -158,12 +162,14 @@ export async function rungAlreadyApplied(plan: ExtractionPlan, step: ExtractionS
 export async function runStep(projectId: string, plan: ExtractionPlan, step: ExtractionStep): Promise<StepRunResult> {
   const { spec, schema } = plan
   const n = ladderNames(spec)
-  const host = await readTableFacts(schema, spec.host)
+  const at = await workspaceAt(projectId)
+  if (at.schema !== schema) return { status: 'failed', detail: `the plan was built for schema ${schema}, and the project's workspace is ${at.schema}` }
+  const host = await readTableFacts(at, spec.host)
   if (!host) return { status: 'failed', detail: `${spec.host} no longer exists` }
 
   switch (step.kind) {
     case 'rehearse': {
-      const r = await rehearseExtraction(host, spec, plan.planId)
+      const r = await rehearseExtraction(at, host, spec, plan.planId)
       const failedNames = r.exercises.filter(e => e.outcome === 'failed').map(e => `${e.name}: ${e.detail}`)
       return r.passed
         ? {
@@ -181,11 +187,11 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
     }
 
     case 'create_satellite': {
-      if (await relationExists(schema, spec.satellite)) {
+      if (await relationExists(at, spec.satellite)) {
         return { status: 'failed', detail: `${spec.satellite} already exists; nothing was created` }
       }
-      await runStatements(step.sql)
-      const sat = await readTableFacts(schema, spec.satellite)
+      await runStatements(at, step.sql)
+      const sat = await readTableFacts(at, spec.satellite)
       if (!sat || !isOurSatellite(sat, spec)) {
         return { status: 'failed', detail: `the statements committed but ${spec.satellite} is not in the catalog as expected` }
       }
@@ -210,10 +216,10 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
     }
 
     case 'sync_forward': {
-      const sat = await readTableFacts(schema, spec.satellite)
+      const sat = await readTableFacts(at, spec.satellite)
       if (!isOurSatellite(sat, spec)) return { status: 'failed', detail: `${spec.satellite} is not this ladder's table` }
-      await runStatements(step.sql)
-      const after = await readTableFacts(schema, spec.host)
+      await runStatements(at, step.sql)
+      const after = await readTableFacts(at, spec.host)
       const trig = after?.triggers.find(t => t.name === n.forward)
       const expected = hostLadderObjects(spec)
       const missing = [
@@ -224,7 +230,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
         return { status: 'failed', detail: `the statements reported no error but ${spec.host} lacks ${missing.join(', ') || n.forward}` }
       }
       // It runs as the owner: nobody else may attach it to a table of theirs.
-      const [acl] = await prisma.$queryRawUnsafe<Array<{ others: string[] }>>(
+      const [acl] = await at.db.$queryRawUnsafe<Array<{ others: string[] }>>(
         `SELECT ARRAY(SELECT CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END
                         FROM aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) x
                        WHERE x.grantee <> p.proowner) AS others
@@ -271,13 +277,13 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
     }
 
     case 'expose_reads': {
-      const sat = await readTableFacts(schema, spec.satellite)
+      const sat = await readTableFacts(at, spec.satellite)
       if (!isOurSatellite(sat, spec)) return { status: 'failed', detail: `${spec.satellite} is not this ladder's table` }
       // Granting reads would also open whatever policy someone else put here.
       const foreign = widerThanParent(sat!, spec)
       if (foreign) return { status: 'failed', detail: `not opened: ${foreign}` }
-      await runStatements(step.sql)
-      const after = (await readTableFacts(schema, spec.satellite))!
+      await runStatements(at, step.sql)
+      const after = (await readTableFacts(at, spec.satellite))!
       const missing = plan.access.readers.filter(
         r => !after.grants.some(g => g.grantee === r && g.privilege === 'SELECT'),
       )
@@ -295,7 +301,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
         spec.satellite,
         `The ${spec.label} concern of ${spec.host}, extracted by Backenly structural evolution`,
       )
-      const reload = await reloadDataPlane()
+      const reload = await reloadDataPlane(at)
       return {
         status: 'completed',
         detail: `${spec.satellite} readable by ${plan.access.readers.join(', ') || 'no role'} under ${spec.host}'s row rules; ${reload}`,
@@ -305,12 +311,12 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
     }
 
     case 'open_writes': {
-      const sat = await readTableFacts(schema, spec.satellite)
+      const sat = await readTableFacts(at, spec.satellite)
       if (!isOurSatellite(sat, spec)) return { status: 'failed', detail: `${spec.satellite} is not this ladder's table` }
       const foreign = widerThanParent(sat!, spec)
       if (foreign) return { status: 'failed', detail: `not opened: ${foreign}` }
-      await runStatements(step.sql)
-      const after = (await readTableFacts(schema, spec.satellite))!
+      await runStatements(at, step.sql)
+      const after = (await readTableFacts(at, spec.satellite))!
       const wider = widerThanParent(after, spec)
       if (wider) return { status: 'failed', detail: `write access is not as planned: ${wider}` }
       const policies = [n.policies.insert, n.policies.update, n.policies.delete]
@@ -330,7 +336,7 @@ export async function runStep(projectId: string, plan: ExtractionPlan, step: Ext
             ].filter(Boolean).join('; '),
         }
       }
-      const reload = await reloadDataPlane()
+      const reload = await reloadDataPlane(at)
       return {
         status: 'completed',
         detail: `${spec.satellite} writable by ${plan.access.writers.join(', ') || 'no role'}; every write reaches ${spec.host}; ${reload}`,

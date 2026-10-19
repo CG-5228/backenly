@@ -40,6 +40,7 @@ import { runStep, rungAlreadyApplied } from './primitives'
 import { inspectEvolutionChain } from './backfill-job'
 import type { StopReason } from '@/lib/evolution-engine/primitive'
 import { resolveExtractionPlan, isResolveRefusal } from './resolve'
+import { workspaceAt } from './workspace'
 
 export type ExtractionRunStatus =
   | 'completed'
@@ -124,6 +125,8 @@ async function runLadder(input: {
 
   const executionId = await openExecution(projectId, plan, 'running', null, approval.id)
   const steps: ExtractionStepOutcome[] = []
+  // The project's tables, where they live (./workspace.ts).
+  const at = await workspaceAt(projectId)
 
   for (const step of plan.steps) {
     if (step.capability === 'human_only') {
@@ -182,7 +185,7 @@ async function runLadder(input: {
     // The previous attempt may have committed this rung and stopped before the
     // ledger heard; a rung that cannot simply run twice is adopted instead.
     if (existing?.status === 'running') {
-      const adopted = await rungAlreadyApplied(plan, step)
+      const adopted = await rungAlreadyApplied(at, plan, step)
       if (adopted) {
         await prisma.maintenanceStepExecution.update({
           where: { id: existing.id },

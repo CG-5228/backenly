@@ -38,7 +38,7 @@
  * drives this primitive through ./primitive.ts.
  */
 
-import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
+import { workspaceAt } from './workspace'
 import type { PriorOutcome } from '@/lib/evolution-engine/levels'
 import { listBaseTables, readTableFacts, relationExists } from './facts'
 import {
@@ -176,8 +176,9 @@ export async function analyzeStructuralEvolution(
 ): Promise<EvolutionReport> {
   const now = opts.now ?? new Date()
   const since = new Date(now.getTime() - WINDOW_DAYS * 86_400_000)
-  const schema = await resolveWorkspaceSchema(projectId)
-  const all = await listBaseTables(schema)
+  // The project's tables, read where they live (./workspace.ts).
+  const at = await workspaceAt(projectId)
+  const all = await listBaseTables(at)
   const names = (opts.tables ? all.filter(t => opts.tables!.includes(t)) : all).slice(0, MAX_TABLES)
 
   const [snapshots, repairs, requests, consumers] = await Promise.all([
@@ -189,14 +190,14 @@ export async function analyzeStructuralEvolution(
 
   const tables: TableAssessment[] = []
   for (const table of names) {
-    const facts = await readTableFacts(schema, table)
+    const facts = await readTableFacts(at, table)
     if (!facts) continue
     // A table holding a `bkn_evo_` foreign key is a satellite. It is the
     // answer to a previous proposal, not a host for the next one.
     if (facts.constraints.some(c => c.kind === 'f' && c.name.startsWith('bkn_evo_'))) continue
 
     const { eligible } = partitionColumns(facts)
-    const sampled = eligible.length >= 2 ? await samplePresence(facts, eligible) : null
+    const sampled = eligible.length >= 2 ? await samplePresence(at, facts, eligible) : null
     tables.push(
       analyzeTable({
         facts,
@@ -223,7 +224,7 @@ export async function analyzeStructuralEvolution(
   const held: ConcernAssessment[] = []
 
   for (const t of tables) {
-    const facts = await readTableFacts(schema, t.table)
+    const facts = await readTableFacts(at, t.table)
     if (!facts) continue
     for (const c of t.concerns) {
       const planId = extractionPlanId(projectId, c.host, c.members)
@@ -244,8 +245,8 @@ export async function analyzeStructuralEvolution(
         satellite: c.defaultSatellite,
         label: c.label,
       }
-      const exists = await relationExists(schema, spec.satellite)
-      const ours = exists ? isOurSatellite(await readTableFacts(schema, spec.satellite), spec) : false
+      const exists = await relationExists(at, spec.satellite)
+      const ours = exists ? isOurSatellite(await readTableFacts(at, spec.satellite), spec) : false
       const plan = buildExtractionPlan({
         projectId,
         spec,

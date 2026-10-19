@@ -39,6 +39,7 @@ import { BACKFILL_BATCH_ROWS } from './plan'
 import { LOCK_TIMEOUT_MS } from './primitives'
 import { readLiveEvolutionApproval } from './consent'
 import { hostVisibility } from './reconcile'
+import { workspaceAt } from './workspace'
 
 /** A batch that met a row being written is retried this many times, after these waits. */
 export const LOCKED_ROW_RETRY_MS = [100, 400, 1_600] as const
@@ -92,9 +93,10 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
     refusal,
   })
 
-  const { resolveWorkspaceSchema } = await import('@/lib/services/workspace-pool')
-  const schema = await resolveWorkspaceSchema(payload.projectId)
-  const host = await readTableFacts(schema, payload.spec.host)
+  // The project's own region: this job runs there (lib/queue REGIONAL_JOB_TYPES).
+  const at = await workspaceAt(payload.projectId)
+  const { schema } = at
+  const host = await readTableFacts(at, payload.spec.host)
   if (!host) return stop(`${payload.spec.host} no longer exists`)
   if (basisFingerprint(host) !== payload.basisFingerprint) {
     return stop(`${payload.spec.host} changed shape since the plan was approved; the backfill stopped rather than adapt`)
@@ -109,7 +111,7 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
   type BatchRow = { scanned: bigint; upserted: bigint; removed: bigint; next_cursor: string | null }
   const batch = () =>
-    prisma.$transaction(async tx => {
+    at.db.$transaction(async tx => {
       await tx.$executeRawUnsafe(
         rlsSessionSql(1),
         ...rlsSessionParams({ userId: '', isServiceRole: true, userRole: 'service' }),

@@ -43,6 +43,7 @@ import {
 import { decisionTrail, readMemory, summarizeDecisions, priorsFor } from '@/lib/evolution-engine/memory'
 import { DEFAULT_POLICY } from '@/lib/evolution-engine/policy'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { asService, buildProject, drain, dropProject, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
 
 jest.setTimeout(300_000)
@@ -123,7 +124,7 @@ describe('one architecture change, from proposal to undo', () => {
     expect(!isApprovalRefusal(r) && r.message).toMatch(/switched off/)
     expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
     expect((await requestsOf(f.projectId))[0].status).toBe('approved')
-    expect(await readTableFacts(f.schema, 'order_refunds')).toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
   })
 
   it('cannot be approved twice', async () => {
@@ -208,7 +209,7 @@ describe('one architecture change, from proposal to undo', () => {
   it('undoes losslessly, and does not propose the same change again on the same evidence', async () => {
     const r = await undo({ projectId: f.projectId, decisionId, userId: f.ownerId })
     expect(r.ok).toBe(true)
-    expect(await readTableFacts(f.schema, 'order_refunds')).toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
     expect((await stateOf(f.projectId, decisionId)).state).toBe('rolled_back')
 
     const priors = priorsFor(summarizeDecisions(await readMemory(f.projectId)))
@@ -256,7 +257,7 @@ describe('a change that misbehaves under observation', () => {
     expect(req.ev.stoppedBecause).toMatch(/consistency|disagrees/)
     // Policy: no automatic undo unless the owner turned it on.
     expect(DEFAULT_POLICY.autoRollbackOnRegression).toBe(false)
-    expect(await readTableFacts(f.schema, 'order_refunds')).not.toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).not.toBeNull()
   })
 
   it('undoes losslessly when the divergence lost nothing: the host still holds every value', async () => {

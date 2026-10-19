@@ -32,8 +32,8 @@
  */
 
 import { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/db'
 import type { TableFacts } from './facts'
+import { workspaceAt } from './workspace'
 import { fq, ladderAccessSql, ladderNames, reconcileSql, type ExtractionSpec, type RenderTarget } from './sql'
 
 export interface ReconcileResult {
@@ -154,12 +154,14 @@ export async function reconcileWith(
 
 /** Reconcile the live tables. */
 export async function reconcileExtraction(
-  _projectId: string,
+  projectId: string,
   facts: TableFacts,
   spec: ExtractionSpec,
 ): Promise<ReconcileResult> {
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
-  return prisma.$transaction(
+  // On the project's own database, where facts were read: both tables, one snapshot.
+  const { db } = await workspaceAt(projectId)
+  return db.$transaction(
     async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '120s'`)
       await tx.$executeRawUnsafe(

@@ -41,11 +41,11 @@
 
 import { prisma } from '@/lib/db'
 import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-flight'
-import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
 import { readTableFacts, type TableFacts } from './facts'
 import { latestRun, ledgerSteps, readLatestEvolutionApproval } from './consent'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite, reloadDataPlane, runStatements, unregisterTable } from './primitives'
+import { workspaceAt, type WorkspaceAt } from './workspace'
 import { closeWritesSql, dropForwardSyncSql, dropSatelliteSql, fq, hostLadderObjects, ladderNames, revokeReadsSql } from './sql'
 
 export interface RollbackAction {
@@ -78,7 +78,9 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
 
   const spec = approval.spec
   const n = ladderNames(spec)
-  const schema = await resolveWorkspaceSchema(projectId)
+  // The project's tables, where they live (./workspace.ts).
+  const at = await workspaceAt(projectId)
+  const { schema } = at
   const target = { schema }
   const ledger = await ledgerSteps(projectId, planId)
   // What a rung observed after committing, whatever its final status: a rung
@@ -87,9 +89,9 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     ledger.find(s => s.kind === kind && s.observedPostState)?.observedPostState as Record<string, unknown> | undefined
   const actions: RollbackAction[] = []
 
-  const host = await readTableFacts(schema, spec.host)
+  const host = await readTableFacts(at, spec.host)
   if (!host) return { status: 'refused', reason: `${spec.host} no longer exists`, actions }
-  const sat = await readTableFacts(schema, spec.satellite)
+  const sat = await readTableFacts(at, spec.satellite)
   const ours = isOurSatellite(sat, spec)
   const hostObjects = hostLadderObjects(spec)
   const onHost = (f: TableFacts) =>
@@ -134,7 +136,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
       return true
     }
     try {
-      await runStatements(sql)
+      await runStatements(at, sql)
     } catch (err) {
       actions.push({ action, outcome: 'failed', detail: databaseWords(err) })
       return false
@@ -148,7 +150,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   }
 
   const lossless = async (): Promise<string | null> => {
-    const facts = await readTableFacts(schema, spec.host)
+    const facts = await readTableFacts(at, spec.host)
     if (!facts) return `${spec.host} no longer exists`
     const r = await reconcileExtraction(projectId, facts, spec)
     // A partial view proves nothing either way.
@@ -167,7 +169,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
     // Whatever was built on the new table since (a view, another table's
     // foreign key) would make the last step fail after the others had
     // already closed it: refused now, while nothing has been removed.
-    const users = await dependentsOf(fq(schema, spec.satellite))
+    const users = await dependentsOf(at, fq(schema, spec.satellite))
     if (users.length > 0) {
       const them = users.length === 1 ? 'it' : 'them'
       return {
@@ -180,7 +182,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
 
   const writers = (recorded('open_writes')?.granted as string[] | undefined) ?? []
   const readers = (recorded('expose_reads')?.granted as string[] | undefined) ?? []
-  const satNow = () => readTableFacts(schema, spec.satellite)
+  const satNow = () => readTableFacts(at, spec.satellite)
 
   // The second lossless check, after the satellite stopped taking writes.
   const recheck = async (): Promise<boolean> => {
@@ -222,7 +224,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
       forwardLive || !!sat,
       [...dropForwardSyncSql(spec, target), ...(sat ? dropSatelliteSql(spec, target) : [])],
       async () => {
-        const h = await readTableFacts(schema, spec.host)
+        const h = await readTableFacts(at, spec.host)
         return !!h && !onHost(h) && (await satNow()) === null
       },
       `${spec.host} no longer mirrors into ${spec.satellite}, and ${spec.satellite} is dropped; ${spec.host} is as it was before the extraction`,
@@ -234,7 +236,7 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   }
 
   await unregisterTable(projectId, schema, spec.satellite)
-  const reload = await reloadDataPlane()
+  const reload = await reloadDataPlane(at)
   await withdraw(approval.id, input.requestedBy, actions)
   await markLedger(projectId, planId, 'verified', actions)
   return { status: 'rolled_back', reason: reload, actions }
@@ -245,8 +247,8 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
  * and rules over it, and other tables' foreign keys into it. Its own indexes,
  * constraints, policies, triggers and rules go with it and are not listed.
  */
-async function dependentsOf(satellite: string): Promise<string[]> {
-  const rows = await prisma.$queryRawUnsafe<Array<{ what: string }>>(
+async function dependentsOf(at: WorkspaceAt, satellite: string): Promise<string[]> {
+  const rows = await at.db.$queryRawUnsafe<Array<{ what: string }>>(
     `SELECT DISTINCT CASE d.classid
               WHEN 'pg_rewrite'::regclass THEN 'the view ' || r.ev_class::regclass::text
               WHEN 'pg_constraint'::regclass THEN 'the foreign key ' || quote_ident(c.conname) || ' on ' || c.conrelid::regclass::text

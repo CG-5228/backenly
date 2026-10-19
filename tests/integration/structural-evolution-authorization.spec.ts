@@ -77,6 +77,7 @@ import {
   type RehearsalReport,
 } from '@/lib/structural-evolution/rehearse'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { fq, ladderNames, type ExtractionSpec } from '@/lib/structural-evolution/sql'
 
 jest.setTimeout(120_000)
@@ -149,7 +150,7 @@ async function asService<T = any>(sql: string, ...p: unknown[]): Promise<T[]> {
 async function rehearse(spec: ExtractionSpec, options: RehearsalOptions = {}): Promise<RehearsalReport> {
   const resolved = await resolveExtractionPlan(projectId, spec)
   if (isResolveRefusal(resolved)) throw new Error(resolved.refusal)
-  return rehearseExtraction(resolved.facts, spec, resolved.plan.planId, options)
+  return rehearseExtraction(workspaceOn(prisma, resolved.facts.schema), resolved.facts, spec, resolved.plan.planId, options)
 }
 
 /** One identity's checks, by check name. */
@@ -683,7 +684,7 @@ describe('a host whose policies ignore the service-role claim', () => {
 
 describe('a host with no access rules of its own', () => {
   it('is unavailable with the reason, never passed, and access stays listed as not rehearsed', async () => {
-    const facts = (await readTableFacts(schema, 'invoices'))!
+    const facts = (await readTableFacts(workspaceOn(prisma, schema), 'invoices'))!
     // The precondition, checked rather than assumed.
     expect(facts.rowSecurity).toBe(false)
     expect(facts.grants.filter(g => g.grantee !== facts.owner)).toEqual([])
@@ -715,8 +716,8 @@ describe('after every rehearsal above', () => {
   it('leaves nothing behind, and every session is the platform again', async () => {
     expect(await rows(`SELECT nspname FROM pg_namespace WHERE nspname LIKE 'bkn\\_rehearsal\\_%'`)).toEqual([])
     for (const spec of [SPEC, GRANTED, UNCLAIMED, PLAIN]) {
-      expect([spec.satellite, await readTableFacts(schema, spec.satellite)]).toEqual([spec.satellite, null])
-      expect([spec.host, (await readTableFacts(schema, spec.host))!.triggers]).toEqual([spec.host, []])
+      expect([spec.satellite, await readTableFacts(workspaceOn(prisma, schema), spec.satellite)]).toEqual([spec.satellite, null])
+      expect([spec.host, (await readTableFacts(workspaceOn(prisma, schema), spec.host))!.triggers]).toEqual([spec.host, []])
     }
     // No function the ladder renders survived either.
     expect(
@@ -730,7 +731,7 @@ describe('after every rehearsal above', () => {
     // The live table was only read: same rows, same policies, same grants.
     expect(await liveSnapshot()).toEqual(ordersBefore)
     expect(await livePolicies()).toEqual(policiesBefore)
-    const live = (await readTableFacts(schema, 'orders'))!
+    const live = (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!
     expect(live.grants.filter(g => g.grantee === ROLE).map(g => g.privilege).sort()).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE'])
     expect(live.grants.filter(g => g.grantee === READER).map(g => g.privilege)).toEqual(['SELECT'])
     expect(live.forceRowSecurity).toBe(true)

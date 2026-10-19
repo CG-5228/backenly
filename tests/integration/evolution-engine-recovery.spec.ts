@@ -48,6 +48,7 @@ import { claimRequest, CLAIM_LEASE_MS } from '@/lib/evolution-engine/request'
 import type { RollbackResult } from '@/lib/evolution-engine/primitive'
 import { structuralExtraction } from '@/lib/structural-evolution/primitive'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { ladderNames } from '@/lib/structural-evolution/sql'
 import { asService, buildProject, drain, dropProject, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
 
@@ -386,7 +387,7 @@ describe('resuming a change nobody approved', () => {
     const r = await resume({ projectId: f.projectId, decisionId: d.decisionId, userId: f.ownerId })
     expect(r).toMatchObject({ ok: false, status: 409 })
     expect(!r.ok && r.error).toMatch(/never approved/)
-    expect(await readTableFacts(f.schema, 'order_refunds')).toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
     expect(await prisma.maintenanceApproval.count({ where: { projectId: f.projectId } })).toBe(0)
   })
 })
@@ -416,10 +417,10 @@ describe('undo', () => {
       expect(s.state).toBe('observing')
       expect(s.observingSince).toEqual(before.observingSince)
       const n = ladderNames({ host: 'orders', satellite: 'order_refunds', members: [], label: 'refund' })
-      const sat = (await readTableFacts(f.schema, 'order_refunds'))!
+      const sat = (await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds'))!
       expect(sat.triggers.map(t => t.name)).toContain(n.reverse)
       expect(sat.policies).toHaveLength(5)
-      expect((await readTableFacts(f.schema, 'orders'))!.triggers.map(t => t.name)).toContain(n.forward)
+      expect((await readTableFacts(workspaceOn(prisma, f.schema), 'orders'))!.triggers.map(t => t.name)).toContain(n.forward)
       expect((await milestones(f, decisionId)).pop()).toMatch(/did not undo .*Nothing was removed; it is as it was\.$/)
     } finally {
       await q(`DROP VIEW IF EXISTS ${view}`)

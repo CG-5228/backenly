@@ -28,6 +28,7 @@ import { prisma } from '@/lib/db'
 import { jwtClaimFunctionSql } from '@/lib/postgrest/rls-translation'
 import { rlsSessionParams, rlsSessionSql, type RlsIdentity } from '@/lib/services/rls-session'
 import { readTableFacts, granteesWith, type TableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import {
   backfillBatchSql,
   carriedObjects,
@@ -112,7 +113,7 @@ beforeAll(async () => {
        FROM generate_series(1, 24) i`,
     `GRANT SELECT, UPDATE ON ${t('orders')} TO "${WEB}"`,
   ])
-  facts = (await readTableFacts(SCHEMA, 'orders'))!
+  facts = (await readTableFacts(workspaceOn(prisma, SCHEMA), 'orders'))!
   expect(facts.owner).toBe(PLAT)
   expect(facts.forceRowSecurity).toBe(true)
 

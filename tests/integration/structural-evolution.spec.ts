@@ -42,6 +42,7 @@ import { handleEvolutionBackfillJob } from '@/lib/structural-evolution/backfill-
 import { reconcileExtraction } from '@/lib/structural-evolution/reconcile'
 import { rollbackExtraction } from '@/lib/structural-evolution/rollback'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { runStep } from '@/lib/structural-evolution/primitives'
 import { fq, ladderNames, type ExtractionSpec } from '@/lib/structural-evolution/sql'
 
@@ -289,7 +290,7 @@ describe('rehearsal', () => {
   it('runs the ladder on a copy, every exercise reconciles, and nothing remains', async () => {
     const resolved = await resolveExtractionPlan(projectId, SPEC)
     if (isResolveRefusal(resolved)) throw new Error(resolved.refusal)
-    const r = await rehearseExtraction(resolved.facts, SPEC, planId)
+    const r = await rehearseExtraction(workspaceOn(prisma, resolved.facts.schema), resolved.facts, SPEC, planId)
     expect(r.error).toBeNull()
     expect(r.exercises.filter(e => e.outcome === 'failed')).toEqual([])
     expect(r.exercises.filter(e => e.outcome === 'passed').map(e => e.name)).toEqual([
@@ -314,8 +315,8 @@ describe('rehearsal', () => {
 
     const scratch = await rows(`SELECT 1 FROM pg_namespace WHERE nspname LIKE 'bkn_rehearsal_%'`)
     expect(scratch).toEqual([])
-    expect(await readTableFacts(schema, 'order_refunds')).toBeNull()
-    expect((await readTableFacts(schema, 'orders'))!.triggers).toEqual([])
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).toBeNull()
+    expect((await readTableFacts(workspaceOn(prisma, schema), 'orders'))!.triggers).toEqual([])
   })
 })
 
@@ -342,7 +343,7 @@ describe('consent', () => {
     const out = await executeExtraction({ projectId, planId })
     expect(out.status).toBe('refused')
     expect(out.haltReason).toMatch(/re-approved/)
-    expect(await readTableFacts(schema, 'order_refunds')).toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).toBeNull()
     await q(`ALTER TABLE ${t('orders')} DROP CONSTRAINT orders_total_positive`)
   })
 })
@@ -356,7 +357,7 @@ describe('the governed executor', () => {
     expect(out.status).toBe('halted')
     expect(out.steps.map(s => [s.kind, s.status])).toEqual([['rehearse', 'completed']])
     expect(out.haltReason).toMatch(/mutations are disabled/)
-    expect(await readTableFacts(schema, 'order_refunds')).toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).toBeNull()
   })
 
   it('with mutations on, builds the satellite closed, syncs it and hands the backfill to the queue', async () => {
@@ -369,7 +370,7 @@ describe('the governed executor', () => {
       ['sync_forward', 'completed'],
       ['backfill', 'dispatched'],
     ])
-    const sat = (await readTableFacts(schema, 'order_refunds'))!
+    const sat = (await readTableFacts(workspaceOn(prisma, schema), 'order_refunds'))!
     expect(sat.forceRowSecurity).toBe(true)
     expect(sat.grants.filter(g => g.grantee !== sat.owner)).toEqual([])
     // The host's CHECK and its index on a member came along.
@@ -390,7 +391,7 @@ describe('the governed executor', () => {
         expect(out.status).toBe('failed')
         expect(out.detail).toBe("not opened: foreign_sweep on order_refunds admits rows by another test than the parent's visibility")
       }
-      const sat = (await readTableFacts(schema, 'order_refunds'))!
+      const sat = (await readTableFacts(workspaceOn(prisma, schema), 'order_refunds'))!
       expect(sat.grants.filter(g => g.grantee !== sat.owner)).toEqual([])
       expect(sat.policies.map(p => p.name).sort()).toEqual([ladderNames(SPEC).policies.owner, 'foreign_sweep'].sort())
     } finally {
@@ -413,10 +414,10 @@ describe('the governed executor', () => {
       ['verify', 'completed'],
       ['contract', 'awaiting_human'],
     ])
-    const sat = (await readTableFacts(schema, 'order_refunds'))!
+    const sat = (await readTableFacts(workspaceOn(prisma, schema), 'order_refunds'))!
     const mine = sat.grants.filter(g => g.grantee === ROLE).map(g => g.privilege).sort()
     expect(mine).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE'])
-    const r = await reconcileExtraction(projectId, (await readTableFacts(schema, 'orders'))!, SPEC)
+    const r = await reconcileExtraction(projectId, (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!, SPEC)
     expect(r).toMatchObject({ consistent: true, present: 60, satelliteRows: 60 })
   })
 })
@@ -493,7 +494,7 @@ describe('after the extraction, as a real role under row-level security', () => 
     )
     await asUser(USER_A, run => run(`DELETE FROM ${t('orders')} WHERE id = $1::uuid`, mine.id))
     expect(await asService(`SELECT 1 FROM ${t('order_refunds')} WHERE ${fk} = $1::uuid`, mine.id)).toEqual([])
-    const r = await reconcileExtraction(projectId, (await readTableFacts(schema, 'orders'))!, SPEC)
+    const r = await reconcileExtraction(projectId, (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!, SPEC)
     expect(r.consistent).toBe(true)
   })
 
@@ -518,7 +519,7 @@ describe('rollback', () => {
     const out = await rollbackExtraction({ projectId, planId, requestedBy: ownerId })
     expect(out.status).toBe('refused')
     expect(out.reason).toMatch(/holds data orders does not \(1 orphaned/)
-    expect(await readTableFacts(schema, 'order_refunds')).not.toBeNull()
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).not.toBeNull()
     await prisma.$transaction(async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL session_replication_role = replica`)
       await tx.$executeRawUnsafe(`DELETE FROM ${t('order_refunds')} WHERE ${fk} = $1::uuid`, id)
@@ -554,14 +555,14 @@ describe('rollback', () => {
       await prisma.$executeRawUnsafe(`DROP EVENT TRIGGER IF EXISTS ${tripwire}`)
       await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public.${tripwire}()`)
     }
-    expect(await readTableFacts(schema, 'order_refunds')).not.toBeNull()
-    expect((await readTableFacts(schema, 'orders'))!.triggers.length).toBeGreaterThan(0)
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).not.toBeNull()
+    expect((await readTableFacts(workspaceOn(prisma, schema), 'orders'))!.triggers.length).toBeGreaterThan(0)
 
     const fk = ladderNames(SPEC).fkColumn
     const id = await bareOrder(USER_A, 4)
     await asUser(USER_A, run => run(`UPDATE ${t('orders')} SET refund_amount = 9, refund_reason = 'kept in step' WHERE id = $1::uuid`, id))
     expect(await asService(`SELECT refund_reason AS r FROM ${t('order_refunds')} WHERE ${fk} = $1::uuid`, id)).toEqual([{ r: 'kept in step' }])
-    const r = await reconcileExtraction(projectId, (await readTableFacts(schema, 'orders'))!, SPEC)
+    const r = await reconcileExtraction(projectId, (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!, SPEC)
     expect(r).toMatchObject({ consistent: true, complete: true })
   })
 
@@ -576,8 +577,8 @@ describe('rollback', () => {
       ['remove', 'done'],
       ['withdraw_consent', 'done'],
     ])
-    expect(await readTableFacts(schema, 'order_refunds')).toBeNull()
-    expect((await readTableFacts(schema, 'orders'))!.triggers).toEqual([])
+    expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).toBeNull()
+    expect((await readTableFacts(workspaceOn(prisma, schema), 'orders'))!.triggers).toEqual([])
     expect(await hostSnapshot()).toEqual(before)
     expect(await readLiveEvolutionApproval(projectId, planId)).toBeNull()
 

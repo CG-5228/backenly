@@ -36,7 +36,8 @@
  */
 
 import { createHash } from 'node:crypto'
-import { prisma } from '@/lib/db'
+import type { WorkspaceRawClient } from '@/lib/data-plane/regional'
+import type { WorkspaceAt } from './workspace'
 
 /** Every object a ladder creates carries this prefix, and nothing else may. */
 export const LADDER_OBJECT_PREFIX = 'bkn_evo_'
@@ -180,16 +181,17 @@ const REL = `to_regclass(format('%I.%I', $1::text, $2::text))`
 
 type Row = Record<string, unknown>
 
-async function q<T extends Row = Row>(sql: string, ...params: unknown[]): Promise<T[]> {
-  return prisma.$queryRawUnsafe<T[]>(sql, ...params)
-}
+/** One catalog query, on the project's own database. */
+type Q = <T extends Row = Row>(sql: string, ...params: unknown[]) => Promise<T[]>
+const on = (db: WorkspaceRawClient): Q => (sql, ...params) => db.$queryRawUnsafe(sql, ...params) as Promise<any>
 
 const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(v))
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : [])
 
 /** The base tables in a schema, excluding Backenly's own bookkeeping tables. */
-export async function listBaseTables(schema: string): Promise<string[]> {
-  const rows = await q<{ name: string }>(
+export async function listBaseTables(at: WorkspaceAt): Promise<string[]> {
+  const { schema } = at
+  const rows = await on(at.db)<{ name: string }>(
     `SELECT c.relname::text AS name
        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition
@@ -201,8 +203,8 @@ export async function listBaseTables(schema: string): Promise<string[]> {
 }
 
 /** Does any relation (table, view, sequence…) already use this name? */
-export async function relationExists(schema: string, name: string): Promise<boolean> {
-  const rows = await q<{ found: boolean }>(`SELECT ${REL} IS NOT NULL AS found`, schema, name)
+export async function relationExists(at: WorkspaceAt, name: string): Promise<boolean> {
+  const rows = await on(at.db)<{ found: boolean }>(`SELECT ${REL} IS NOT NULL AS found`, at.schema, name)
   return rows[0]?.found === true
 }
 
@@ -212,8 +214,10 @@ export async function relationExists(schema: string, name: string): Promise<bool
  * Every query is keyed on the same `to_regclass` so a table renamed between two
  * of them reads as absent rather than as a mixture of two tables.
  */
-export async function readTableFacts(schema: string, table: string): Promise<TableFacts | null> {
+export async function readTableFacts(at: WorkspaceAt, table: string): Promise<TableFacts | null> {
   if (!IDENT.test(table)) return null
+  const { schema } = at
+  const q = on(at.db)
 
   const rel = await q<{
     oid: unknown; relkind: string; owner: string; rls: boolean; force: boolean

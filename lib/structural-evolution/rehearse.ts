@@ -85,7 +85,7 @@
 
 import { createHash } from 'node:crypto'
 import type { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/db'
+import type { WorkspaceAt } from './workspace'
 import type { RlsIdentity } from '@/lib/services/rls-session'
 import { granteesWith, type TableFacts } from './facts'
 import { reconcileWith } from './reconcile'
@@ -188,6 +188,8 @@ const brief = (err: string) => {
 const SERVICE: RlsIdentity = { userId: '', isServiceRole: true, userRole: 'service' }
 
 export async function rehearseExtraction(
+  /** The project's own database: the copy is made, exercised and rolled back where its rows are. */
+  at: WorkspaceAt,
   facts: TableFacts,
   spec: ExtractionSpec,
   planId: string,
@@ -229,7 +231,7 @@ export async function rehearseExtraction(
   const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
 
   try {
-    await prisma.$transaction(
+    await at.db.$transaction(
       async tx => {
         const exec = (sql: string, ...p: unknown[]) => tx.$executeRawUnsafe(sql, ...p)
         const rows = <T = Record<string, unknown>>(sql: string, ...p: unknown[]) => tx.$queryRawUnsafe<T[]>(sql, ...p)

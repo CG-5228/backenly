@@ -37,6 +37,7 @@ import { extractionPlanId, requiredTier, type ExtractionPlan, type ExtractionSte
 import { normaliseSpec, resolveExtractionPlan, isResolveRefusal } from './resolve'
 import { readTableFacts } from './facts'
 import { rehearseExtraction } from './rehearse'
+import { workspaceAt } from './workspace'
 import { grantEvolutionApproval, isGrantRefusal, readLiveEvolutionApproval, revokeEvolutionApproval, isRevokeRefusal } from './consent'
 import { executeExtraction } from './execute'
 import { reconcileExtraction } from './reconcile'
@@ -193,7 +194,8 @@ export const structuralExtraction: EvolutionPrimitive<ExtractionSpec, Structural
   },
 
   async rehearse(projectId, plan): Promise<Rehearsal> {
-    const facts = await readTableFacts(plan.schema, plan.spec.host)
+    const at = await workspaceAt(projectId)
+    const facts = await readTableFacts(at, plan.spec.host)
     if (!facts) {
       return {
         passed: false,
@@ -203,7 +205,7 @@ export const structuralExtraction: EvolutionPrimitive<ExtractionSpec, Structural
         report: null,
       }
     }
-    const r = await rehearseExtraction(facts, plan.spec, plan.planId)
+    const r = await rehearseExtraction(at, facts, plan.spec, plan.planId)
     const auth = (r as { authorization?: { status?: 'passed' | 'failed' | 'unavailable'; detail?: string } }).authorization
     const exercised = r.exercises.filter(e => e.outcome === 'passed').length
     return {
@@ -261,7 +263,7 @@ export const structuralExtraction: EvolutionPrimitive<ExtractionSpec, Structural
   },
 
   async verify(projectId, plan) {
-    const facts = await readTableFacts(plan.schema, plan.spec.host)
+    const facts = await readTableFacts(await workspaceAt(projectId), plan.spec.host)
     if (!facts) return { consistent: false, summary: `${plan.spec.host} no longer exists`, detail: null }
     const r = await reconcileExtraction(projectId, facts, plan.spec)
     return { consistent: r.consistent, summary: r.summary, detail: r }

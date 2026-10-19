@@ -86,6 +86,7 @@ import { CONSISTENCY_SIGNAL } from '@/lib/evolution-engine/observe'
 import { MIN_INCIDENTS } from '@/lib/autonomy/maintenance/outcome'
 import type { ExtractionPlan } from './plan'
 import { readTableFacts } from './facts'
+import { workspaceAt, type WorkspaceAt } from './workspace'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite } from './primitives'
 import { columnHistory, readRepairs, readSnapshots, type SnapshotRow } from './sensing'
@@ -197,7 +198,8 @@ type Unavailable = TelemetrySnapshot['unavailable'][number]
 // ── Small helpers ────────────────────────────────────────────────────────────
 
 type Query = <T = Record<string, unknown>>(sql: string, ...params: unknown[]) => Promise<T[]>
-const platform: Query = (sql, ...params) => prisma.$queryRawUnsafe(sql, ...params) as Promise<any>
+/** Statistics live with the tables: the project's own region's database (./workspace.ts). */
+const onWorkspace = (at: WorkspaceAt): Query => (sql, ...params) => at.db.$queryRawUnsafe(sql, ...params) as Promise<any>
 
 const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(v))
 const numOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v))
@@ -294,11 +296,12 @@ export async function readRequestWindow(
 // ── Table counters ───────────────────────────────────────────────────────────
 
 async function readCounters(
+  run: Query,
   schema: string,
   host: string,
   satellite: string,
 ): Promise<{ host: TableCounters | null; satellite: TableCounters | null; statsReset: string | null }> {
-  const rows = await platform(
+  const rows = await run(
     `SELECT v.role, c.oid::int8 AS oid,
             s.n_tup_ins::int8 AS ins, s.n_tup_upd::int8 AS upd, s.n_tup_hot_upd::int8 AS hot,
             s.n_tup_del::int8 AS del, s.n_live_tup::int8 AS live, s.n_dead_tup::int8 AS dead,
@@ -371,15 +374,15 @@ const CLASS_SQL = (toplevel: boolean) => `
 /**
  * Per-class sums of pg_stat_statements for the host and the satellite.
  *
- * `run` defaults to the platform connection; it is a parameter so a test can
- * read as a role that cannot see other roles' statement text and prove the
- * reading says so instead of reporting no work.
+ * `run` is the project's own database, where its statements were counted; a
+ * test passes one that reads as a role that cannot see other roles' statement
+ * text, and proves the reading says so instead of reporting no work.
  */
 export async function readStatementClasses(
   schema: string,
   host: string,
   satellite: string,
-  run: Query = platform,
+  run: Query,
 ): Promise<StatementReading> {
   const none = (state: StatementCapability, detail: string, hidden = 0): StatementReading => ({
     state,
@@ -512,11 +515,14 @@ export async function observeExtraction(
 ): Promise<ObservationSignal[]> {
   const { host, satellite } = plan.spec
   const signals: ObservationSignal[] = []
+  // Outside the fail-soft reads below: a region this process cannot reach is
+  // not an observation that something is unavailable; nothing was observed.
+  const at = await workspaceAt(projectId)
 
   let present: 'ours' | 'gone' | 'foreign' | 'unknown' = 'unknown'
   let satDetail = ''
   try {
-    const sat = await readTableFacts(plan.schema, satellite)
+    const sat = await readTableFacts(at, satellite)
     present = !sat ? 'gone' : isOurSatellite(sat, plan.spec) ? 'ours' : 'foreign'
   } catch (err) {
     satDetail = errText(err)
@@ -544,7 +550,7 @@ export async function observeExtraction(
   } else {
     let consistency: ObservationSignal
     try {
-      const facts = await readTableFacts(plan.schema, host)
+      const facts = await readTableFacts(at, host)
       if (!facts) {
         consistency = { name: CONSISTENCY_SIGNAL, status: 'regressed', detail: `${host} no longer exists` }
       } else {
@@ -590,13 +596,16 @@ export async function snapshotExtraction(
 ): Promise<TelemetrySnapshot> {
   const { host, satellite } = plan.spec
   const unavailable: Unavailable[] = []
+  // Resolved before any fail-soft read below: a region this process cannot
+  // reach is not "no statistics yet".
+  const run = onWorkspace(await workspaceAt(projectId))
 
   const [counters, statements] = await Promise.all([
-    readCounters(plan.schema, host, satellite).catch(err => {
+    readCounters(run, plan.schema, host, satellite).catch(err => {
       unavailable.push({ metric: 'tables', reason: 'not_yet_measurable', detail: `table statistics could not be read: ${errText(err)}` })
       return { host: null, satellite: null, statsReset: null }
     }),
-    readStatementClasses(plan.schema, host, satellite),
+    readStatementClasses(plan.schema, host, satellite, run),
   ])
   if (statements.state !== 'available') {
     unavailable.push({

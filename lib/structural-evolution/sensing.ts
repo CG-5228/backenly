@@ -33,6 +33,7 @@
 
 import { prisma } from '@/lib/db'
 import type { TableFacts } from './facts'
+import type { WorkspaceAt } from './workspace'
 import {
   creationColumn,
   timestampColumns,
@@ -57,7 +58,7 @@ const q = (name: string) => `"${name.replace(/"/g, '""')}"`
 
 export type SampleResult = { sample: PresenceSample } | { unavailable: string }
 
-export async function samplePresence(facts: TableFacts, columns: string[]): Promise<SampleResult> {
+export async function samplePresence(at: WorkspaceAt, facts: TableFacts, columns: string[]): Promise<SampleResult> {
   const cols = columns.slice(0, MAX_SAMPLED_COLUMNS)
   if (cols.length < 2) return { unavailable: 'fewer than two candidate columns to compare' }
 
@@ -82,7 +83,8 @@ export async function samplePresence(facts: TableFacts, columns: string[]): Prom
 
   try {
     const { rlsSessionSql, rlsSessionParams } = await import('@/lib/services/rls-session')
-    const rows = await prisma.$transaction(async tx => {
+    // The rows are in the project's own region.
+    const rows = await at.db.$transaction(async tx => {
       await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '15s'`)
       // As the platform: every workspace table is FORCE ROW LEVEL SECURITY, and
       // a sample read as nobody would see no rows and call every column absent.

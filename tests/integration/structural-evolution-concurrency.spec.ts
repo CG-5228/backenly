@@ -43,6 +43,7 @@ import { executeExtraction } from '@/lib/structural-evolution/execute'
 import { handleEvolutionBackfillJob, LOCKED_ROW_RETRY_MS } from '@/lib/structural-evolution/backfill-job'
 import { reconcileExtraction } from '@/lib/structural-evolution/reconcile'
 import { readTableFacts, basisFingerprint } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { backfillBatchSql, type ExtractionSpec } from '@/lib/structural-evolution/sql'
 import { BACKFILL_BATCH_ROWS } from '@/lib/structural-evolution/plan'
 
@@ -138,7 +139,7 @@ function agree(v: { host: string; sat: string | null }): boolean {
 }
 
 async function consistent(): Promise<void> {
-  const r = await reconcileExtraction(projectId, (await readTableFacts(schema, 'orders'))!, SPEC)
+  const r = await reconcileExtraction(projectId, (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!, SPEC)
   expect(r.summary).toMatch(/match/)
   expect(r.consistent).toBe(true)
 }
@@ -235,7 +236,7 @@ describe('the backfill', () => {
     const writer = await connect()
     await writer.query('BEGIN')
     await writer.query(`UPDATE ${t('orders')} SET total = total WHERE id = 3`)
-    const facts = (await readTableFacts(schema, 'orders'))!
+    const facts = (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!
     const started = Date.now()
     const err = await settle(
       prisma.$transaction(tx => tx.$queryRawUnsafe(backfillBatchSql(facts, SPEC, { schema }, BACKFILL_BATCH_ROWS), null)),
@@ -249,7 +250,7 @@ describe('the backfill', () => {
     const writer = await connect()
     await writer.query('BEGIN')
     await writer.query(`UPDATE ${t('orders')} SET total = total WHERE id = 4`)
-    const facts = (await readTableFacts(schema, 'orders'))!
+    const facts = (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!
     const payload = { projectId, planId, planVersion, basisFingerprint: basisFingerprint(facts), spec: SPEC, cursor: null }
     const run = handleEvolutionBackfillJob(payload)
     // Released after the first retry wait, before the last.
@@ -264,7 +265,7 @@ describe('the backfill', () => {
     const writer = await connect()
     await writer.query('BEGIN')
     await writer.query(`UPDATE ${t('orders')} SET total = total WHERE id = 6`)
-    const facts = (await readTableFacts(schema, 'orders'))!
+    const facts = (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!
     const payload = { projectId, planId, planVersion, basisFingerprint: basisFingerprint(facts), spec: SPEC, cursor: null }
     const err = await settle(handleEvolutionBackfillJob(payload))
     expect(String((err as Error)?.message)).toMatch(/55P03|could not obtain lock/)

@@ -20,6 +20,7 @@ import { prisma } from '@/lib/db'
 import { jwtClaimFunctionSql } from '@/lib/postgrest/rls-translation'
 import { rlsSessionParams, rlsSessionSql, type RlsIdentity } from '@/lib/services/rls-session'
 import { granteesWith, readTableFacts, type TableFacts } from '@/lib/structural-evolution/facts'
+import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import {
   backfillBatchSql,
   carriedObjects,
@@ -86,7 +87,7 @@ export async function ownedWorkspace(label: string, spec: ExtractionSpec, setup:
     t,
     as,
     within,
-    facts: async () => (await readTableFacts(schema, spec.host))!,
+    facts: async () => (await readTableFacts(workspaceOn(prisma, schema), spec.host))!,
     drop: async () => {
       await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {})
       await prisma.$executeRawUnsafe(`DROP ROLE IF EXISTS "${client}"`).catch(() => {})

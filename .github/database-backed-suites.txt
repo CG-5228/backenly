@@ -1156,6 +1156,12 @@ tests/integration/structural-evolution-runtime-role.spec.ts
 # function that runs as the owner cannot be fired on another table.
 tests/integration/structural-evolution-semantics.spec.ts
 
+# An extraction of a project kept in another region happens in that region: a
+# second database stands in for us-east-1, holds the project's tables alone, and
+# analysis, rehearsal, every rung, the backfill, reconciliation and undo run
+# there, and nothing is ever found at home.
+tests/integration/structural-evolution-regional.spec.ts
+
 # Whether a user's coding agent is connected: an MCP key or OAuth connection
 # their agent authenticated with (authenticateMcp's stamp), unexpired, for this
 # user and this project only, and the console status route built on it: owner
