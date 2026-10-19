@@ -22,7 +22,20 @@
  *     [--job-wait-minutes 15] [--repair-wait-minutes 6] [--freshness-seconds 30] \
  *     [--member <a developer or viewer of the probe project, by email>] \
  *     [--kill-command '<kills the process serving the control plane>'] [--kill-after-seconds 8] \
- *     [--settle-wait-minutes 30] [--skip-deletion-drill]
+ *     [--settle-wait-minutes 30] [--skip-deletion-drill] \
+ *     [--foreign <a project of another region>@<its region>,...]
+ *
+ * The home region (--region ap-south-1) is qualified the same way through the
+ * home host, which serves its data plane: --api is then the home host itself.
+ * Its snapshots and restores are taken by the home host while the request
+ * waits, and the two checks only a region's own host can make (no console
+ * paths; the home host's refusal) are reported as not run.
+ *
+ * --foreign names projects that live in other regions (the home region's probe
+ * project, another region's): the region's host must refuse each of them. No
+ * key of theirs is needed, since the refusal comes before any key is read, so
+ * name projects that exist: an id with no project resolves to the home region.
+ * Without it, that check is reported as not run.
  *
  * The member's password comes from BACKENLY_QUALIFY_MEMBER_PASSWORD (and its
  * current two-factor code, if it has two-factor sign-in, from
@@ -48,7 +61,9 @@
  * What it checks, in order:
  *   region     the region's host answers health; it serves no console path;
  *              the home host refuses the project with 421 WRONG_REGION, naming
- *              the region and its address
+ *              the region and its address; and the region's host refuses every
+ *              --foreign project the same way, on /api/v1 and /api/v2, naming
+ *              that project's region and an address that is not its own
  *   operator   the probe project's owner signs in at the home host
  *   fixtures   over MCP: the key is the probe project's; a table, an owner-only
  *              policy installed as exact SQL, end-user auth, realtime on the
@@ -84,7 +99,10 @@
  *              rows back. A restore is refused, changing nothing, while a later
  *              change depends on what it would undo. PostgREST at the region
  *              serves a new table, stops serving a restored one and serves a
- *              reapplied one within --freshness-seconds, each timed
+ *              reapplied one within --freshness-seconds, each timed, and so do
+ *              read_backend_state's tables and schema sections, what a coding
+ *              agent reads to learn the backend (one lagged a restore by 12
+ *              minutes once). The rollback check above is held to the same bound
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -129,7 +147,7 @@ import { Readable } from 'node:stream'
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 
 import { BackenlyClient } from '@/packages/sdk/src/index'
-import { findRegion } from '@/lib/regions'
+import { HOME_REGION, findRegion } from '@/lib/regions'
 
 // ── Arguments ────────────────────────────────────────────────────────────────
 
@@ -171,6 +189,8 @@ export interface QualifyArgs {
   killAfterSeconds: number
   /** How long the region's scheduler is given to settle a change whose process died. */
   settleWaitMinutes: number
+  /** Projects of other regions, which the region's host must refuse. Empty: that check is not run. */
+  foreign: Array<{ project: string; region: string }>
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -199,7 +219,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   const known = [
     '--project', '--region', '--api', '--home', '--connect', '--report', '--approval-wait-minutes', '--job-wait-minutes',
     '--repair-wait-minutes', '--operator', '--freshness-seconds', '--member', '--kill-command', '--kill-after-seconds',
-    '--settle-wait-minutes',
+    '--settle-wait-minutes', '--foreign',
   ]
   for (const f of flags.keys()) if (!known.includes(f)) throw new Error(`unknown option: ${f}`)
 
@@ -222,10 +242,15 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   }
   const api = url('--api')
   const home = url('--home')
-  if (!api.hostname.startsWith(`${region}.api.`)) {
-    throw new Error(`--api must be the region's host, ${region}.api.<domain>, not ${api.hostname}`)
+  if (region === HOME_REGION) {
+    // The home region's data plane is served by the home host itself.
+    if (api.origin !== home.origin) throw new Error(`--api must be the home host for ${HOME_REGION}, whose projects are served there`)
+  } else {
+    if (!api.hostname.startsWith(`${region}.api.`)) {
+      throw new Error(`--api must be the region's host, ${region}.api.<domain>, not ${api.hostname}`)
+    }
+    if (api.hostname === home.hostname) throw new Error('--api and --home are the same host: the region must be served apart from home')
   }
-  if (api.hostname === home.hostname) throw new Error('--api and --home are the same host: the region must be served apart from home')
 
   const connect: Record<string, string> = {}
   for (const pair of (flags.get('--connect') ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
@@ -284,6 +309,17 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   const settleWait = Number(flags.get('--settle-wait-minutes') ?? '30')
   if (!Number.isFinite(settleWait) || settleWait <= 0 || settleWait > 120) throw new Error('--settle-wait-minutes must be between 0 and 120')
 
+  const foreign: QualifyArgs['foreign'] = []
+  for (const item of (flags.get('--foreign') ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [id, other, extra] = item.split('@')
+    if (!id || !UUID.test(id) || !other || extra !== undefined) throw new Error(`--foreign takes <project id>@<region> pairs, not "${item}"`)
+    const known = findRegion(other)
+    if (!known) throw new Error(`--foreign names "${other}", which is not a Backenly Cloud region`)
+    if (known.id === region) throw new Error(`--foreign ${id} is in ${region}, the region being qualified: name a project of another region`)
+    if (id.toLowerCase() === project.toLowerCase()) throw new Error('--foreign must not name the probe project')
+    foreign.push({ project: id, region: known.id })
+  }
+
   return {
     project,
     region,
@@ -306,6 +342,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     killCommand,
     killAfterSeconds: killAfter,
     settleWaitMinutes: settleWait,
+    foreign,
   }
 }
 
@@ -642,6 +679,40 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
   const snapshotsPath = `/api/projects/${args.project}/backup`
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
+  /**
+   * How long after `since` both of what a coding agent reads to learn the
+   * backend list `table`, or stop listing it, within --freshness-seconds:
+   * read_backend_state's "tables" section, which answers from the platform's
+   * table registry that a change or a restore refreshes when it settles (once
+   * it went on describing a restored table for 12 minutes), and its "schema"
+   * section, which reads the region's live catalog. `firstRead` says the very
+   * first read already agreed, so the time is an upper bound set by the checks
+   * before this one, not a measured lag.
+   */
+  async function untilDescribed(table: string, want: 'listed' | 'gone', since: number): Promise<{ ms: number; firstRead: boolean }> {
+    const named = new RegExp(`\\b${table}\\b`)
+    const bound = since + args.freshnessSeconds * 1_000
+    for (let read = 1; ; read++) {
+      const behind: string[] = []
+      for (const section of ['tables', 'schema'] as const) {
+        const listed = named.test((await mcp!.call('read_backend_state', { section })).text)
+        if (want === 'listed' ? !listed : listed) behind.push(section)
+      }
+      if (behind.length === 0) return { ms: Date.now() - since, firstRead: read === 1 }
+      if (Date.now() > bound) {
+        throw new Error(
+          `read_backend_state's ${behind.join(' and ')} section${behind.length > 1 ? 's' : ''} ` +
+            `${want === 'listed' ? 'still did not list' : 'still listed'} ${table} ${args.freshnessSeconds} s after it was asked for`,
+        )
+      }
+      await new Promise((r) => setTimeout(r, 1_000))
+    }
+  }
+  /** The detail of a passing freshness check. */
+  const described = (what: string, table: string, t: { ms: number; firstRead: boolean }, after: string) =>
+    `read_backend_state's tables and schema sections ${what} ${table} ${t.firstRead ? 'by the first read, ' : ''}` +
+    `${seconds(t.ms)} after ${after}`
+
   /** Wait for a snapshot or restore the home host queued, until its region has done it. */
   async function untilRegionDone(jobId: string, what: string): Promise<void> {
     const deadline = Date.now() + args.jobWaitMinutes * 60_000
@@ -705,7 +776,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(res.status === 200, `GET /api/v1/<project>/healthz at the region answered ${res.status}`)
       return 'the region serves the project'
     })
-    await check('region', 'no-console', [], async () => {
+    // The home region is served by the home host, which serves the console and
+    // has no home to refuse its projects: those two checks are a region's.
+    const atHome = args.region === HOME_REGION
+    if (atHome) {
+      notRun.push(`no console at the region host, and the home host's refusal of the project (${HOME_REGION} is served by the home host)`)
+    } else await check('region', 'no-console', [], async () => {
       for (const path of ['/app', '/api/projects', '/login']) {
         const res = await theFetch(apiUrl(path), { redirect: 'manual' })
         const body = await json(res)
@@ -713,7 +789,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       }
       return 'console paths are answered 404 by the region\'s load balancer'
     })
-    await check('region', 'wrong-region-at-home', [], async () => {
+    if (!atHome) await check('region', 'wrong-region-at-home', [], async () => {
       const res = await theFetch(homeUrl(`/api/v1/${args.project}/healthz`), { headers: { 'x-api-key': args.projectKey } })
       const body = await json(res)
       must(res.status === 421, `the home host answered ${res.status} for the regional project, not 421`)
@@ -721,6 +797,43 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(typeof body.apiUrl === 'string' && body.apiUrl.startsWith(args.api.origin), `the refusal points to ${body.apiUrl}, not the region's host`)
       return `421 WRONG_REGION, pointing to ${body.apiUrl}`
     })
+    // The other direction: this region's host serves only its own projects. A
+    // project of another region is refused before anything about it, its key
+    // included, is read here, so no key of it is needed.
+    if (args.foreign.length === 0) {
+      notRun.push('cross-region isolation at the region host: --foreign named no project of another region')
+    }
+    for (const other of args.foreign) {
+      await check('region', `refuses-${other.region}-project`, [], async () => {
+        const answers: string[] = []
+        for (const path of [`/api/v1/${other.project}/healthz`, `/api/v2/${other.project}/${TABLE}?select=*&limit=1`]) {
+          const res = await theFetch(apiUrl(path))
+          const body = await json(res)
+          const route = path.split('/').slice(0, 3).join('/')
+          must(res.status === 421, `${route} at the ${args.region} host answered ${res.status} for a ${other.region} project, not 421`)
+          must(
+            body.code === 'WRONG_REGION' && body.region === other.region,
+            `the refusal on ${route} names ${body.code}/${body.region}, not WRONG_REGION/${other.region}`,
+          )
+          // The address is a courtesy (lib/data-plane/serving.ts): a regional host
+          // knows its own and the home host's, so another region's may be null.
+          // When given, it must be the project's and never this host.
+          if (body.apiUrl === null && other.region !== HOME_REGION) {
+            answers.push(`${route} 421 with no address (this host is not given ${other.region}'s)`)
+            continue
+          }
+          must(
+            typeof body.apiUrl === 'string' && body.apiUrl.includes(other.project) && !body.apiUrl.startsWith(args.api.origin),
+            `the refusal on ${route} points to ${body.apiUrl}, not the project's own region`,
+          )
+          if (other.region === HOME_REGION) {
+            must(body.apiUrl.startsWith(args.home.origin), `the refusal on ${route} points to ${body.apiUrl}, not the home host`)
+          }
+          answers.push(`${route} 421 to ${body.apiUrl}`)
+        }
+        return `the ${args.region} host refuses ${other.region} project ${other.project.slice(0, 8)}: ${answers.join('; ')}`
+      })
+    }
 
     // ── operator ─────────────────────────────────────────────────────────────
     log('\n── operator (control plane, signed in)')
@@ -1040,7 +1153,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       restorable = { id: made.id, seq: made.seq }
       return `${rollbackTable} created over MCP as change #${made.seq}, applied and verified`
     })
+    let undoneAt = 0
     await check('rollback', 'undone', ['change', 'insert-a'], async () => {
+      undoneAt = Date.now()
       const restored = await restoreFromConsole(restorable!)
       // The region's live catalog: the restore runs on the region's database.
       const gone = await mcp!.call('get_table_schema', { tableName: rollbackTable }).then((o) => o.text, (err: unknown) => describeError(err))
@@ -1050,6 +1165,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const rows: Array<{ body: string }> = await users.a!.client[TABLE].list({ limit: 100 })
       must(rows.some((r) => r.body === `${run}-a`), `user a no longer sees its row in ${TABLE} after the restore`)
       return `restored the state before #${restorable!.seq} (${restored}): ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
+    })
+    await check('rollback', 'described-after-undo', ['undone'], async () => {
+      return described('stopped describing', rollbackTable, await untilDescribed(rollbackTable, 'gone', undoneAt), 'the restore was asked for')
     })
 
     // ── autonomy: a fault the region repairs on its own ──────────────────────
@@ -1258,15 +1376,21 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
 
     const keptTable = `qualify_kept_${run}`
     let kept: { id: string; seq: number } | null = null
+    /** When the drill's change, its acknowledged restore and the reapply were each asked for. */
+    const keptAt = { applied: 0, restored: 0, reapplied: 0 }
     await check('rollback-drills', 'served-after-a-change', ['nothing-waiting'], async () => {
       const started = Date.now()
       await fixture('apply_migration', { sql: `CREATE TABLE ${keptTable} (note text)` })
       const applied = Date.now()
+      keptAt.applied = applied
       const made = await changeTouching(keptTable, seqBeforeDrills)
       must(made.outcome.state === 'healthy', `the change that created ${keptTable} is ${made.outcome.state}, not applied and verified`)
       kept = { id: made.id, seq: made.seq }
       const ms = await untilServed(keptTable, 'served', applied)
       return `change #${made.seq} applied and verified in ${seconds(applied - started)}; PostgREST at the region served ${keptTable} ${seconds(ms)} later`
+    })
+    await check('rollback-drills', 'described-after-a-change', ['served-after-a-change'], async () => {
+      return described('described', keptTable, await untilDescribed(keptTable, 'listed', keptAt.applied), 'the change applied')
     })
 
     await check('rollback-drills', 'agent-asks-a-person-decides', ['served-after-a-change'], async () => {
@@ -1308,6 +1432,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     let recoveryRecord: string | null = null
     await check('rollback-drills', 'restored-with-acknowledgement', ['restore-needs-a-person'], async () => {
       const asked = Date.now()
+      keptAt.restored = asked
       const res = await changeCall(args.project, kept!.id, 'restore', { seq: kept!.seq, acknowledged: acknowledgement })
       must(res.status === 200 && res.body.status === 'restored', `the acknowledged restore answered ${res.status}: ${String(res.body.error ?? '').slice(0, 200)}`)
       must(res.body.verification?.outcome === 'confirmed', `#${kept!.seq} was restored but not verified against its restore point`)
@@ -1315,6 +1440,9 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must((await columnsOf(keptTable)) === null, `${keptTable} is still in the region's schema after the restore`)
       const ms = await untilServed(keptTable, 'gone', asked)
       return `restored as #${res.body.recoverySeq} and verified, its 3 rows kept aside; PostgREST at the region stopped serving ${keptTable} ${seconds(ms)} after the restore was asked for`
+    })
+    await check('rollback-drills', 'described-after-acknowledged-restore', ['restored-with-acknowledgement'], async () => {
+      return described('stopped describing', keptTable, await untilDescribed(keptTable, 'gone', keptAt.restored), 'the restore was asked for')
     })
 
     await check('rollback-drills', 'reapplied-and-served', ['restored-with-acknowledgement'], async () => {
@@ -1326,12 +1454,16 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         `reapplying #${kept!.seq} is ${preview?.safety ?? 'not previewed'}: ${String(preview?.reason ?? '').slice(0, 200)}`,
       )
       const asked = Date.now()
+      keptAt.reapplied = asked
       const res = await changeCall(args.project, recoveryRecord!, 'restore', { seq: preview.seq })
       must(res.status === 200 && res.body.verification?.outcome === 'confirmed', `the reapply answered ${res.status}: ${String(res.body.error ?? '').slice(0, 200)}`)
       const ms = await untilServed(keptTable, 'served', asked)
       const rows = toolData<{ rows?: unknown[] }>(await mcp!.call('db_query', { table: keptTable, limit: 10 }))?.rows ?? []
       must(rows.length === 3, `${keptTable} came back with ${rows.length} rows, not its 3`)
       return `reapplied and verified, with its 3 rows; PostgREST at the region served ${keptTable} again ${seconds(ms)} after the reapply was asked for`
+    })
+    await check('rollback-drills', 'described-after-reapply', ['reapplied-and-served'], async () => {
+      return described('described again', keptTable, await untilDescribed(keptTable, 'listed', keptAt.reapplied), 'the reapply was asked for')
     })
 
     const parentTable = `qualify_parent_${run}`
@@ -1378,11 +1510,17 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const started = Date.now()
       const res = await theFetch(homeUrl(snapshotsPath), asOperator({ method: 'POST' }))
       const body = await json(res)
-      // A snapshot of a regional project taken at home would be a full copy of
-      // its data outside its region: home must queue it for the region instead.
-      must(res.status === 202 && body.queued === true, `asking for a snapshot answered ${res.status}, not 202 queued for the region`)
-      must(body.region === args.region, `the snapshot was queued for ${body.region}, not ${args.region}`)
-      await untilRegionDone(body.jobId, 'the snapshot')
+      if (atHome) {
+        // A home project's snapshot is taken by the home host, while it waits;
+        // the list below finds it (the answer describes the file, not its row).
+        must(res.status === 201 && body.success === true, `asking for a snapshot answered ${res.status}, not 201 with the snapshot`)
+      } else {
+        // A snapshot of a regional project taken at home would be a full copy of
+        // its data outside its region: home must queue it for the region instead.
+        must(res.status === 202 && body.queued === true, `asking for a snapshot answered ${res.status}, not 202 queued for the region`)
+        must(body.region === args.region, `the snapshot was queued for ${body.region}, not ${args.region}`)
+        await untilRegionDone(body.jobId, 'the snapshot')
+      }
       const taken = ((await operatorJson(snapshotsPath)).data ?? []).filter((s: { id: string }) => !known.has(s.id))
       must(taken.length === 1 && taken[0].status === 'completed', `expected one new completed snapshot, found ${taken.length}`)
       snapshotId = taken[0].id
@@ -1390,6 +1528,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     })
     await check('recovery', 'download-from-region', ['snapshot'], async () => {
       const res = await theFetch(homeUrl(`${snapshotsPath}/${snapshotId}/download`), asOperator({ redirect: 'manual' }))
+      if (atHome) {
+        // The home region's snapshots are kept by the home host, which sends the file itself.
+        const bytes = Buffer.from(await res.arrayBuffer())
+        must(res.status === 200 && bytes[0] === 0x1f && bytes[1] === 0x8b, `the download answered ${res.status} with ${bytes.length} bytes that are not a gzip`)
+        return `${bytes.length} gzip bytes from the home host, which keeps the home region's snapshots`
+      }
       must(res.status === 302, `the download answered ${res.status}, not a redirect to the region's bucket`)
       const link = new URL(res.headers.get('location') ?? 'invalid:')
       must(
@@ -1413,8 +1557,12 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       const started = Date.now()
       const res = await theFetch(homeUrl(snapshotsPath), asOperator({ method: 'PUT', body: JSON.stringify({ backupId: snapshotId }) }))
       const body = await json(res)
-      must(res.status === 202 && body.queued === true && body.region === args.region, `asking for the restore answered ${res.status}, not 202 queued for ${args.region}`)
-      await untilRegionDone(body.jobId, 'the restore')
+      if (atHome) {
+        must(res.status === 200 && body.success === true, `asking for the restore answered ${res.status}: ${String(body.error ?? '').slice(0, 200)}`)
+      } else {
+        must(res.status === 202 && body.queued === true && body.region === args.region, `asking for the restore answered ${res.status}, not 202 queued for ${args.region}`)
+        await untilRegionDone(body.jobId, 'the restore')
+      }
       const took = Date.now() - started
       for (const who of ['a', 'b'] as const) {
         const now = await idsOf(who)
@@ -1602,7 +1750,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         )
         const made = await json(created)
         must(created.status === 201 && typeof made.data?.id === 'string', `creating a project in ${args.region} answered ${created.status}: ${String(made.error ?? '').slice(0, 200)}`)
-        must(made.data.region === args.region, `the new project is in ${made.data.region}, not ${args.region}`)
+        // A home project's region may be recorded as null, which is the home region.
+        must((made.data.region ?? HOME_REGION) === args.region, `the new project is in ${made.data.region}, not ${args.region}`)
         const doomed = made.data.id as string
         const doomedKey = typeof made.apiKey === 'string' ? made.apiKey : null
         let deleted = false
