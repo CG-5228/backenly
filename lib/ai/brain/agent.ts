@@ -1,20 +1,29 @@
 /**
  * BRAIN AGENT — the loop
  * ======================
- * The single entry point for the new agentic chat path. Replaces the 25-stage
- * regex pipeline and the legacy `agent-loop-v2`. The shape is the same one
- * Cursor / Replit / Lovable use:
+ * The single entry point for a natural-language turn. Its caller is MCP
+ * `backend_chat` (app/api/mcp/chat/route.ts), which queues every call the
+ * approval gate stops in the Review Queue; an approved call later runs
+ * verbatim through dispatchTool (lib/mcp/approvals.ts), not through this loop.
+ * Replaces the 25-stage regex pipeline and the legacy `agent-loop-v2`. The
+ * shape is the same one Cursor / Replit / Lovable use:
  *
  *   load memory → classify intent → route → (loop tool-use) → verify → finish
  *
  * Routing decisions per intent (made BEFORE the agent loop runs):
- *   CHAT            → call answer_question tool once, return.
- *   UNCLEAR         → call ask_user once, return.
- *   APPLY_PROPOSAL  → call apply_proposal once, return.
- *   CONFIRM         → resume any pending plan (currently surfaced via context;
- *                     the agent prompt is told the prior plan exists).
- *   BUILD / MODIFY / FIX / QUESTION / DESTRUCTIVE → enter the agent loop with
- *                     intent-specific hints in the system prompt.
+ *   CHAT            → call answer_question once, return.
+ *   UNCLEAR         → ask one clarifying question (ask_user), return. On an
+ *                     empty project, a message that reads like an app
+ *                     description goes to the architect first, as a BUILD.
+ *   BUILD / APPLY_PROPOSAL on an empty project
+ *                   → propose a blueprint (curated, or the architect's design)
+ *                     and save it as the pending plan; ask_user when the
+ *                     request is too vague to design.
+ *   CONFIRM         → run the pending blueprint plan, else the resume queue,
+ *                     else the original build request, re-architected. With
+ *                     nothing pending at all, say so and change nothing.
+ *   anything else, or a route above with nothing to run
+ *                   → the agent loop, with an intent-specific hint.
  *
  * This is what makes "give me competitors" NEVER trigger a build:
  *   1. The LLM classifier returns CHAT with high confidence.
@@ -119,9 +128,9 @@ export interface BrainInput {
   // verbatim (lib/mcp/approvals.ts runApprovedCall). Approval is a decision a
   // person makes in the dashboard, never something a message can carry.
   /**
-   * Per-turn idempotency key (UUID) passed down to `saveTurn`/`saveMessages`
-   * so the conversation log dedups
-   * cleanly across writers (route handler, brain terminal paths, retries).
+   * Per-turn idempotency key (UUID) passed down to `saveTurn`/`saveMessages`,
+   * so a turn written twice, by a retry say, is logged once. backend_chat
+   * sends none.
    */
   requestId?: string | null
   /** The caller that opened this turn. Unlike `surface`, this is not page context. */
@@ -146,8 +155,8 @@ export interface BrainInput {
    * (see `verifyWithinBudget`). Verification is no longer a step the model may or
    * may not reach; it is a budget line item that is spent first from the end.
    *
-   * Omit it and the loop behaves exactly as before — the dashboard has no hard
-   * cap, only the MCP transport does.
+   * Omit it and the loop has no wall clock of its own. backend_chat always
+   * passes one, from its 90s cap.
    */
   deadlineAt?: number
   /**
@@ -177,10 +186,10 @@ export type BrainEvent =
   | { type: 'tool_done'; tool: string; title: string; detail?: string }
   | { type: 'tool_fail'; tool: string; title: string; detail?: string }
   /**
-   * A destructive tool was blocked pending explicit user confirmation. Carries
-   * everything the chat needs to render a structured danger card: what would
-   * be destroyed, how many live rows are at stake (best-effort COUNT), and the
-   * exact phrase the user must provide to confirm the destructive action.
+   * A call the approval gate stopped: it did not run, and the caller queues it
+   * for a person from BrainResult.blockedCalls. This names the same target and
+   * live row count (best-effort COUNT). No message approves a call, so
+   * `confirmPhrase` is a label, not something to type.
    */
   | {
       type: 'danger'
@@ -207,9 +216,7 @@ export interface BrainResult {
   tokensUsed: number
   /**
    * True when this turn already ran the behavioral fix-loop against the live
-   * runtime (the deterministic blueprint executor does). The execute route
-   * checks this to avoid running a SECOND, redundant verification pass — which
-   * would double the time budget and sign up throwaway end-users twice.
+   * runtime (the deterministic blueprint executor does).
    */
   verifiedInline?: boolean
   /**
@@ -378,16 +385,12 @@ const ARCHITECT_HEARTBEAT_MESSAGES = [
 ] as const
 
 /**
- * Run `work` while emitting a keep-alive progress event every `intervalMs`.
+ * Run `work` while emitting a progress event every `intervalMs`.
  *
- * WHY THIS EXISTS: the execute route arms a 90s idle watchdog that closes the
- * SSE stream if the brain stops sending updates for too long.
  * The LLM architect is a SINGLE 30–180s design call that emits nothing on its
- * own — and `architectBackend` deliberately budgets up to 180s per attempt.
- * Without a heartbeat, any healthy big-spec design that runs past 90s is killed
- * mid-generation and the whole build collapses into the fragile agent loop —
- * the exact failure behind the Founder Outreach "continue" loop. Each emitted
- * event resets the route's idle timer, so a legitimately long design survives.
+ * own (`architectBackend` budgets up to 180s per attempt), so these lines are
+ * all the turn's events show meanwhile; backend_chat returns them in `events`.
+ * They extend nothing: backend_chat's 90s cap is a hard wall clock.
  */
 async function withHeartbeat<T>(
   emit: (e: BrainEvent) => void,
@@ -409,8 +412,8 @@ async function withHeartbeat<T>(
 }
 
 /**
- * Resolve a Blueprint for a prompt, keeping the SSE stream alive during the
- * long architect call. Never throws — a failure resolves to null so the caller
+ * Resolve a Blueprint for a prompt, emitting progress during the long
+ * architect call. Never throws — a failure resolves to null so the caller
  * falls back to the agent loop exactly as it does today.
  */
 async function resolveBlueprintWithHeartbeat(
@@ -657,8 +660,8 @@ export async function runBrain(
 
     // No stored plan at all — but the user is confirming/continuing a build.
     // This is the state that produced the endless "continue" loop: the
-    // architect had failed on the original turn (e.g. the idle watchdog killed
-    // it, or a transient model error), so no pending plan was ever saved, and
+    // architect had failed on the original turn (e.g. the time limit cut it
+    // off, or a transient model error), so no pending plan was ever saved, and
     // the build fell into the agent loop — which cannot finish a 40-operation
     // spec in 12 iterations and just re-derives partial work on every retry.
     //
@@ -969,8 +972,8 @@ async function blueprintExecuteTurn(
         },
       })
       // Prose summary + the structured evidence fence. The fence rides inside
-      // the persisted message, so the chat renders a real evidence card (per
-      // check: what was exercised, what came back) on live stream AND refresh.
+      // the summary, so backend_chat's caller and the saved conversation both
+      // get each check's evidence (what was exercised, what came back).
       const { buildVerificationFence } = await import('../verification-evidence')
       const fence = buildVerificationFence(fixResult)
       verificationBlock = [renderVerificationBlock(fixResult), fence].filter(Boolean).join('\n\n')
@@ -1038,8 +1041,6 @@ async function blueprintExecuteTurn(
     toolsRun,
     classification,
     tokensUsed,
-    // The behavioral fix-loop already ran above — tell the route not to run it
-    // a second time (see BrainResult.verifiedInline).
     verifiedInline: succeededSteps.length > 0,
   }
 }
@@ -1078,8 +1079,9 @@ function renderVerificationBlock(result: FixLoopResult): string {
 }
 
 /**
- * Describe a blocked destructive tool for the chat's danger card. Best-effort
- * row count via the workspace-table-stats kernel (cached COUNT — cheap).
+ * Describe a call the approval gate stopped, for the Review Queue request the
+ * caller files from it (BlockedCall). Best-effort row count via the
+ * workspace-table-stats kernel (cached COUNT — cheap).
  * Honesty rules baked in:
  *   • A dropped table or column is reversible because its data is not
  *     destroyed: inside a recorded change it moves into the change's vault and
@@ -1087,8 +1089,6 @@ function renderVerificationBlock(result: FixLoopResult): string {
  *     the ledger is on; without it the old answer, irreversible, is the true one.
  *   • Truncation deletes rows, which are data rather than schema, and nothing
  *     keeps them, so it stays irreversible.
- *   • The confirm phrase must satisfy the execute route's confirmation gate
- *     using the current destructive-action confirmation flow.
  */
 async function describeDanger(
   projectId: string,
@@ -1274,11 +1274,11 @@ async function singleToolTurn(
   //   • Read / chat / clarification tools (answer_question, ask_user,
   //     read_*, get_*, list_*) — no model spend worth billing → 0.
   //   • Direct dispatch of a mutation tool (apply_proposal, generate_function,
-  //     fix_backend, etc. — used when the user pre-confirmed and we skip
-  //     the agent loop entirely) — these do real internal LLM + DB work,
-  //     so bill the proxy. Without this, the same operation through the
-  //     deterministic shortcut would be free; through the agent loop
-  //     it would cost — a meter the user can game by phrasing differently.
+  //     fix_backend, etc.; runBrain sends none here today) — these do real
+  //     internal LLM + DB work, so bill the proxy. Without this, the same
+  //     operation through the deterministic shortcut would be free; through
+  //     the agent loop it would cost — a meter the user can game by phrasing
+  //     differently.
   const tokensUsed = isReadOnlyTool(tool) || CONTROL_TOOLS.has(tool)
     ? 0
     : proxyTokensForSteps([tool])

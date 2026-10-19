@@ -317,9 +317,9 @@ export interface ToolDispatchContext {
   /** Pre-formatted project understanding block (from memory.formatUnderstanding). */
   understandingBlock?: string
   /**
-   * True when the user's message in this turn explicitly authorised a destructive
-   * action ("yes drop it", "confirm revoke"). Forwarded to the executor as
-   * `params.confirmed=true` so its approval gate doesn't double-prompt.
+   * True only on the replay of a call a person approved (runApprovedCall in
+   * lib/mcp/approvals.ts); no message sets it. Forwarded to the executor as
+   * `params.confirmed=true` so its own gate does not stop the approved call.
    */
   destructiveConfirmed?: boolean
   /**
