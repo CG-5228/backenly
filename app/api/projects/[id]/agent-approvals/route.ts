@@ -70,6 +70,9 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, projectId
   if (!result.ok && result.status === 'missing') {
     return NextResponse.json({ success: false, error: result.error }, { status: 404 })
   }
+  if (!result.ok && result.status === 'forbidden') {
+    return NextResponse.json({ success: false, error: result.error }, { status: 403 })
+  }
   if (result.regionUnavailable) {
     // The project's region, which keeps the request's exact call, could not be
     // reached: nothing ran, and the request is still waiting to be approved again.

@@ -52,16 +52,17 @@
  *   functions  the HTTP function answers at the region's host; the sandboxed
  *              one reads the region's table
  *   latency    p50 and p95 of 20 reads through the region's host
- *   rollback   a table added over MCP is rolled back from the console to the
- *              restore point recorded before it; the fixtures and their rows
- *              are left as they were
+ *   rollback   a table added over MCP is a governed change, verified; the
+ *              console restores the state before it (Restore previous state),
+ *              verified; the fixtures and their rows are left as they were
  *   autonomy   a fault the region repairs on its own: a reference column added
  *              over MCP with a DEFAULT, a path that creates no index, is
  *              indexed by the region's repair loop without anyone asking
  *              (missing_fk_index, Tier 0), confirmed by its HEALTH_AUTO_FIXED
  *              record and by the table's own indexes. A repair made from home
  *              instead proves nothing about the region and fails the check.
- *              The column is then rolled back from the console
+ *              The changes the drill made are then restored from the console,
+ *              newest first
  *   recovery   the console asks for a snapshot and home queues it for the
  *              region, which takes it; its download link is the region's own
  *              bucket, never the home host; rows changed after it are put back
@@ -479,6 +480,42 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     must(res.status === 200, `GET ${path} at the home host answered ${res.status}`)
     return json(res)
   }
+
+  /** The project's governed changes newer than `seq`, newest first, as the console lists them. */
+  async function changesSince(seq: number): Promise<Array<{
+    id: string
+    seq: number
+    touched: string[]
+    outcome: { state: string }
+    action: { kind: string; available: boolean; reason?: string } | null
+  }>> {
+    const { changes } = await operatorJson(`/api/projects/${args.project}/changes?limit=50`)
+    return ((changes ?? []) as Array<{ seq: number }>).filter((c) => c.seq > seq) as any
+  }
+
+  /**
+   * Restore previous state, as the console does it: the preview's four checks,
+   * then the restore, which must come back restored and verified. Only a
+   * lossless restore is run here; one that would set data aside needs a person
+   * reading what it would set aside, which a qualification run is not.
+   */
+  async function restoreFromConsole(change: { id: string; seq: number }): Promise<string> {
+    const base = `/api/projects/${args.project}/changes/${change.id}`
+    const preview = await json(await theFetch(homeUrl(`${base}/preview`), asOperator({ method: 'POST', body: '{}' })))
+    must(preview.preview, `the preview of #${change.seq} answered: ${String(preview.error ?? '').slice(0, 200)}`)
+    must(
+      preview.preview.safety === 'lossless',
+      `restoring #${change.seq} is ${preview.preview.safety}, not lossless: ${String(preview.preview.reason ?? '').slice(0, 200)}`,
+    )
+    const res = await theFetch(homeUrl(`${base}/restore`), asOperator({ method: 'POST', body: JSON.stringify({ seq: change.seq }) }))
+    const body = await json(res)
+    must(
+      res.status === 200 && body.success === true && body.status === 'restored',
+      `restoring #${change.seq} answered ${res.status}: ${String(body.error ?? '').slice(0, 200)}`,
+    )
+    must(body.verification?.outcome === 'confirmed', `#${change.seq} was restored but not verified against its restore point`)
+    return `verified, as #${body.recoverySeq}`
+  }
   const snapshotsPath = `/api/projects/${args.project}/backup`
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
@@ -865,33 +902,30 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     })
 
     // ── rollback ─────────────────────────────────────────────────────────────
-    log('\n── rollback (a governed change, undone from the console)')
+    log('\n── rollback (a governed change, restored from the console)')
     const rollbackTable = `qualify_rollback_${run}`
-    let restorePoint: { id: string; versionNum: number } | null = null
+    let restorable: { id: string; seq: number } | null = null
     await check('rollback', 'change', ['table', 'sign-in'], async () => {
       await fixture('apply_migration', { sql: `CREATE TABLE ${rollbackTable} (note text)` })
-      const { versions } = await operatorJson(`/api/projects/${args.project}/schema-versions`)
-      // Every schema change records the schema as it was just before it.
-      const before = (versions ?? []).find((v: { description?: string }) => v.description?.includes(rollbackTable))
-      must(before, `no restore point was recorded before ${rollbackTable} was created`)
-      restorePoint = { id: before.id, versionNum: before.versionNum }
-      return `${rollbackTable} created over MCP, after restore point v${before.versionNum}`
+      // Every schema change is a governed change: checkpointed, applied, and
+      // verified by Backenly in the region it ran in.
+      const changes = await changesSince(0)
+      const made = changes.find((c) => c.touched.includes(rollbackTable))
+      must(made, `no governed change was recorded for ${rollbackTable}`)
+      must(made.outcome.state === 'healthy', `the change that created ${rollbackTable} is ${made.outcome.state}, not applied and verified`)
+      restorable = { id: made.id, seq: made.seq }
+      return `${rollbackTable} created over MCP as change #${made.seq}, applied and verified`
     })
     await check('rollback', 'undone', ['change', 'insert-a'], async () => {
-      const res = await theFetch(
-        homeUrl(`/api/projects/${args.project}/schema-versions`),
-        asOperator({ method: 'POST', body: JSON.stringify({ versionId: restorePoint!.id }) }),
-      )
-      const body = await json(res)
-      must(res.status === 200 && body.success === true, `the rollback answered ${res.status}: ${String(body.message ?? body.error ?? '').slice(0, 200)}`)
-      // The region's live catalog: the rollback runs on the region's database.
+      const restored = await restoreFromConsole(restorable!)
+      // The region's live catalog: the restore runs on the region's database.
       const gone = await mcp!.call('get_table_schema', { tableName: rollbackTable }).then((o) => o.text, (err: unknown) => describeError(err))
-      must(/does not exist/i.test(gone), `${rollbackTable} is still in the region's schema after the rollback: ${gone.slice(0, 160)}`)
+      must(/does not exist/i.test(gone), `${rollbackTable} is still in the region's schema after the restore: ${gone.slice(0, 160)}`)
       const tables = await mcp!.call('read_backend_state', { section: 'tables' })
-      must(tables.text.includes(TABLE), `the rollback removed ${TABLE}, which the restore point recorded`)
+      must(tables.text.includes(TABLE), `the restore removed ${TABLE}, which was there before the change`)
       const rows: Array<{ body: string }> = await users.a!.client[TABLE].list({ limit: 100 })
-      must(rows.some((r) => r.body === `${run}-a`), `user a no longer sees its row in ${TABLE} after the rollback`)
-      return `rolled back to v${restorePoint!.versionNum}: ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
+      must(rows.some((r) => r.body === `${run}-a`), `user a no longer sees its row in ${TABLE} after the restore`)
+      return `restored the state before #${restorable!.seq} (${restored}): ${rollbackTable} is gone; ${TABLE} and its rows are as they were`
     })
 
     // ── autonomy: a fault the region repairs on its own ──────────────────────
@@ -899,8 +933,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     // back (it does not change a backend whose error rate is high).
     log('\n── autonomy (a fault the region repairs without being asked)')
     const probeColumn = `qualify_probe_${run}_id`
-    const versionsPath = `/api/projects/${args.project}/schema-versions`
-    let versionsBeforeFault: Set<string> | null = null
+    /** The newest change before the drill: everything after it is the drill's to restore. */
+    let seqBeforeFault: number | null = null
     /** The definition of an index on TABLE that leads with `column`, or null. */
     const indexLeadingWith = async (column: string): Promise<string | null> => {
       const schema = await mcp!.call('get_table_schema', { tableName: TABLE })
@@ -921,7 +955,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       return strings.find((s) => /CREATE (UNIQUE )?INDEX/.test(s) && leads.test(s)) ?? null
     }
     await check('autonomy', 'repaired-in-region', ['table', 'sign-in'], async () => {
-      versionsBeforeFault = new Set(((await operatorJson(versionsPath)).versions ?? []).map((v: { id: string }) => v.id))
+      seqBeforeFault = (await changesSince(0))[0]?.seq ?? 0
       // The region's repair loop runs at the top of each minute, and home's
       // observer looks at a project 60 s after an MCP change to it. A fault made
       // at second 40 or later reaches the region's loop first.
@@ -970,22 +1004,20 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       }
     })
     await check('autonomy', 'probe-rolled-back', ['repaired-in-region'], async () => {
-      // The first restore point recorded after the drill began is the one taken
-      // just before the probe column was added.
-      const recorded = (((await operatorJson(versionsPath)).versions ?? []) as Array<{ id: string; versionNum: number }>)
-        .filter((v) => !versionsBeforeFault!.has(v.id))
-        .sort((a, b) => a.versionNum - b.versionNum)
-      must(recorded.length > 0, `no restore point was recorded before ${probeColumn} was added`)
-      const res = await theFetch(homeUrl(versionsPath), asOperator({ method: 'POST', body: JSON.stringify({ versionId: recorded[0].id }) }))
-      const body = await json(res)
-      must(res.status === 200 && body.success === true, `rolling ${probeColumn} back answered ${res.status}: ${String(body.message ?? body.error ?? '').slice(0, 200)}`)
-      must(!(await indexLeadingWith(probeColumn)), `${probeColumn}'s index is still there after the rollback`)
+      // The drill made two changes to TABLE: the probe column (over MCP), then
+      // its index (the region's repair loop). A later change to a table blocks
+      // restoring an earlier one, so they are restored newest first.
+      const drill = (await changesSince(seqBeforeFault!)).filter((c) => c.action?.kind === 'restore' && c.touched.includes(TABLE))
+      must(drill.length > 0, `no governed change was recorded for ${probeColumn}`)
+      const done: string[] = []
+      for (const c of drill) done.push(`#${c.seq} ${await restoreFromConsole({ id: c.id, seq: c.seq })}`)
+      must(!(await indexLeadingWith(probeColumn)), `${probeColumn}'s index is still there after the restore`)
       // The table's own columns: read_backend_state's schema section counts columns and never names them.
       const described = toolData<{ columns?: Array<{ name?: string }> }>(await mcp!.call('get_table_schema', { tableName: TABLE }))
       const columns = (described?.columns ?? []).map((c) => c.name)
       must(columns.length > 0, `get_table_schema listed no columns for ${TABLE}`)
-      must(!columns.includes(probeColumn), `${probeColumn} is still in the schema after the rollback`)
-      return `rolled back to v${recorded[0].versionNum}: ${probeColumn} and its index are gone`
+      must(!columns.includes(probeColumn), `${probeColumn} is still in the schema after the restore`)
+      return `restored the state before ${done.join(', then ')}: ${probeColumn} and its index are gone`
     })
 
     // ── recovery ─────────────────────────────────────────────────────────────

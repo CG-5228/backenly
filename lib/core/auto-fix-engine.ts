@@ -22,6 +22,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { executeAction } from '@/lib/ai/minimal-executor'
+import { randomUUID } from 'crypto'
 import { regionRawClient } from '@/lib/data-plane/regional'
 import { HOME_REGION } from '@/lib/regions'
 import {
@@ -34,7 +35,7 @@ import {
   recordedStatements,
 } from '@/lib/data-plane/residency'
 import { HeldActionUnreadable, heldActionForReplay } from '@/lib/operational-memory/held-action-targets'
-import { captureSchemaSnapshot, rollbackToSchemaVersion } from '@/lib/services/workspace-schema-snapshot'
+import { captureSchemaSnapshot } from '@/lib/services/workspace-schema-snapshot'
 import {
   withSqlCapture,
   installSqlRecorder,
@@ -200,6 +201,34 @@ async function capturePreFixState(
   }
 
   return { preSnapshotId: preSnapshot?.id ?? null, preMetadata, schemaTouching }
+}
+
+/**
+ * Run a fix as governed changes grouped under one id (lib/changes), and say
+ * which changes it made. Its undo restores exactly those, scoped to what they
+ * touched and refused if anything later touched the same tables. The undo this
+ * replaced restored the whole schema to a snapshot, which also archived every
+ * table and column anyone had added since the fix.
+ */
+async function withFixGroup<T>(findingId: string, fn: () => Promise<T>): Promise<{ result: T; changeIds: string[] }> {
+  const { withChangeAttribution, currentAttribution } = await import('@/lib/changes/attribution')
+  const groupId = `fix:${findingId}:${randomUUID().slice(0, 8)}`
+  const result = await withChangeAttribution({ source: currentAttribution()?.source ?? 'autonomy', groupId }, fn)
+  return { result, changeIds: await changesInGroup(groupId) }
+}
+
+/**
+ * The governed changes a fix group made, newest first. The fix has already run
+ * by now, so failing to read them must not make it look as if it had not:
+ * none recorded means its Undo says so (revertEligibility).
+ */
+async function changesInGroup(groupId: string): Promise<string[]> {
+  try {
+    const changes = await prisma.backendChange.findMany({ where: { groupId, kind: 'change' }, orderBy: { seq: 'desc' }, select: { id: true } })
+    return changes.map((c) => c.id)
+  } catch {
+    return []
+  }
 }
 
 // ── Core engine ───────────────────────────────────────────────────────────────
@@ -507,7 +536,10 @@ export async function executeApprovedFix(
             rollbackData: {
               fixAction: applied.fixAction,
               statements: applied.statements,
-              rollbackFormat: 2,
+              // Format 3 only when the changes it made were recorded; an
+              // unverified apply from before that stays format 2.
+              rollbackFormat: Array.isArray(applied.changeIds) ? 3 : 2,
+              ...(Array.isArray(applied.changeIds) ? { changeIds: applied.changeIds } : {}),
               snapshotId: applied.snapshotId ?? null,
               fixedAt: applied.at,
               verification: 'confirmed' satisfies FixVerification,
@@ -574,9 +606,10 @@ export async function executeApprovedFix(
   installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
 
+  let changeIds: string[] = []
   for (let attempt = 0; attempt <= BACKOFFS_MS.length; attempt++) {
     try {
-      const captured = await withSqlCapture(() => withBuildLock(
+      const { result: captured, changeIds: madeNow } = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
         projectId,
         'modify',
         async () => executeAction(
@@ -589,11 +622,12 @@ export async function executeApprovedFix(
         ),
         // Human-approved: skip the autonomy cooldown/budget gate (see fn docs).
         { skipCooldown: true },
-      ))
+      )))
       const governed = captured.result
       // Only the attempt that actually ran contributes statements; a lock-
       // contention retry captured nothing and must not append an empty round.
       if (captured.statements.length > 0) statements = captured.statements
+      if (madeNow.length > 0) changeIds = madeNow
       if (governed.error) {
         lastLockError = governed.error
         // Retry on lock-contention. cooldown/budget are skipped above for the
@@ -728,8 +762,11 @@ export async function executeApprovedFix(
     // derivable by diffing two schema snapshots, but the statement itself was
     // never stored, so "show me what it ran" had no answer.
     statements: recordedStatements(statements, keep),
-    // UNDO CONTRACT (rollbackFormat 2): snapshotId is the PRE-fix state.
-    rollbackFormat: 2,
+    // UNDO CONTRACT (rollbackFormat 3): the governed changes this fix made,
+    // newest first. Undo restores exactly those (lib/changes/recovery.ts).
+    // snapshotId stays as the record of the pre-fix schema; it is not the undo.
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     preMetadata: pre.preMetadata,
@@ -847,8 +884,9 @@ export async function executeApprovedProposal(input: {
 
   installHomeSqlRecorders()
   let captured
+  let changeIds: string[] = []
   try {
-    captured = await withSqlCapture(() => withBuildLock(
+    const grouped = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
       projectId,
       'modify',
       async () => {
@@ -863,7 +901,9 @@ export async function executeApprovedProposal(input: {
       },
       // Human-approved: skip the autonomy cooldown/budget gate.
       { skipCooldown: true },
-    ))
+    )))
+    captured = grouped.result
+    changeIds = grouped.changeIds
   } catch (err) {
     return { mutated: false, fixed: false, outcome: 'failed', message: `The change could not run: ${err instanceof Error ? err.message : String(err)}` }
   }
@@ -885,7 +925,10 @@ export async function executeApprovedProposal(input: {
     fixAction: recordedFixAction(fixAction, keep),
     fixResult: recordedFixResult(result, keep),
     statements: recordedStatements(statements, keep),
-    rollbackFormat: 2,
+    // UNDO CONTRACT (rollbackFormat 3), as for every other fix: the governed
+    // changes it made, newest first, which Undo restores (lib/changes/recovery.ts).
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     preMetadata: pre.preMetadata,
     schemaTouching: pre.schemaTouching,
@@ -1013,14 +1056,16 @@ export interface RevertEligibility {
  * `revertAutoFix` calls this as its own first gate, so the button's precondition
  * and the engine's precondition are one function and cannot drift.
  *
- * The three ways a fix is genuinely unrevertible are all knowable from the
- * finding row:
+ * The ways a fix is genuinely unrevertible are all knowable from the finding
+ * row:
  *   • no rollbackData at all — the fix predates the undo contract entirely
- *   • rollbackFormat !== 2  — its snapshot was captured AFTER the fix, so a
+ *   • rollbackFormat 1      — its snapshot was captured AFTER the fix, so a
  *     "revert" would restore the post-fix state and report success having done
  *     nothing (this is the bug format 2 exists to close)
- *   • schemaTouching with no snapshotId — capture failed at fix time, so there
- *     is no pre-fix state to go back to
+ *   • a schema-touching fix in format 2 — its only way back is restoring the
+ *     whole schema to the pre-fix snapshot, which would also undo every change
+ *     anyone made since. Format 3 records the governed changes the fix made, and
+ *     undoes exactly those (lib/changes/recovery.ts).
  */
 export function revertEligibility(
   findingType: string,
@@ -1037,7 +1082,7 @@ export function revertEligibility(
     }
   }
 
-  if (rollbackData.rollbackFormat !== 2) {
+  if (rollbackData.rollbackFormat !== 2 && rollbackData.rollbackFormat !== 3) {
     return {
       revertible: false,
       requiresConfirmation: false,
@@ -1047,13 +1092,32 @@ export function revertEligibility(
     }
   }
 
-  if (rollbackData.schemaTouching === true && !rollbackData.snapshotId) {
+  if (rollbackData.schemaTouching === true && rollbackData.rollbackFormat === 2) {
     return {
       revertible: false,
       requiresConfirmation: false,
-      reason:
-        'No pre-fix snapshot was captured when this fix ran, so there is no recorded state to ' +
-        'restore.',
+      reason: rollbackData.snapshotId
+        ? 'This fix was made before Backenly recorded each change with its own restore point. Undoing it ' +
+          'now would mean restoring the whole schema to how it was then, which would also undo every change ' +
+          'made since, so it is not done automatically.'
+        : 'No pre-fix snapshot was captured when this fix ran, so there is no recorded state to restore.',
+    }
+  }
+
+  // Format 3 undoes exactly the changes the fix recorded. A fix that ran
+  // statements but recorded no change (the ledger was off, or the lookup
+  // failed) has no restore point to go back to, and "nothing to undo" would be
+  // a false answer.
+  if (
+    rollbackData.schemaTouching === true &&
+    rollbackData.rollbackFormat === 3 &&
+    !(Array.isArray(rollbackData.changeIds) && rollbackData.changeIds.length > 0) &&
+    Array.isArray(rollbackData.statements) && rollbackData.statements.length > 0
+  ) {
+    return {
+      revertible: false,
+      requiresConfirmation: false,
+      reason: 'This fix ran statements that were not recorded as a change with a restore point, so there is no recorded state to restore.',
     }
   }
 
@@ -1064,13 +1128,14 @@ export function revertEligibility(
 /**
  * Revert an auto-fixed finding to its recorded pre-fix state.
  *
- * The undo contract (rollbackFormat 2):
- *   • schema-touching fixes → rollbackToSchemaVersion(PRE-fix snapshot), whose
- *     DDL engine now diffs indexes (both directions), FK constraints, RLS
- *     policies, and triggers
+ * The undo contract (rollbackFormat 3):
+ *   • schema-touching fixes → the governed changes the fix made, each restored
+ *     to the state before it (lib/changes/recovery.ts), scoped to what it
+ *     touched and verified
  *   • metadata fixes → the exact pre-fix rows/values from preMetadata
- *   • legacy fixes (pre-contract) are REFUSED honestly — their snapshot is
- *     post-fix, so "reverting" to it would no-op while claiming success
+ *   • older fixes are REFUSED honestly: format 1 because its snapshot is
+ *     post-fix, schema-touching format 2 because its only way back restores the
+ *     whole schema and would undo every later change with it
  *
  * Pure engine logic: does NOT flip finding status or write audit rows — the
  * caller (route / verifier) owns that, because it owns the actor identity.
@@ -1117,24 +1182,39 @@ export async function revertAutoFix(
     }
   }
 
-  // ── Schema-side revert (workspace schema = the enforcement truth) ──────────
+  // ── Schema-side revert: the governed changes this fix made ──────────────────
+  //
+  // Each one is restored on its own, newest first, scoped to what it touched,
+  // with the same checks as Restore previous state: refused if a later change
+  // touched the same tables, and never silently setting aside data written
+  // since. A restore that would affect such data is not done from here: it
+  // belongs in Database → Changes, where the person sees exactly what is kept.
   let appliedSteps = 0
   let schemaMessage = ''
   if (rollbackData.schemaTouching === true) {
-    // Non-null by the eligibility gate above, which refuses schemaTouching
-    // fixes that never captured one.
-    const snapshotId = rollbackData.snapshotId as string
-    const snapshot = await prisma.workspaceSchemaSnapshot.findUnique({
-      where: { id: snapshotId },
-      select: { versionNum: true },
-    })
-    if (!snapshot) return { success: false, message: `Rollback snapshot ${snapshotId} no longer exists.` }
-
-    const res = await rollbackToSchemaVersion(projectId, snapshot.versionNum)
-    if (!res.success) return { success: false, message: `Schema rollback failed: ${res.error}` }
-    appliedSteps = res.appliedSteps
-    schemaMessage = `schema restored to pre-fix version ${snapshot.versionNum} ` +
-      `(${res.appliedSteps} step${res.appliedSteps === 1 ? '' : 's'} applied)`
+    const { previewRecovery, recoverChange } = await import('@/lib/changes/recovery')
+    const { currentAttribution } = await import('@/lib/changes/attribution')
+    const ids = Array.isArray(rollbackData.changeIds) ? (rollbackData.changeIds as string[]) : []
+    let restored = 0
+    for (const id of ids) {
+      const preview = await previewRecovery(projectId, id)
+      if (!preview || preview.safety === 'unavailable') continue // already restored, or never in effect
+      if (preview.safety !== 'lossless') {
+        return {
+          success: false,
+          message:
+            `Not undone: ${preview.reason ?? 'it cannot be restored automatically'}. ` +
+            'Open Database → Changes to restore it there, where you can see exactly what would be kept.',
+        }
+      }
+      const out = await recoverChange(projectId, id, { mode: 'manual', actorUserId: currentAttribution()?.actorUserId ?? null })
+      if (!out.ok) return { success: false, message: `Not undone: ${(out as { error: string }).error}` }
+      restored++
+    }
+    appliedSteps = restored
+    schemaMessage = restored > 0
+      ? `restored the state before ${restored === 1 ? 'the change' : `the ${restored} changes`} this fix made, verified`
+      : 'nothing in the schema to undo'
   }
 
   // ── Metadata-side revert (platform rows the snapshot can't see) ────────────
@@ -1477,8 +1557,9 @@ async function _executeAutoFix(
   let result
   installHomeSqlRecorders()
   let statements: RecordedStatement[] = []
+  let changeIds: string[] = []
   try {
-    const captured = await withSqlCapture(() => withBuildLock(
+    const { result: captured, changeIds: madeNow } = await withFixGroup(findingId, () => withSqlCapture(() => withBuildLock(
       projectId,
       'modify',
       async () => {
@@ -1497,9 +1578,10 @@ async function _executeAutoFix(
         return r
       },
       { skipCooldown: opts.skipCooldown },
-    ))
+    )))
     const governed = captured.result
     statements = captured.statements
+    changeIds = madeNow
     if (governed.error) {
       return _isTransientGovernanceError(governed.error)
         ? _deferred(findingId, projectId, type, details, governed.error)
@@ -1607,6 +1689,7 @@ async function _executeAutoFix(
         fixAction: recorded.fixAction,
         statements: recorded.statements,
         preSnapshotId: pre.preSnapshotId,
+        changeIds,
         message: recorded.message,
         verifierError,
       })
@@ -1646,8 +1729,11 @@ async function _executeAutoFix(
     // derivable by diffing two schema snapshots, but the statement itself was
     // never stored, so "show me what it ran" had no answer.
     statements: recorded.statements,
-    // UNDO CONTRACT (rollbackFormat 2): snapshotId is the PRE-fix state.
-    rollbackFormat: 2,
+    // UNDO CONTRACT (rollbackFormat 3): the governed changes this fix made,
+    // newest first. Undo restores exactly those (lib/changes/recovery.ts).
+    // snapshotId stays as the record of the pre-fix schema; it is not the undo.
+    rollbackFormat: 3,
+    changeIds,
     snapshotId: pre.preSnapshotId,
     postSnapshotId: postSnapshot?.id ?? null,
     preMetadata: pre.preMetadata,
@@ -1727,6 +1813,7 @@ async function _appliedUnverified(
     fixAction: unknown
     statements: unknown
     preSnapshotId: string | null
+    changeIds: string[]
     message: string
     verifierError: string
   },
@@ -1755,6 +1842,7 @@ async function _appliedUnverified(
           fixAction: applied.fixAction,
           statements: applied.statements,
           snapshotId: applied.preSnapshotId,
+          changeIds: applied.changeIds,
           verifierError: applied.verifierError,
         },
         escalation: {
