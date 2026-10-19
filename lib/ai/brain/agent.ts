@@ -1214,12 +1214,55 @@ async function describeDanger(
       return { tool, target: `the scheduled job \`${namedThing ?? 'unknown'}\``, rowCount: null, reversible: false, confirmPhrase: 'Confirm — delete the scheduled job' }
     case 'remove_integration_key':
       return { tool, target: `the ${namedThing ?? ''} integration (functions calling it will fail)`.trim(), rowCount: null, reversible: false, confirmPhrase: 'Confirm — disconnect the integration' }
+    case 'delete_webhook': {
+      // The card names the endpoint the person is approving. The call carries
+      // only an id, and a bare `delete_webhook` did not say which receiver
+      // stops getting events.
+      const webhookId = str('webhookId')
+      let target = webhookId ? `the webhook \`${webhookId}\` and its delivery history` : 'no webhook (the call names none)'
+      if (webhookId) {
+        try {
+          const { prisma } = await import('@/lib/db')
+          const found = await prisma.webhook.findFirst({ where: { id: webhookId, projectId }, select: { eventType: true, targetUrl: true } })
+          target = found
+            ? `the webhook \`${webhookId}\` (${found.eventType} → ${found.targetUrl}) and its delivery history`
+            : `the webhook \`${webhookId}\` (no such webhook in this project)`
+        } catch { /* keep the id */ }
+      }
+      return {
+        tool,
+        target,
+        rowCount: null,
+        // Its signing secret goes with it: an endpoint created again signs with
+        // a new one, which the receiver does not have.
+        reversible: false,
+        confirmPhrase: 'Confirm — delete the webhook',
+      }
+    }
     case 'block_end_user':
       return { tool, target: `the end-user ${namedThing ?? ''} (they lose access immediately)`.trim(), rowCount: null, reversible: true, confirmPhrase: 'Confirm — block the user' }
     case 'remove_permission':
       return { tool, target: 'a row-level security policy (data exposure may widen)', rowCount: null, reversible: true, confirmPhrase: 'Confirm — remove the permission' }
     case 'disable_oauth_provider':
       return { tool, target: `${namedThing ?? 'an OAuth'} sign-in (end-users on this provider cannot log in)`, rowCount: null, reversible: true, confirmPhrase: 'Confirm — disable the provider' }
+    case 'remove_auth_smtp': {
+      // The card says where auth email goes once the settings are gone: through
+      // the deployment's SMTP when its environment has one, and otherwise
+      // nowhere (resolveProjectSmtp, lib/email/project-smtp.ts).
+      const { readEnvSmtpCredentials } = await import('@/lib/email/smtp-transport')
+      const after = readEnvSmtpCredentials()
+        ? "go out through the deployment's SMTP instead"
+        : 'stop: this deployment has no SMTP to fall back to'
+      return {
+        tool,
+        target: `this project's SMTP settings (verification, password-reset and magic-link emails then ${after})`,
+        rowCount: null,
+        // The stored password is deleted with them, so putting them back means
+        // entering it again.
+        reversible: false,
+        confirmPhrase: 'Confirm — remove the SMTP settings',
+      }
+    }
     case 'merge_branch':
     case 'discard_branch': {
       // The approval card is the only thing the human reads before a branch

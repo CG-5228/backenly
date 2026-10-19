@@ -1192,6 +1192,13 @@ tests/integration/dashboard-stats-counts.spec.ts
 # routes answer 404, and the approval card names the trigger. Real trigger and
 # approval rows are the property, so it needs a real Postgres.
 tests/integration/delete-trigger-scope.spec.ts
+# The Review Queue entry for delete_webhook and remove_auth_smtp, through a real
+# brain turn: a webhook in the project is named with its event and target URL,
+# another project's webhook is reported as not in this project without its URL
+# reaching the entry or the model, the SMTP entry says where auth email goes
+# next, and the gate deletes nothing. Real webhook, delivery and SMTP rows are
+# the property, so it needs a real Postgres.
+tests/integration/approval-target-names.spec.ts
 # Regional jobs: a snapshot or restore of a project kept in another region,
 # asked for at home and carried out in that region. No generic worker can claim
 # one, each region claims its own, a run past its timeout counts as an attempt,
