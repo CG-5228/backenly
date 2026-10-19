@@ -1235,7 +1235,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         args.region === HOME_REGION
           ? 'each key checked at home, where the project lives'
           : authorizationMode === 'enforce'
-            ? "each key checked against the region's own authorization copy"
+            ? "each key checked against the region's own authorization copy while it is fresh, at home otherwise"
             : `each key still checked in the home region (authorization copy ${authorizationMode ?? 'not reported'})`
       return `p50 ${p50} ms, p95 ${p95} ms over 20 reads (from where this runs; ${where})`
     })
@@ -1323,7 +1323,7 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must(!(await indexLeadingWith(probeColumn)), `${probeColumn} was indexed as it was added, so there is no fault to repair`)
       const deadline = since.getTime() + args.repairWaitMinutes * 60_000
       let indexedAt: number | null = null
-      /** The loop's change freeze during an incident, if the feed shows one in the window: it repairs nothing then. */
+      /** The newest of the loop's change freezes in the window (it writes one on every frozen tick): it repairs nothing then. */
       let frozen: { at?: string; full?: string } | null = null
       for (;;) {
         const { events } = await operatorJson(
@@ -1335,7 +1335,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         const repair = ((events ?? []) as Event[]).find(
           (e) => e.action === 'HEALTH_AUTO_FIXED' && e.tableName === TABLE && String(e.full ?? '').includes(`${TABLE}.${probeColumn}`),
         )
-        frozen = ((events ?? []) as Event[]).find((e) => e.action === 'AUTONOMY_CHANGE_FREEZE') ?? frozen
+        for (const e of (events ?? []) as Event[]) {
+          if (e.action !== 'AUTONOMY_CHANGE_FREEZE' || !e.at || Number.isNaN(Date.parse(e.at))) continue
+          if (!frozen?.at || Date.parse(e.at) > Date.parse(frozen.at)) frozen = e
+        }
         const index = await indexLeadingWith(probeColumn)
         if (repair) {
           must(repair.verified === true, `the repair of ${probeColumn} ran but was not confirmed: ${repair.full}`)
@@ -1361,7 +1364,10 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
         if (Date.now() > deadline) {
           // A freeze is the loop doing its job (it changes no backend mid-incident), not a failed repair; but the
           // repair was not shown either, so the drill is reported as not exercised and the region is not qualified.
-          if (frozen) {
+          // Only a freeze still holding at the end (one in its last two minutes, on the service's clock) explains a
+          // repair that never came, and only while nothing else indexed the column: that stays a failure above.
+          const stillFrozen = frozen?.at !== undefined && deadline + offset - Date.parse(frozen.at) <= 120_000
+          if (frozen && stillFrozen && indexedAt === null) {
             throw new NotExercised(
               `held back by an incident freeze: the repair loop froze autonomous changes` +
                 `${frozen.at ? ` at ${frozen.at}` : ''} (${String(frozen.full ?? 'mid-incident').slice(0, 160)}) and ` +
@@ -1602,7 +1608,8 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
     await check('rollback-drills', 'described-after-reapply', ['reapplied-and-served'], async () => {
       return described('described again', keptTable, await untilDescribed(keptTable, 'listed', keptAt.reapplied), 'the reapply was asked for')
     })
-    await check('rollback-drills', 'functions-after-reapply', ['described-after-reapply'], async () => {
+    // Only a restore that removed them shows the reapply bringing them back.
+    await check('rollback-drills', 'functions-after-reapply', ['described-after-reapply', 'functions-after-acknowledged-restore'], async () => {
       // Every table gets a generated `<table>-schema` endpoint; the reapply brought the table back, so it is back too.
       const listed = await functionsGeneratedFor(keptTable)
       must(listed.includes(`${keptTable}-schema`), `the reapply brought ${keptTable} back without its generated functions: listed ${listed.join(', ') || 'none'}`)
@@ -1640,14 +1647,20 @@ export async function qualify(args: QualifyArgs, log: (line: string) => void = c
       must((await columnsOf(keptTable)) === null, `${keptTable} is still in the region's schema`)
       return `${keptTable} is gone again, its rows kept aside in the restore's vault`
     })
-    await check('rollback-drills', 'functions-after-drill-restores', ['drill-tables-removed'], async () => {
-      // Every drill table is gone: put back automatically (partway), restored newest first (parent), restored again
-      // (kept). None may leave its generated functions behind.
-      const tables = [`qualify_partway_${run}`, parentTable, keptTable]
-      const left = (await Promise.all(tables.map((t) => functionsGeneratedFor(t)))).flat()
-      must(left.length === 0, `the drills removed their tables but left the functions generated for them: ${left.join(', ')}`)
-      return `no function generated for ${tables.join(', ')} is listed once their tables were removed`
-    })
+    // Each drill that created and removed one of these tables must have run, or "none left" proves nothing.
+    await check(
+      'rollback-drills',
+      'functions-after-drill-restores',
+      ['drill-tables-removed', 'recovered-after-failing-part-way', 'restore-refused-under-a-later-change', 'functions-after-reapply'],
+      async () => {
+        // Every drill table is gone: put back automatically (partway), restored newest first (parent), restored again
+        // (kept). None may leave its generated functions behind.
+        const tables = [`qualify_partway_${run}`, parentTable, keptTable]
+        const left = (await Promise.all(tables.map((t) => functionsGeneratedFor(t)))).flat()
+        must(left.length === 0, `the drills removed their tables but left the functions generated for them: ${left.join(', ')}`)
+        return `no function generated for ${tables.join(', ')} is listed once their tables were removed`
+      },
+    )
 
     // ── recovery ─────────────────────────────────────────────────────────────
     log('\n── recovery (a snapshot, taken and restored in the region)')
