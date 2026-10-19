@@ -2,12 +2,14 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
-import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes, regionErrorResponse } from '@/lib/api/v1/errors'
+import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes, regionErrorResponse, dataRefusalResponse } from '@/lib/api/v1/errors'
 import { deleteSchema } from '@/lib/api/v1/schemas'
 import { typedParams } from '@/lib/api/v1/typed-params'
+import { whereConditions } from '@/lib/api/v1/where'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
+import type { QueryContext } from '@/lib/db/query-errors'
 import { columnTypes } from '@/lib/mcp/runtime-db'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
@@ -18,6 +20,8 @@ import { recordedV1 } from '@/lib/traffic/recorded-v1'
  */
 async function handlePOST(request: NextRequest, props: { params: Promise<{ projectId: string }> }) {
   const params = await props.params;
+  // What was bound, so a refusal can name its column (lib/api/v1/data-errors.ts).
+  let refusal: QueryContext | undefined
   try {
     const middleware = await v1ApiMiddleware(request, params)
     if (middleware.response) {
@@ -52,17 +56,13 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       return createErrorResponse(ErrorCodes.NOT_FOUND, `Table '${table}' not found in this project`, 404)
     }
 
-    // Build WHERE clause (require it — no accidental full-table deletes).
-    // Each value is cast to its column's type (lib/api/v1/typed-params.ts).
-    const whereParts: string[] = []
-    const bound = typedParams(await columnTypes(context.projectId, schemaName, tableName))
-
-    if (where && typeof where === 'object') {
-      for (const [col, val] of Object.entries(where)) {
-        if (!/^[a-z_][a-z0-9_]*$/i.test(col)) continue
-        whereParts.push(`"${col}" = ${bound.bind(col, val)}`)
-      }
-    }
+    // Build WHERE clause (require it — no accidental full-table deletes), with
+    // the operators the SDK sends, each value cast to its column's type
+    // (lib/api/v1/where.ts).
+    const types = await columnTypes(context.projectId, schemaName, tableName)
+    const bound = typedParams(types)
+    refusal = bound.context(tableName)
+    const whereParts = whereConditions(where, bound, types)
 
     if (whereParts.length === 0) {
       return createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'A WHERE condition is required for delete', 400)
@@ -123,6 +123,8 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
 
     return createSuccessResponse({ success: true, deleted: result.length })
   } catch (error: any) {
+    const refused = dataRefusalResponse(error, refusal)
+    if (refused) return refused
     console.error('Database delete error:', error)
     return regionErrorResponse(error) ?? createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to delete data', 500)
   }
