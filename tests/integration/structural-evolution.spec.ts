@@ -475,6 +475,24 @@ describe('the governed executor', () => {
       expect(c).toMatchObject({ kind: 'change', source: 'approval', actorUserId: ownerId, groupId: `evolution:${planId}` })
     }
   })
+
+  it('offers no restore of one step on its own: the change is undone whole, by the engine', async () => {
+    const { listChanges } = await import('@/lib/changes/history')
+    const { recoverChange } = await import('@/lib/changes/recovery')
+    const steps = (await listChanges(projectId)).changes.filter(c => c.title.startsWith('Architecture change'))
+    expect(steps).toHaveLength(4)
+    for (const c of steps) {
+      expect(c.action).toMatchObject({ kind: 'restore', available: false, code: 'PART_OF_ARCHITECTURE_CHANGE' })
+      expect(c.action?.reason).toMatch(/Undo the whole change from the Autonomy page/)
+    }
+    // Restoring the sync alone would leave old clients' writes unmirrored.
+    const sync = steps.find(c => /Mirror every write/.test(c.title))!
+    const out = await recoverChange(projectId, sync.id, { mode: 'manual', actorUserId: ownerId })
+    expect(out).toMatchObject({ ok: false, code: 'NOT_AVAILABLE' })
+    const host = (await readTableFacts(workspaceOn(prisma, schema), 'orders'))!
+    expect(host.triggers.map(t => t.name)).toContain(ladderNames(SPEC).forward)
+    expect((await prisma.backendChange.findUnique({ where: { id: sync.id }, select: { status: true } }))?.status).toBe('healthy')
+  })
 })
 
 // ── Behave ───────────────────────────────────────────────────────────────────

@@ -183,7 +183,7 @@ function outcomeOf(r: Row, recovery: Row | null, recoveryActor: ChangeActor | nu
 
 function availabilityFor(r: Row, windowDays: number, targetStatus: string | null): Availability {
   return availabilityOf(
-    { kind: r.kind, status: r.status, footprint: footprintOf(r), createdAt: r.createdAt, intact: checkpointIntact(r) },
+    { kind: r.kind, status: r.status, footprint: footprintOf(r), createdAt: r.createdAt, intact: checkpointIntact(r), groupId: r.groupId },
     windowDays,
     { targetStatus },
   )
