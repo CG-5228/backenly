@@ -1,7 +1,7 @@
 /**
  * The project change lock is re-entered only by the work of the change holding
  * it (lib/changes/lock.ts): never once it has been given back, and never from a
- * change whose own work is over.
+ * change whose own work is over, unless the lock was taken there.
  *
  * Work a change leaves running (a timer, an unawaited promise) carries its
  * async context. It used to re-enter the lock on the change's connection after
@@ -68,18 +68,17 @@ describe('the change lock, after the change that held it', () => {
   })
 
   it('is never re-entered once given back: leftover work takes the lock itself', async () => {
-    let outer: PoolClient | undefined
-    let late: Promise<{ client: PoolClient; holds: boolean }> | undefined
-    await withChangeLock(projectId, async (client) => {
-      outer = client
+    let late: Promise<boolean> | undefined
+    await withChangeLock(projectId, async () => {
       // A plain timer: it carries the holder's async context past its release.
       late = new Promise((resolve, reject) => setTimeout(() => {
-        withChangeLock(projectId, async (c) => resolve({ client: c, holds: await holdsAdvisoryLock(c) })).catch(reject)
+        withChangeLock(projectId, async (c) => resolve(await holdsAdvisoryLock(c))).catch(reject)
       }, 50))
     })
-    const got = await late!
-    expect(got.client).not.toBe(outer)
-    expect(got.holds).toBe(true)
+    // Re-entering the given-back lock would run on a session that no longer
+    // holds it. (The pool may hand back the same client object; the lock is
+    // what tells them apart.)
+    expect(await late!).toBe(true)
   })
 
   it('leftover work of a finished change waits for the lock instead of joining it', async () => {
@@ -101,4 +100,19 @@ describe('the change lock, after the change that held it', () => {
     await late
     expect(order).toEqual(['the holder is done', 'leftover work'])
   })
+
+  it('a lock taken by leftover work of a finished change is re-entered by its own work', async () => {
+    // Leftover work of a finished change opens a change of its own; when that
+    // change recovers automatically, its recovery re-enters the lock it took.
+    // It must not wait for itself (30 s, then CHANGE_IN_PROGRESS).
+    const finished = { projectId, finished: true }
+    await openChangeContext.run(finished, () => withChangeLock(projectId, async (outer) => {
+      const startedAt = Date.now()
+      await withChangeLock(projectId, async (inner) => {
+        expect(inner).toBe(outer)
+        expect(await holdsAdvisoryLock(inner)).toBe(true)
+      })
+      expect(Date.now() - startedAt).toBeLessThan(5_000)
+    }))
+  }, 60_000)
 })

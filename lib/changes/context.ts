@@ -8,8 +8,10 @@
  * already closed, joined it as if it were part of it, and was recorded nowhere,
  * attributed to whoever made that change.
  *
- * Its own module, depending only on attribution, so whatever schedules work
- * for later can step outside both without importing the ledger.
+ * Its own module, depending only on attribution and the statement capture
+ * (lib/execution/sql-recorder.ts, async_hooks alone), so whatever schedules work
+ * for later can step outside all of them without importing the ledger or a
+ * database module.
  */
 
 import { AsyncLocalStorage } from 'async_hooks'
@@ -33,6 +35,12 @@ export interface HeldChangeLock {
   client: PoolClient
   /** Set when the lock is released; a released lock is never re-entered. */
   released: boolean
+  /**
+   * The change open where the lock was taken, if any. Work that runs in that
+   * same context is the holder's own (the automatic recovery of the change it
+   * took the lock for), even when that context is a change whose work is over.
+   */
+  openedIn?: ChangeContext
 }
 
 /**

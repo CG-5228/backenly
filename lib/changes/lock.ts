@@ -86,16 +86,19 @@ export async function withChangeLock<T>(
   fn: (client: PoolClient) => Promise<T>,
   opts: { waitMs?: number } = {},
 ): Promise<T> {
-  // Re-entered only by work of the change holding it (a recovery it starts runs
-  // on its connection). Never once the lock is given back, and never from a
-  // change whose own work is over: a timer or promise it left running carries
-  // this context, and must wait for the lock like anyone else.
+  // Re-entered only by the holder's own work (a recovery it starts runs on its
+  // connection). Never once the lock is given back, and never from a change
+  // whose own work is over, unless the lock was taken in that very context: a
+  // timer or promise a finished change left running carries the context of the
+  // lock that change's work held, and must wait for the lock like anyone else.
   const current = heldChangeLock.getStore()
   const inChange = openChangeContext.getStore()
-  if (current && current.projectId === projectId && !current.released && !inChange?.finished) return fn(current.client)
+  if (current && current.projectId === projectId && !current.released && (!inChange?.finished || inChange === current.openedIn)) {
+    return fn(current.client)
+  }
 
   const client = await (await lockPool(projectId)).connect()
-  const holding: HeldChangeLock = { projectId, client, released: false }
+  const holding: HeldChangeLock = { projectId, client, released: false, openedIn: openChangeContext.getStore() }
   const key = projectToLockKey(projectId)
   let locked = false
   let broken = false
