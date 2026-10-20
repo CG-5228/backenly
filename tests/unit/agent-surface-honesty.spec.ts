@@ -361,6 +361,49 @@ describe('agent-facing text never recommends an unadvertised tool (#43)', () => 
   })
 })
 
+// ── #234 — a non-feature is something no tool does ───────────────────────────
+
+describe('NON_FEATURES refuses nothing a brain tool does (#234)', () => {
+  // NON_FEATURES said there was no "create a webhook URL" surface while
+  // create_webhook sat in the same prompt, so the model was told to refuse a
+  // request a tool in front of it could carry out. A tool is named for what it
+  // does, verb then object, so an entry that says that in plain words is
+  // refusing the tool. An entry that points at a tool as the alternative names
+  // it (run_query), which this does not match.
+  //
+  // These only steer the turn, and "ask the user" is ordinary advice.
+  const STEERING = new Set(['finish', 'propose_plan', 'ask_user', 'answer_question'])
+
+  /** The words a tool is named for: create_webhook → "create a webhook", "creating webhooks", … */
+  function operation(tool: string): RegExp | null {
+    const [verb, ...object] = tool.split('_')
+    if (object.length === 0) return null
+    const stem = verb.replace(/e$/, '')
+    const verbs = [verb, `${verb}s`, `${stem}ed`, `${stem}ing`]
+    const one = object.pop()!.replace(/ies$/, 'y').replace(/(ch|sh|x|ss)es$/, '$1').replace(/([^su])s$/, '$1')
+    const many = /[^aeiou]y$/.test(one) ? one.replace(/y$/, 'ies') : /(ch|sh|x|s)$/.test(one) ? `${one}es` : `${one}s`
+    const lead = object.map((w) => `${w}[\\s-]+`).join('')
+    return new RegExp(`\\b(?:${verbs.join('|')})\\s+(?:(?:a|an|the)\\s+)?${lead}(?:${one}|${many})\\b`, 'i')
+  }
+
+  it('recognises the refusal that was there', () => {
+    expect(operation('create_webhook')!.test('There is no separate "create a webhook URL" surface')).toBe(true)
+    expect(operation('run_query')!.test('run_query executes read-only SQL')).toBe(false)
+  })
+
+  it('no entry says in plain words what a tool is named for', async () => {
+    const { NON_FEATURES } = await import('@/lib/ai/brain/capabilities')
+    const { BRAIN_TOOLS } = await import('@/lib/ai/brain/tools')
+    const tools = BRAIN_TOOLS.map((t) => t.function.name).filter((name) => !STEERING.has(name))
+    const refused = NON_FEATURES.flatMap((entry) =>
+      tools
+        .filter((tool) => operation(tool)?.test(`${entry.pattern}. ${entry.why}`))
+        .map((tool) => ({ entry: entry.pattern, tool })),
+    )
+    expect(refused).toEqual([])
+  })
+})
+
 /**
  * ── #12 — two-party tables ───────────────────────────────────────────────────
  *
