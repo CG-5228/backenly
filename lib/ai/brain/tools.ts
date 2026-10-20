@@ -2817,14 +2817,15 @@ export async function dispatchTool(
           ? finalize({ ok: true, summary: `History of one architecture change (${detail.status?.label ?? 'unknown'}): ${detail.trail.filter(t => t.milestone).map(t => t.sentence).join(' ')}`, data: detail })
           : finalize({ ok: false, summary: 'No architecture change with that id in this project.' })
       }
-      const summary = await engine.architectureSummary(ctx.projectId).catch(() => null)
+      const summary = await engine.architectureSummary(ctx.projectId, { detail: args.detail === true }).catch(() => null)
       if (!summary) return finalize({ ok: false, summary: 'Could not read architecture evolution right now. Try again in a moment.' })
       const lines: string[] = []
-      for (const c of summary.changes) lines.push(`- ${c.headline} (${c.status.label}${c.outcome ? `; ${c.outcome.summary}` : ''})`)
+      for (const c of summary.changes) lines.push(`- ${c.headline} ${c.detail} (${c.status.label}${c.outcome ? `; ${c.outcome.plain}` : ''})`)
       if (summary.waitingOnYou > 0) {
         lines.push(`${summary.waitingOnYou} architecture change(s) wait for the owner's approval on the Autonomy page. Approval is theirs to give; an agent cannot give it.`)
       }
-      for (const r of summary.recommendations.slice(0, 3)) lines.push(`- Recommended, not proposed to run: ${r.sentence}`)
+      // Each sentence already says what it is ("Recommended for orders, not proposed to run: …").
+      for (const r of summary.recommendations.slice(0, 3)) lines.push(`- ${r.sentence}`)
       for (const n of summary.noChange.slice(0, 3)) lines.push(`- ${n.subject}: ${n.reason}`)
       if (!summary.execution.enabled) lines.push(summary.execution.reason ?? '')
       let data: Record<string, unknown> = { ...summary }

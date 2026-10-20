@@ -12,6 +12,7 @@ import { rlsSessionParams, rlsSessionSql } from '@/lib/services/rls-session'
 import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
 import { EVOLUTION_FINDING_TYPE } from '@/lib/core/types'
 import { decisionTrail, summarizeDecisions } from '@/lib/evolution-engine/memory'
+import { proposeChanges } from '@/lib/evolution-engine/engine'
 import type { EvolutionRequestDetails } from '@/lib/evolution-engine/request'
 import { handleEvolutionBackfillJob } from '@/lib/structural-evolution/backfill-job'
 
@@ -133,6 +134,26 @@ export async function dropProject(f: Fixture): Promise<void> {
   await prisma.workspaceSchemaSnapshot.deleteMany({ where: { projectId: f.projectId } }).catch(() => {})
   await prisma.project.deleteMany({ where: { userId: f.ownerId } }).catch(() => {})
   await prisma.user.delete({ where: { id: f.ownerId } }).catch(() => {})
+}
+
+/**
+ * A proposal pass in a deployment where approved changes carry on by
+ * themselves: the only setup in which Backenly asks a person for one
+ * (`continuation` in lib/evolution-engine/engine.ts). The flags are put back as
+ * they were afterwards, so each test still decides whether approving runs it.
+ */
+export async function proposeWhereItRuns(projectId: string, opts: { now?: Date } = {}) {
+  const saved = { m: process.env.ENABLE_EVOLUTION_MUTATIONS, s: process.env.ENABLE_EVOLUTION_SCHEDULER }
+  process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
+  process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+  try {
+    return await proposeChanges(projectId, opts)
+  } finally {
+    for (const [k, v] of [['ENABLE_EVOLUTION_MUTATIONS', saved.m], ['ENABLE_EVOLUTION_SCHEDULER', saved.s]] as const) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
 }
 
 export async function requestsOf(projectId: string) {

@@ -243,18 +243,31 @@ export interface TelemetrySnapshot {
 
 /** Words for a person. Never internal state names, never SQL. */
 export interface UserFacingSummary {
-  /** "Backenly improved your Orders architecture." */
+  /** "Move refund data out of orders into its own table". */
   headline: string
   /** What changed, in one or two sentences. */
   change: string
-  /** Why. */
+  /** Why, in plain sentences: what it costs today, never a count or a score. */
   reason: string
+  /** That apps using the subject today keep working. */
   compatibility: string
+  /**
+   * That who may read or change the data stays the same. Said only where the
+   * rehearsal checked it (`rehearsal.authorization === 'passed'`).
+   */
+  access?: string
+  /** What undo removes and what it keeps, including what stops working. */
   rollback: string
   /** The subject as a name in a sentence: "Orders". */
   subjectTitle: string
   /** What was done, as a past-tense clause: "moved refund data out of orders into its own table, order_refunds". */
   did: string
+  /**
+   * What each stage does, as the subject of "… did not finish": "copying the
+   * existing refund data into order_refunds". A step that fails is told by its
+   * stage in these words, never by its internal name or its error.
+   */
+  stages?: Partial<Record<RungStage, string>>
 }
 
 export interface Opportunity<Spec = unknown> {

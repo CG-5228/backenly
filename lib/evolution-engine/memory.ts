@@ -128,6 +128,12 @@ export async function remember(input: {
   /** The one sentence a person reads. Plain words, no SQL. */
   sentence: string
   userId?: string | null
+  /**
+   * Something went wrong that a person should look at: a step that did not
+   * finish, a regression, an undo that stopped part-way. Feeds label only these
+   * as failures; a withdrawn request or a person's own pause is not one.
+   */
+  problem?: boolean
 }): Promise<{ written: boolean }> {
   const r = input.record
   const where = [
@@ -153,6 +159,7 @@ export async function remember(input: {
     primitive: r.primitive,
     subject: r.subject,
     sentence: input.sentence,
+    ...(input.problem ? { problem: true } : {}),
   }).slice(0, DETAILS_MAX)
 
   await prisma.auditLog.create({
@@ -276,8 +283,8 @@ export interface DecisionSummary {
   observingSince?: Date
   /** An undo removed part of the change and then failed: only undo remains. */
   undoIncomplete: boolean
-  /** The latest benefit verdict, if one was reached. */
-  outcome?: { verdict: string; summary: string; at: Date }
+  /** The latest benefit verdict, if one was reached: `plain` by default, `summary` with its numbers. */
+  outcome?: { verdict: string; summary: string; plain: string; at: Date }
   /** The latest sentence a person was shown about this decision. */
   headline?: string
   evidenceHash?: string
@@ -319,7 +326,7 @@ export function summarizeDecisions(entries: MemoryEntry[]): DecisionSummary[] {
       findingId?: string
       reason?: string
       verdict?: string
-      benefit?: { verdict?: string; summary?: string }
+      benefit?: { verdict?: string; summary?: string; plain?: string }
       undoIncomplete?: boolean
     }
     if (r.planVersion) d.planVersion = r.planVersion
@@ -345,7 +352,7 @@ export function summarizeDecisions(entries: MemoryEntry[]): DecisionSummary[] {
     if (r.event === 'declined') d.declined = true
     if (r.event === 'withdrawn') d.withdrawn = true
     if (r.event === 'outcome' && p.benefit?.verdict) {
-      d.outcome = { verdict: p.benefit.verdict, summary: p.benefit.summary ?? '', at: e.at }
+      d.outcome = { verdict: p.benefit.verdict, summary: p.benefit.summary ?? '', plain: p.benefit.plain ?? '', at: e.at }
     }
     if (p.verdict === 'regressed' || p.benefit?.verdict === 'regressed') d.regressed = true
     if (e.milestone && e.sentence) d.headline = e.sentence

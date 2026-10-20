@@ -21,7 +21,13 @@
  *               shown is said where the person reads it, the data is reconciled
  *               again, and a problem found then stops the change for a person
  *               (the measurement step is replaced only to choose a verdict)
- *   decline     "not now" is remembered the same way
+ *   decline     a decline is remembered the same way, and said where the
+ *               person reads it; "not now" on a stopped change moves it to
+ *               the card without touching it
+ *   asking      Backenly asks only where an approved change then finishes on
+ *               its own, and says plainly why a change waits where it does not
+ *   stopping    a step that does not finish is told by what it was doing,
+ *               never by a job id or the database's words
  *   scheduler   resumes only what a person approved, and holds it where it is
  *               while the project is mid-incident (lib/autonomy/change-freeze.ts)
  *
@@ -38,6 +44,8 @@ import { explainHeldBack } from '@/lib/autonomy/because-copy'
 import {
   advance,
   approveRequest,
+  architectureSummary,
+  dismissRequest,
   isActionRefusal,
   isApprovalRefusal,
   listChanges,
@@ -45,7 +53,6 @@ import {
   observe,
   pause,
   proposeChanges,
-  recordDecline,
   resume,
   sweepArchitecture,
   undo,
@@ -56,16 +63,25 @@ import { readTableFacts } from '@/lib/structural-evolution/facts'
 import { structuralExtraction } from '@/lib/structural-evolution/primitive'
 import type { Measurement } from '@/lib/evolution-engine/primitive'
 import { workspaceOn } from '@/lib/structural-evolution/workspace'
-import { asService, buildProject, drain, dropProject, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
+import { asService, buildProject, drain, dropProject, proposeWhereItRuns, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
 
 jest.setTimeout(300_000)
 
 const originalMutations = process.env.ENABLE_EVOLUTION_MUTATIONS
+const originalScheduler = process.env.ENABLE_EVOLUTION_SCHEDULER
 const HOUR = 3_600_000
+
+// A deployment that carries approved changes on by itself, as one that asks
+// for them does; the scheduler suite below turns it off where it says so.
+beforeAll(() => {
+  process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+})
 
 afterAll(async () => {
   if (originalMutations === undefined) delete process.env.ENABLE_EVOLUTION_MUTATIONS
   else process.env.ENABLE_EVOLUTION_MUTATIONS = originalMutations
+  if (originalScheduler === undefined) delete process.env.ENABLE_EVOLUTION_SCHEDULER
+  else process.env.ENABLE_EVOLUTION_SCHEDULER = originalScheduler
   await closeMaintenanceLockPool()
 })
 
@@ -85,7 +101,7 @@ describe('one architecture change, from proposal to undo', () => {
   afterAll(async () => dropProject(f), 60_000)
 
   it('proposes once: rehearsed first, then asked through the approval queue', async () => {
-    const pass = await proposeChanges(f.projectId)
+    const pass = await proposeWhereItRuns(f.projectId)
     expect(pass.requested).toBe(1)
     const [req] = await requestsOf(f.projectId)
     expect(req.status).toBe('pending_approval')
@@ -97,7 +113,7 @@ describe('one architecture change, from proposal to undo', () => {
     expect(req.ev.rehearsal).toMatchObject({ passed: true })
     expect(req.ev.rehearsal.planVersion).toBe(req.ev.planVersion)
     expect(req.ev.summary.headline).toMatch(/refund/)
-    expect(req.ev.summary.compatibility).toMatch(/keeps working/)
+    expect(req.ev.summary.compatibility).toMatch(/keep working unchanged/)
     expect(req.ev.technical.steps.some(s => s.humanOnly)).toBe(true)
     findingId = req.id
     decisionId = req.ev.decisionId
@@ -113,7 +129,7 @@ describe('one architecture change, from proposal to undo', () => {
     expect(trail.some(e => e.record.event === 'measured')).toBe(true) // the R snapshot
 
     // Asking again changes nothing: one request per decision.
-    expect((await proposeChanges(f.projectId)).requested).toBe(0)
+    expect((await proposeWhereItRuns(f.projectId)).requested).toBe(0)
     expect(await requestsOf(f.projectId)).toHaveLength(1)
   })
 
@@ -133,7 +149,9 @@ describe('one architecture change, from proposal to undo', () => {
   it('with mutations off, records consent and runs nothing', async () => {
     const r = await approveRequest({ projectId: f.projectId, findingId, planVersion, userId: f.ownerId })
     expect(r.ok).toBe(true)
-    expect(!isApprovalRefusal(r) && r.message).toMatch(/switched off/)
+    // Said as it is, in words for a person: never the operator's flag.
+    expect(!isApprovalRefusal(r) && r.message).toMatch(/^Approved\. Backenly isn't running architecture changes in this deployment right now\. It starts when it can/)
+    expect(!isApprovalRefusal(r) && r.message).not.toMatch(/ENABLE_/)
     expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
     expect((await requestsOf(f.projectId))[0].status).toBe('approved')
     expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
@@ -229,7 +247,7 @@ describe('one architecture change, from proposal to undo', () => {
 
     const priors = priorsFor(summarizeDecisions(await readMemory(f.projectId)))
     expect(priors['orders:refund']).toMatchObject({ kind: 'reversed', regressed: false })
-    expect((await proposeChanges(f.projectId)).requested).toBe(0)
+    expect((await proposeWhereItRuns(f.projectId)).requested).toBe(0)
     const assessed = (await readMemory(f.projectId)).filter(e => e.record.event === 'assessed' && e.record.concernKey === 'orders:refund')
     expect(assessed[assessed.length - 1].sentence).toMatch(/you undid it/)
   })
@@ -245,7 +263,7 @@ describe('a change that misbehaves under observation', () => {
   beforeAll(async () => {
     process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
     f = await buildProject('regress')
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
     decisionId = req.ev.decisionId
     const a = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
@@ -256,7 +274,7 @@ describe('a change that misbehaves under observation', () => {
   }, 180_000)
   afterAll(async () => dropProject(f), 60_000)
 
-  it('stops on the first divergence and asks the owner to resume or undo', async () => {
+  it('stops on the first divergence and asks the owner to keep or undo it', async () => {
     expect((await stateOf(f.projectId, decisionId)).state).toBe('observing')
     // A write that bypasses the triggers — the one way the two shapes can part.
     await prisma.$transaction(async tx => {
@@ -268,7 +286,8 @@ describe('a change that misbehaves under observation', () => {
     expect((await stateOf(f.projectId, decisionId)).state).toBe('blocked')
     const [req] = await requestsOf(f.projectId)
     expect(req.status).toBe('pending_approval')
-    expect(req.ev.ask).toBe('resume_or_undo')
+    // It was already in place: there is nothing left to resume.
+    expect(req.ev.ask).toBe('keep_or_undo')
     expect(req.ev.stoppedBecause).toMatch(/consistency|disagrees/)
     // Policy: no automatic undo unless the owner turned it on.
     expect(DEFAULT_POLICY.autoRollbackOnRegression).toBe(false)
@@ -309,7 +328,7 @@ describe('after a change is done, its outcome is looked at again, and a later pr
   beforeAll(async () => {
     process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
     f = await buildProject('horizon')
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
     decisionId = req.ev.decisionId
     const a = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
@@ -361,7 +380,7 @@ describe('after a change is done, its outcome is looked at again, and a later pr
     const s = await stateOf(f.projectId, decisionId)
     expect(s.state).toBe('stable')
     expect(s.outcome?.verdict).toBe('neutral')
-    expect(s.headline).toMatch(/^A month on, Backenly can no longer show that the change to orders helped: /)
+    expect(s.headline).toBe('A month on, Backenly can no longer show that the change to orders helped. Existing apps were unaffected, but it has not paid off yet.')
     expect(s.headline).not.toMatch(/improved/)
   })
 
@@ -382,7 +401,7 @@ describe('after a change is done, its outcome is looked at again, and a later pr
     expect(s.headline).toBe('Backenly stopped the change to orders because it saw a problem: its data stopped matching.')
     // Back in front of the person: the request settled when it was done, so a new one is raised.
     const waiting = (await requestsOf(f.projectId)).filter(r => r.ev.decisionId === decisionId && r.status === 'pending_approval')
-    expect(waiting.map(r => [r.ev.ask, r.ev.stoppedBecause])).toEqual([['resume_or_undo', 'its data stopped matching']])
+    expect(waiting.map(r => [r.ev.ask, r.ev.stoppedBecause])).toEqual([['keep_or_undo', 'its data stopped matching']])
   })
 
   it('kept on purpose, it is watched again from now', async () => {
@@ -402,16 +421,24 @@ describe('declining a request', () => {
   }, 120_000)
   afterAll(async () => dropProject(f), 60_000)
 
-  it('is remembered, and the same change is not asked for again on the same evidence', async () => {
-    await proposeChanges(f.projectId)
+  it('is remembered, said where the person reads it, and the same change is not asked for again on the same evidence', async () => {
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
-    // What POST /health { findingId } does for this type.
-    await prisma.healthFinding.update({ where: { id: req.id }, data: { status: 'dismissed' } })
-    await recordDecline(f.projectId, req.id, f.ownerId)
+    const r = await dismissRequest({ projectId: f.projectId, findingId: req.id, userId: f.ownerId })
+    expect(r).toMatchObject({ ok: true, message: "Declined. Backenly won't ask again unless something new is measured." })
+    expect((await requestsOf(f.projectId))[0].status).toBe('dismissed')
+    // A second click, or a stale tab, declines nothing twice.
+    expect(await dismissRequest({ projectId: f.projectId, findingId: req.id, userId: f.ownerId })).toMatchObject({ ok: false, status: 409 })
+
+    // Shown, as an architecture event, not a failure.
+    const report = await buildTrustReport(f.projectId)
+    const said = report.recentActivity.find(a => a.summary.startsWith('You declined:'))
+    expect(said).toMatchObject({ kind: 'architecture' })
+    expect(said!.summary).toMatch(/Backenly won't ask again unless something new is measured\.$/)
 
     const priors = priorsFor(summarizeDecisions(await readMemory(f.projectId)))
     expect(priors['orders:refund']).toMatchObject({ kind: 'declined' })
-    expect((await proposeChanges(f.projectId)).requested).toBe(0)
+    expect((await proposeWhereItRuns(f.projectId)).requested).toBe(0)
     expect((await requestsOf(f.projectId)).filter(r => r.status === 'pending_approval')).toHaveLength(0)
     const assessed = (await readMemory(f.projectId)).filter(e => e.record.event === 'assessed' && e.record.concernKey === 'orders:refund')
     expect(assessed[assessed.length - 1].sentence).toMatch(/you declined this change/)
@@ -428,7 +455,7 @@ describe('a request waiting while the table changes', () => {
   beforeAll(async () => {
     delete process.env.ENABLE_EVOLUTION_MUTATIONS
     f = await buildProject('drift')
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
     findingId = req.id
     firstVersion = req.ev.planVersion
@@ -437,7 +464,7 @@ describe('a request waiting while the table changes', () => {
 
   it('is re-rehearsed for the table as it is now, in the same row, and the old version can no longer be approved', async () => {
     await q(`ALTER TABLE "${f.schema}"."orders" ADD COLUMN note text`)
-    const pass = await proposeChanges(f.projectId)
+    const pass = await proposeWhereItRuns(f.projectId)
     expect(pass.refreshed).toBe(1)
     const reqs = await requestsOf(f.projectId)
     expect(reqs).toHaveLength(1)
@@ -452,7 +479,7 @@ describe('a request waiting while the table changes', () => {
   it('is withdrawn — not left in the queue — when the concern it was about is gone', async () => {
     const decisionId = (await requestsOf(f.projectId))[0].ev.decisionId
     await q(`ALTER TABLE "${f.schema}"."orders" DROP COLUMN refund_amount, DROP COLUMN refund_reason, DROP COLUMN refunded_at`)
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
     expect(req.status).toBe('resolved')
     const s = await stateOf(f.projectId, decisionId)
@@ -468,7 +495,6 @@ describe('a request waiting while the table changes', () => {
 describe('the scheduler', () => {
   let f: Fixture
   let decisionId = ''
-  const originalScheduler = process.env.ENABLE_EVOLUTION_SCHEDULER
 
   /**
    * A normal day of end-user traffic, then an hour in which every request
@@ -498,17 +524,13 @@ describe('the scheduler', () => {
     delete process.env.ENABLE_EVOLUTION_MUTATIONS
     delete process.env.ENABLE_EVOLUTION_SCHEDULER
     f = await buildProject('scheduler')
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [req] = await requestsOf(f.projectId)
     decisionId = req.ev.decisionId
     const r = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
     expect(r.ok).toBe(true)
   }, 120_000)
-  afterAll(async () => {
-    if (originalScheduler === undefined) delete process.env.ENABLE_EVOLUTION_SCHEDULER
-    else process.env.ENABLE_EVOLUTION_SCHEDULER = originalScheduler
-    await dropProject(f)
-  }, 60_000)
+  afterAll(async () => dropProject(f), 60_000)
 
   it('runs nothing while it is off', async () => {
     process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
@@ -538,5 +560,147 @@ describe('the scheduler', () => {
     expect(r).not.toHaveProperty('frozen')
     expect((await stateOf(f.projectId, decisionId)).state).toBe('backfilling')
     expect((await drain(f.projectId)).every(x => !x.refusal)).toBe(true)
+  })
+})
+
+
+// ── Asking only for what then finishes on its own ────────────────────────────
+
+describe('asking only for a change that then finishes on its own', () => {
+  let f: Fixture
+  const setup = async (o: { mutations: boolean; scheduler: boolean; autonomy?: 'OFF' | 'BALANCED' }) => {
+    if (o.mutations) process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
+    else delete process.env.ENABLE_EVOLUTION_MUTATIONS
+    if (o.scheduler) process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+    else delete process.env.ENABLE_EVOLUTION_SCHEDULER
+    await prisma.project.update({ where: { id: f.projectId }, data: { autonomyLevel: o.autonomy ?? 'BALANCED' } as any })
+  }
+
+  beforeAll(async () => {
+    f = await buildProject('ask-only')
+  }, 120_000)
+  afterAll(async () => {
+    process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+    await dropProject(f)
+  }, 60_000)
+
+  it.each([
+    ['changes are not run here', { mutations: false, scheduler: true }, "Backenly isn't running architecture changes in this deployment right now."],
+    ['nothing carries changes on here', { mutations: true, scheduler: false }, "this deployment doesn't carry architecture changes on by itself."],
+    ['autonomy is off for the project', { mutations: true, scheduler: true, autonomy: 'OFF' as const }, 'autonomy is off for this project, so Backenly does not carry changes on by itself.'],
+  ])('asks for nothing when %s, and says why', async (_label, o, why) => {
+    await setup(o)
+    const pass = await proposeChanges(f.projectId)
+    expect(pass.requested).toBe(0)
+    expect(await requestsOf(f.projectId)).toHaveLength(0)
+    const summary = await architectureSummary(f.projectId)
+    expect(summary.recommendations.map(r => r.sentence)).toContain(`A change to orders is ready, but Backenly is not asking for it: ${why}`)
+  })
+
+  it('withdraws a request that was waiting when changes stopped carrying on here, as news rather than a failure', async () => {
+    await setup({ mutations: true, scheduler: true })
+    expect((await proposeChanges(f.projectId)).requested).toBe(1)
+    const [req] = await requestsOf(f.projectId)
+    await setup({ mutations: false, scheduler: true })
+    await proposeChanges(f.projectId)
+    expect((await requestsOf(f.projectId))[0].status).toBe('resolved')
+    const s = await stateOf(f.projectId, req.ev.decisionId)
+    expect(s.state).toBe('blocked')
+    expect(s.headline).toBe('Backenly withdrew its request to change orders: approved changes cannot carry on by themselves here right now.')
+    const said = (await buildTrustReport(f.projectId)).recentActivity.find(a => a.summary === s.headline)
+    expect(said).toMatchObject({ kind: 'architecture' })
+
+    // A day later, where it carries on again, it is asked for again.
+    await setup({ mutations: true, scheduler: true })
+    expect((await proposeChanges(f.projectId, { now: new Date(Date.now() + 25 * HOUR) })).refreshed).toBe(1)
+    expect((await requestsOf(f.projectId)).filter(r => r.status === 'pending_approval')).toHaveLength(1)
+  })
+
+  it('says plainly why an approved change waits, and never offers pause and resume together', async () => {
+    await setup({ mutations: true, scheduler: true })
+    const [req] = (await requestsOf(f.projectId)).filter(r => r.status === 'pending_approval')
+    // The deployment stopped running changes between the request and the click.
+    await setup({ mutations: false, scheduler: true })
+    const r = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
+    expect(!isApprovalRefusal(r) && r.message).toBe(
+      "Approved. Backenly isn't running architecture changes in this deployment right now. It starts when it can; your app works as before.",
+    )
+    const view = async () => (await listChanges(f.projectId)).find(c => c.decisionId === req.ev.decisionId)!
+    let c = await view()
+    expect(c).toMatchObject({
+      status: { label: 'Waiting to start', tone: 'attention' },
+      waiting: "Backenly isn't running architecture changes in this deployment right now.",
+      actions: { pause: false, resume: false },
+    })
+    expect(c).not.toHaveProperty('state')
+    expect((await listChanges(f.projectId, { detail: true })).find(x => x.decisionId === req.ev.decisionId)?.state).toBe('approved')
+    // Nothing resumes where nothing can run, and it says so instead of "Resumed.".
+    const refused = await resume({ projectId: f.projectId, decisionId: req.ev.decisionId, userId: f.ownerId })
+    expect(isActionRefusal(refused) && refused.error).toMatch(/^Backenly isn't running architecture changes in this deployment right now, so this one can't carry on yet\./)
+
+    // Runs here, but nothing carries it on: a person may push it on, and only that.
+    await setup({ mutations: true, scheduler: false })
+    c = await view()
+    expect(c).toMatchObject({ status: { label: 'Waiting to start' }, waiting: "This deployment doesn't carry architecture changes on by itself.", actions: { pause: false, resume: true } })
+    // Carried on by itself: it can be paused, and there is nothing to resume.
+    await setup({ mutations: true, scheduler: true })
+    c = await view()
+    expect(c).toMatchObject({ status: { label: 'In progress' }, actions: { pause: true, resume: false } })
+    expect(c).not.toHaveProperty('waiting')
+    expect(c.headline).toBe('Backenly is changing your Orders architecture.')
+  })
+})
+
+// ── A step that does not finish ──────────────────────────────────────────────
+
+describe('a step that does not finish', () => {
+  let f: Fixture
+  let decisionId = ''
+
+  beforeAll(async () => {
+    process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
+    process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+    f = await buildProject('step-fails')
+    await proposeWhereItRuns(f.projectId)
+    const [req] = await requestsOf(f.projectId)
+    decisionId = req.ev.decisionId
+    const r = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
+    expect(r).toMatchObject({ ok: true, state: 'backfilling' })
+  }, 120_000)
+  afterAll(async () => dropProject(f), 60_000)
+
+  it('is told by what it was doing, never by a job id or the database\'s words, and a vanished job is not the table changing', async () => {
+    // The copy's background job disappears before it ran: not drift, a step that did not finish.
+    await prisma.backgroundJob.deleteMany({ where: { projectId: f.projectId, type: 'evolution_backfill' } })
+    const r = await advance({ projectId: f.projectId, decisionId })
+    expect(r.state).toBe('failed')
+    const s = await stateOf(f.projectId, decisionId)
+    expect(s.stoppedBecause).toBe('copying the existing refund data into order_refunds did not finish')
+    expect(s.headline).toBe(
+      'The change to orders stopped: copying the existing refund data into order_refunds did not finish. Your app works as before; you can resume or undo it.',
+    )
+    expect(s.headline).not.toMatch(/job|step \d|backfill|no longer exists|table changed/)
+    // The executor's own account stays in the history.
+    const stopped = (await decisionTrail(f.projectId, decisionId)).filter(e => e.record.state === 'failed').at(-1)!
+    expect((stopped.record.payload as any).haltReason).toMatch(/background job .* no longer exists/)
+    // A failure, where the feed says what happened.
+    const said = (await buildTrustReport(f.projectId)).recentActivity.find(a => a.summary === s.headline)
+    expect(said).toMatchObject({ kind: 'failed' })
+    // In the queue, the same plain reason, asking resume or undo.
+    const waiting = (await requestsOf(f.projectId)).filter(x => x.status === 'pending_approval')
+    expect(waiting.map(x => [x.ev.ask, x.ev.stoppedBecause])).toEqual([['resume_or_undo', s.stoppedBecause]])
+  })
+
+  it('"not now" leaves the change as it is and hands the decision to the card', async () => {
+    const [req] = (await requestsOf(f.projectId)).filter(x => x.status === 'pending_approval')
+    const r = await dismissRequest({ projectId: f.projectId, findingId: req.id, userId: f.ownerId })
+    expect(r).toMatchObject({ ok: true, state: 'failed' })
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('failed')
+    expect((await requestsOf(f.projectId)).filter(x => x.status === 'pending_approval')).toHaveLength(0)
+    const c = (await listChanges(f.projectId)).find(x => x.decisionId === decisionId)!
+    expect(c).not.toHaveProperty('findingId')
+    expect(c.actions).toMatchObject({ resume: true, undo: true, pause: false })
+    expect(c.headline).toBe('The change to your Orders architecture stopped.')
+    expect(c.detail).toBe('It stopped because copying the existing refund data into order_refunds did not finish. Your app works as before.')
   })
 })

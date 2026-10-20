@@ -10,38 +10,49 @@
  * HealthFinding of type `architecture_evolution` with status
  * `pending_approval`, in the trust report's `pendingApprovals`, with its
  * `details.evolution` verbatim (lib/evolution-engine/request.ts). The queue
- * already has the badge, the count and the dismiss path. What it did not have
- * is a way to give consent that is bound to one exact plan version, so this row
- * carries exactly that and nothing more.
+ * already has the badge and the count. What it did not have is a way to give
+ * consent that is bound to one exact plan version, so this row carries exactly
+ * that and nothing more. Backenly asks only for a change it can then carry
+ * through on its own: approving is the one thing a person does.
  *
  * WHAT A PERSON SEES BY DEFAULT
  * -----------------------------
- * The headline, what changes and why, three small facts (how risky, that
- * existing apps keep working, that it can be undone), whether it was rehearsed
- * on a copy, and two buttons. A change that stopped part-way asks a different
- * question (resume it, or undo it) and says why it stopped in one sentence.
+ * The headline, what changes and why (in plain words: never a count or a
+ * score), the risk, that apps keep working and who may read the data (only
+ * where the rehearsal checked it), what undo does, whether it was rehearsed on
+ * a copy, and two buttons. Every sentence is on the page, never only in a
+ * tooltip a keyboard or a phone cannot reach. A change that stopped asks a
+ * different question, resume or undo, or, once it was in place, keep or undo,
+ * and says why it stopped in one sentence.
  *
- * Everything else, the steps with their exact SQL, the evidence, what this
- * change deliberately does not decide and what someone would have to migrate
- * before the old columns could ever be removed, sits behind one "Technical
- * details" toggle. Internal lifecycle states are never shown, and nothing here
- * ever offers to remove the old columns: that step is planned and explained,
- * never run by software, and so never a button.
+ * Everything else, the steps with their exact SQL, the evidence and its
+ * numbers, what this change deliberately does not decide and what someone
+ * would have to migrate before the old columns could ever be removed, sits
+ * behind one "Technical details" toggle. Internal lifecycle states are never
+ * shown, and nothing here ever offers to remove the old columns: that step is
+ * planned and explained, never run by software, and so never a button.
  *
  * WHERE THE DECISIONS GO
  * ----------------------
- *   Approve   POST /api/projects/[id]/architecture { action: 'approve', findingId, planVersion }
- *             The plan version is the one on screen. A 409 means the world moved
- *             (the table changed and Backenly re-checked it, or someone else is
- *             already approving): the row says so and asks the queue to re-read,
- *             so the next click consents to what the person is now looking at.
- *   Resume /  POST /api/projects/[id]/architecture { action, decisionId }
- *   Undo      Undo asks once more before it runs.
- *   Not now   POST /api/projects/[id]/health { findingId } (the queue's dismiss;
- *             a 409 means someone already decided it, and the queue re-reads)
+ * Every one to POST /api/projects/[id]/architecture, which needs an
+ * organization admin (a refusal says so, ADMIN_ONLY):
  *
- * Never /health/approve or /approvals: both refuse this type, and neither can
- * bind consent to a plan version.
+ *   Approve   { action: 'approve', findingId, planVersion }  The plan version is
+ *             the one on screen. A 409 means the world moved (the table changed
+ *             and Backenly re-checked it, or someone else is already
+ *             approving): the row says so and asks the queue to re-read, so the
+ *             next click consents to what the person is now looking at.
+ *   Decline   { action: 'dismiss', findingId }  Remembered: Backenly does not
+ *             ask again unless something new is measured, and says so.
+ *   Not now   the same, on a stopped change: the change stays as it is and the
+ *             decision moves to the Architecture changes card.
+ *   Resume /  { action: 'resume', decisionId }
+ *   Keep it
+ *   Undo      { action: 'undo', decisionId }  Asks once more, saying what undo
+ *             removes and what stops working, before it runs.
+ *
+ * Never /health, /health/approve or /approvals: they refuse this type, and none
+ * of them can bind consent to a plan version.
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -49,6 +60,7 @@ import { CheckCircle2, ChevronDown, Info, Loader2, Undo2, XCircle } from 'lucide
 import { KitButton, Tag } from '@/components/inspector/kit'
 import type { EvolutionRequestDetails } from '@/lib/evolution-engine/request'
 import type { RiskLevel } from '@/lib/evolution-engine/policy'
+import { ADMIN_ONLY, announceArchitectureChange } from './architecture-decisions'
 
 /** The part of a queue row this component reads. PendingApproval satisfies it. */
 export interface EvolutionQueueItem {
@@ -116,6 +128,11 @@ function rehearsedThisVersion(ev: EvolutionRequestDetails): boolean {
   return !!ev.rehearsal?.passed && ev.rehearsal.planVersion === ev.planVersion
 }
 
+/** What a refusal says, with a role refusal in words that name the role. */
+function refusal(status: number, error: string | undefined, fallback: string): string {
+  return status === 403 ? ADMIN_ONLY : error || fallback
+}
+
 export function EvolutionRequestRow({
   projectId,
   request,
@@ -132,18 +149,31 @@ export function EvolutionRequestRow({
   const [state, setState] = useState<RowState>({ phase: 'idle' })
   const [showTechnical, setShowTechnical] = useState(false)
   const timers = useRef<ReturnType<typeof setTimeout>[]>([])
+  const actions = useRef<HTMLDivElement>(null)
+  const previous = useRef<RowState['phase']>('idle')
   useEffect(() => () => { timers.current.forEach(clearTimeout) }, [])
+
+  // Keyboard focus follows the confirmation: onto its safe choice when it
+  // opens, back to Undo when it is cancelled, never lost with a button that
+  // unmounted under it.
+  useEffect(() => {
+    const buttons = () => [...(actions.current?.querySelectorAll('button') ?? [])]
+    if (state.phase === 'confirm_undo') buttons()[0]?.focus()
+    else if (previous.current === 'confirm_undo' && state.phase === 'idle') buttons().find(b => /Undo/.test(b.textContent ?? ''))?.focus()
+    previous.current = state.phase
+  }, [state.phase])
 
   const ev = evolutionOf(request)
 
   const settle = (message: string) => {
     setState({ phase: 'done', message })
     onDecided?.(message)
+    announceArchitectureChange('queue')
     timers.current.push(setTimeout(() => { void onRefresh() }, SETTLE_MS))
   }
 
-  const post = async (url: string, body: Record<string, unknown>) => {
-    const res = await fetch(url, {
+  const post = async (body: Record<string, unknown>) => {
+    const res = await fetch(`/api/projects/${projectId}/architecture`, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
@@ -153,51 +183,44 @@ export function EvolutionRequestRow({
     return { res, j: (j ?? {}) as { ok?: boolean; message?: string; error?: string } }
   }
 
-  const decide = async (action: 'approve' | 'resume' | 'undo') => {
-    if (!ev) return
+  const run = async (action: Action, body: Record<string, unknown>, done: string) => {
     setState({ phase: 'busy', action })
     try {
-      const body =
-        action === 'approve'
-          ? { action, findingId: request.id, planVersion: ev.planVersion }
-          : { action, decisionId: ev.decisionId }
-      const { res, j } = await post(`/api/projects/${projectId}/architecture`, body)
+      const { res, j } = await post(body)
       if (res.ok && j.ok) {
-        settle(j.message || (action === 'undo' ? 'Undone.' : action === 'resume' ? 'Resumed.' : 'Approved.'))
+        settle(j.message || done)
         return
       }
       if (res.status === 409) {
-        setState({ phase: 'moved', message: j.error || 'This change moved on since you opened it. Here is the current version.' })
+        setState({ phase: 'moved', message: j.error || 'This change moved on since you opened it. Here is where it is now.' })
         await onRefresh()
         return
       }
-      setState({ phase: 'error', message: j.error || 'That did not go through. Try again in a moment.' })
+      setState({ phase: 'error', message: refusal(res.status, j.error, 'That did not go through. Try again in a moment.') })
     } catch {
       setState({ phase: 'error', message: 'Network error. Check your connection and try again.' })
     }
   }
 
-  const notNow = async () => {
-    setState({ phase: 'busy', action: 'dismiss' })
-    try {
-      const { res, j } = await post(`/api/projects/${projectId}/health`, { findingId: request.id })
-      if (res.status === 409) {
-        // Someone already decided it; show where it is now.
-        setState({ phase: 'moved', message: j.error || 'This change was already decided.' })
-        await onRefresh()
-        return
-      }
-      if (!res.ok) {
-        setState({ phase: 'error', message: 'Could not dismiss. Try again.' })
-        return
-      }
-      await onRefresh()
-    } catch {
-      setState({ phase: 'error', message: 'Network error. Try again.' })
-    }
+  const decide = (action: 'approve' | 'resume' | 'undo') => {
+    if (!ev) return
+    const body =
+      action === 'approve' ? { action, findingId: request.id, planVersion: ev.planVersion } : { action, decisionId: ev.decisionId }
+    return run(action, body, action === 'undo' ? 'Undone.' : action === 'resume' ? 'Done.' : 'Approved.')
   }
 
-  // A row this page cannot read is still a row the person can clear.
+  const dismiss = () => run('dismiss', { action: 'dismiss', findingId: request.id }, 'Set aside.')
+
+  // What a screen reader hears as the row changes: the outcome of a decision,
+  // a version that moved, or the question an undo asks.
+  const announced =
+    state.phase === 'done' || state.phase === 'moved'
+      ? state.message
+      : state.phase === 'confirm_undo' && ev
+        ? `Undo? ${ev.summary.rollback}`
+        : ''
+
+  // A row this page cannot read is still a row the person can set aside.
   if (!ev) {
     return (
       <li className="px-5 py-3.5">
@@ -209,10 +232,10 @@ export function EvolutionRequestRow({
               This page cannot read the request. Refresh, or set it aside.
             </p>
             {state.phase === 'error' && (
-              <p className="mt-1 text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
+              <p role="alert" className="mt-1 text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
             )}
           </div>
-          <KitButton variant="secondary" onClick={notNow} disabled={state.phase === 'busy'}>
+          <KitButton variant="secondary" onClick={dismiss} disabled={state.phase === 'busy'}>
             Not now
           </KitButton>
         </div>
@@ -230,17 +253,21 @@ export function EvolutionRequestRow({
         <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-emerald-400" />
         <div className="min-w-0 flex-1">
           <p className="text-[12.5px] font-medium text-zinc-200">{s.headline}</p>
-          <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{state.message}</p>
+          <p role="status" aria-live="polite" className="mt-1 text-[12.5px] leading-snug text-zinc-400">{state.message}</p>
         </div>
       </li>
     )
   }
 
   const asksApproval = ev.ask === 'approve'
+  // Stopped after it was already in place: there is nothing left to resume.
+  const keeps = ev.ask === 'keep_or_undo'
   const rehearsed = rehearsedThisVersion(ev)
+  const accessChecked = ev.rehearsal?.authorization === 'passed'
 
   return (
     <li className={`px-5 py-3.5 transition-colors ${state.phase === 'error' ? 'bg-rose-500/[0.03]' : ''}`}>
+      <p className="sr-only" role="status" aria-live="polite">{announced}</p>
       <div className="flex items-start gap-3">
         <span
           className={`mt-1.5 size-1.5 shrink-0 rounded-full ${asksApproval ? 'bg-violet-400' : 'bg-amber-400'} ${
@@ -253,24 +280,27 @@ export function EvolutionRequestRow({
           {asksApproval ? (
             <>
               {s.change && <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{s.change}</p>}
-              {s.reason && <p className="mt-1 text-[12.5px] leading-snug text-zinc-500">{s.reason}</p>}
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                {RISK_LABEL[ev.risk] && <Tag tone={RISK_TONE[ev.risk]}>{RISK_LABEL[ev.risk]}</Tag>}
-                <span title={s.compatibility || undefined}>
-                  <Tag>Existing apps keep working</Tag>
-                </span>
-                <span title={s.rollback || undefined}>
-                  <Tag>Can be undone</Tag>
-                </span>
-              </div>
+              {s.reason && <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{s.reason}</p>}
+              {RISK_LABEL[ev.risk] && (
+                <div className="mt-2">
+                  <Tag tone={RISK_TONE[ev.risk]}>{RISK_LABEL[ev.risk]}</Tag>
+                </div>
+              )}
+              <p className="mt-2 text-[12.5px] leading-snug text-zinc-400">
+                {s.compatibility}{' '}
+                {accessChecked
+                  ? s.access ?? ''
+                  : 'Who can read or change this data was not checked on the copy, so Backenly does not promise it stays the same.'}
+              </p>
+              {s.rollback && <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{s.rollback}</p>}
               {rehearsed ? (
-                <p className="mt-2 text-[12px] leading-snug text-zinc-500">
-                  {ev.rehearsal.authorization === 'passed'
+                <p className="mt-2 text-[12px] leading-snug text-zinc-400">
+                  {accessChecked
                     ? 'Rehearsed on a copy of your data, including who can read and change it.'
                     : 'Rehearsed on a copy of your data.'}
                 </p>
               ) : (
-                <p className="mt-2 text-[12px] leading-snug text-zinc-500">
+                <p className="mt-2 text-[12px] leading-snug text-zinc-400">
                   Not rehearsed yet. Backenly rehearses a change on a copy of your data before it can be approved.
                 </p>
               )}
@@ -278,11 +308,11 @@ export function EvolutionRequestRow({
           ) : (
             <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">
               {ev.stoppedBecause ? `It stopped because ${lowerFirst(ev.stoppedBecause)}` : 'It stopped part-way.'}
-              {' '}Resume it, or undo it.
+              {keeps ? ' It is still in place. Keep it, or undo it.' : ' Resume it, or undo it.'}
             </p>
           )}
 
-          <p className="mt-1.5 text-[12px] text-zinc-600">{timeAgo(request.detectedAt)}</p>
+          <p className="mt-1.5 text-[12px] tabular-nums text-zinc-400">{timeAgo(request.detectedAt)}</p>
 
           <TechnicalDetails
             ev={ev}
@@ -295,9 +325,7 @@ export function EvolutionRequestRow({
           {state.phase === 'confirm_undo' && (
             <div className="mt-2 flex items-start gap-2 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2">
               <Undo2 className="mt-px size-3.5 shrink-0 text-zinc-400" />
-              <p className="text-[12.5px] leading-snug text-zinc-300">
-                Undo puts {ev.subject} back exactly as it was. Nothing is lost.
-              </p>
+              <p className="text-[12.5px] leading-snug text-zinc-300">{s.rollback || `Undo puts ${ev.subject} back exactly as it was.`}</p>
             </div>
           )}
 
@@ -311,12 +339,12 @@ export function EvolutionRequestRow({
           {state.phase === 'error' && (
             <div className="mt-2 flex items-start gap-2">
               <XCircle className="mt-px size-3.5 shrink-0 text-rose-400" />
-              <p className="text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
+              <p role="alert" className="text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
             </div>
           )}
         </div>
 
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+        <div ref={actions} className="flex shrink-0 flex-wrap items-center justify-end gap-2">
           {state.phase === 'error' ? (
             <KitButton variant="secondary" onClick={() => setState({ phase: 'idle' })}>
               Try again
@@ -324,7 +352,7 @@ export function EvolutionRequestRow({
           ) : state.phase === 'confirm_undo' ? (
             <>
               <KitButton variant="secondary" onClick={() => setState({ phase: 'idle' })}>
-                Keep it
+                Cancel
               </KitButton>
               <KitButton variant="danger" onClick={() => decide('undo')}>
                 <Undo2 className="size-3.5" /> Undo
@@ -332,9 +360,9 @@ export function EvolutionRequestRow({
             </>
           ) : asksApproval ? (
             <>
-              <KitButton variant="secondary" onClick={notNow} disabled={busy}>
+              <KitButton variant="secondary" onClick={dismiss} disabled={busy}>
                 {busyWith('dismiss') ? <Loader2 className="size-3 animate-spin" /> : null}
-                Not now
+                Decline
               </KitButton>
               {rehearsed && (
                 <KitButton variant="primary" onClick={() => decide('approve')} disabled={busy}>
@@ -348,7 +376,7 @@ export function EvolutionRequestRow({
             </>
           ) : (
             <>
-              <KitButton variant="secondary" onClick={notNow} disabled={busy}>
+              <KitButton variant="secondary" onClick={dismiss} disabled={busy}>
                 {busyWith('dismiss') ? <Loader2 className="size-3 animate-spin" /> : null}
                 Not now
               </KitButton>
@@ -357,7 +385,9 @@ export function EvolutionRequestRow({
                 Undo
               </KitButton>
               <KitButton variant="primary" onClick={() => decide('resume')} disabled={busy}>
-                {busyWith('resume') ? <><Loader2 className="size-3.5 animate-spin" /> Resuming…</> : 'Resume'}
+                {busyWith('resume') ? (
+                  <><Loader2 className="size-3.5 animate-spin" /> {keeps ? 'Keeping…' : 'Resuming…'}</>
+                ) : keeps ? 'Keep it' : 'Resume'}
               </KitButton>
             </>
           )}
@@ -545,7 +575,7 @@ function TechnicalDetails({
                 {migration.map((m, i) => (
                   <li key={i}>
                     <p className="text-zinc-500">To {m.purpose}:</p>
-                    <p className="font-mono text-[12px] text-zinc-600">before {m.before}</p>
+                    <p className="font-mono text-[12px] text-zinc-500">before {m.before}</p>
                     <p className="font-mono text-[12px] text-zinc-400">after&nbsp; {m.after}</p>
                   </li>
                 ))}

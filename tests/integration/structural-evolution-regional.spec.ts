@@ -47,8 +47,8 @@ import { rollbackExtraction } from '@/lib/structural-evolution/rollback'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
 import { workspaceAt } from '@/lib/structural-evolution/workspace'
 import { ladderNames, type ExtractionSpec } from '@/lib/structural-evolution/sql'
-import { advance, approveRequest, isApprovalRefusal, liveStatements, observe, proposeChanges, undo } from '@/lib/evolution-engine/engine'
-import { ordersSql, recordHistory, requestsOf, stateOf } from '../helpers/evolution-engine-fixture'
+import { advance, approveRequest, isApprovalRefusal, liveStatements, observe, undo } from '@/lib/evolution-engine/engine'
+import { ordersSql, proposeWhereItRuns, recordHistory, requestsOf, stateOf } from '../helpers/evolution-engine-fixture'
 
 jest.setTimeout(300_000)
 
@@ -334,7 +334,7 @@ describe('the engine, for a project kept in us-east-1', () => {
   }, 60_000)
 
   it('proposes from the region, and the request at home carries no statement', async () => {
-    const pass = await proposeChanges(p.projectId)
+    const pass = await proposeWhereItRuns(p.projectId)
     expect(pass.requested).toBe(1)
     const [req] = await requestsOf(p.projectId)
     expect(req.ev).toMatchObject({ ask: 'approve', subject: 'orders', level: 'executable_proposal' })

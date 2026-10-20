@@ -54,6 +54,7 @@ import { groupFindings, CATEGORY_LABEL, type FindingGroup } from '@/lib/core/fin
 import { hasExecutableFix } from '@/lib/core/fix-actions'
 import { isEvolutionApprovalFinding } from '@/lib/core/types'
 import { EvolutionRequestRow } from '@/components/autonomy/EvolutionRequestRow'
+import { onArchitectureChange } from '@/components/autonomy/architecture-decisions'
 
 interface PendingApproval {
   id: string
@@ -245,6 +246,8 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
   }, [projectId])
 
   useEffect(() => { fetchReport() }, [fetchReport])
+  // A change decided on the Architecture changes card leaves or joins this queue.
+  useEffect(() => onArchitectureChange('queue', () => { void fetchReport(true) }), [fetchReport])
 
   // Architecture changes leave before grouping: each is its own decision on its
   // own plan version, and the grouper would fold several into one row.

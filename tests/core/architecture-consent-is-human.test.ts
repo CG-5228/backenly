@@ -30,7 +30,7 @@ function walk(dir: string): string[] {
 }
 
 /** Every function that records or changes consent, or moves a change forward or back. */
-const DECISIONS = /\b(approveRequest|grantEvolutionApproval|revokeEvolutionApproval|claimRequest|executeExtraction|rollbackExtraction)\b|\b(pause|resume|undo|advance)\s*\(\s*\{\s*projectId/
+const DECISIONS = /\b(approveRequest|dismissRequest|recordDecline|grantEvolutionApproval|revokeEvolutionApproval|claimRequest|executeExtraction|rollbackExtraction)\b|\b(pause|resume|undo|advance)\s*\(\s*\{\s*projectId/
 
 describe('the decision door', () => {
   const ROUTE = 'app/api/projects/[id]/architecture/route.ts'
@@ -41,6 +41,15 @@ describe('the decision door', () => {
     expect(src).toMatch(/export async function GET[\s\S]*withProjectValidation/)
     // withProjectValidation authenticates a SESSION; MCP credentials are API keys.
     expect(read('lib/middleware/projectValidation.ts')).toMatch(/requireAuth|verifySession/)
+  })
+
+  it('declining is decided there too, at the same floor: the generic dismiss refuses the type', () => {
+    expect(read(ROUTE)).toMatch(/action === 'dismiss'[\s\S]*dismissRequest\(/)
+    expect(read(ROUTE)).toMatch(/floor: 'administer'/)
+    const health = read('app/api/projects/[id]/health/route.ts')
+    const post = health.slice(health.indexOf('export async function POST'))
+    expect(post).toMatch(/if \(isEvolutionApprovalFinding\(finding\.type\)\) \{\s*(\/\/[^\n]*\n\s*)*return NextResponse\.json\(/)
+    expect(post).not.toMatch(/recordDecline/)
   })
 
   it('takes the spec from the request row, never from the body', () => {

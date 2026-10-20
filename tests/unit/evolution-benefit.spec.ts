@@ -382,6 +382,38 @@ describe('the verdict, in order of precedence', () => {
   })
 })
 
+describe('what a person reads by default', () => {
+  // `summary` carries the numbers, for whoever opens the details; `plain` is the
+  // same verdict without them, for the card, the activity feed and a stop reason.
+  const thinTraffic = latency({ samplesBefore: 30, samplesAfter: 12 })
+  const cases: Array<[string, ReturnType<typeof assessBenefit>, string]> = [
+    ['beneficial', assessBenefit(PASS, [latency(), locks(5, 0), problems(6, 0)]), 'It helped: fewer refund changes that locked all of orders and fewer problems found on refund columns.'],
+    ['neutral', assessBenefit(PASS, [latency(), locks(3, 1)]), 'Existing apps were unaffected, but it has not paid off yet.'],
+    ['neutral, worse', assessBenefit(PASS, [latency(), locks(1, 9)]), 'Existing apps were unaffected, but what it was made to improve got worse.'],
+    ['may have helped', assessBenefit(PASS, [thinTraffic, locks(5, 0)]), 'It may have helped, but it is too early to say.'],
+    ['too early', assessBenefit(PASS, [thinTraffic, locks(3, 1)]), 'Too early to say whether it helped.'],
+    ['slower', assessBenefit(PASS, [latency({ name: 'orders write p95', before: 40, after: 90 })]), 'It made things worse: requests got slower.'],
+    ['slower and failing', assessBenefit(PASS, [latency({ before: 40, after: 90 }), rate(0, 1_000, 100, 1_000)]), 'It made things worse: requests got slower and requests failed more often.'],
+    ['data', assessBenefit({ ...PASS, correctness: 'fail' }, []), 'It made things worse: its data stopped matching.'],
+  ]
+
+  it.each(cases)('%s: one sentence, and no number in it', (_label, report, plain) => {
+    expect(report.plain).toBe(plain)
+    expect(report.plain).not.toMatch(/\d/)
+  })
+
+  it('says it helped only when the verdict is beneficial', () => {
+    for (const [, report] of cases) {
+      if (report.verdict !== 'beneficial') expect(report.plain).not.toMatch(/^It helped/)
+    }
+  })
+
+  it('says the data could not be confirmed, when it could not', () => {
+    const r = assessBenefit({ ...PASS, correctness: 'not_run' }, [latency(), locks(5, 0)])
+    expect(r.plain).toBe('Backenly could not confirm its data still matches. It helped: fewer refund changes that locked all of orders.')
+  })
+})
+
 describe('whose traffic must be checked', () => {
   const api = (over: Partial<Measurement> = {}) => latency({ population: 'api', ...over })
   const notServed = (name: string) =>

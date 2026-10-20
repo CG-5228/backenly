@@ -40,6 +40,7 @@ import { DetectedFindingsPanel } from '@/components/DetectedFindingsPanel'
 import { AppliedChangesPanel, type AppliedChange } from '@/components/AppliedChangesPanel'
 import { MaintenanceLadderPanel } from '@/components/MaintenanceLadderPanel'
 import { ArchitectureChangesPanel } from '@/components/autonomy/ArchitectureChangesPanel'
+import { onArchitectureChange } from '@/components/autonomy/architecture-decisions'
 import type { ArchitectureChangeView } from '@/lib/evolution-engine/views'
 
 type Level = 'OFF' | 'CONSERVATIVE' | 'BALANCED' | 'AGGRESSIVE'
@@ -175,6 +176,8 @@ export function AutonomyGuardrailsSettings({ projectId }: { projectId: string })
   useEffect(() => {
     fetchReport()
   }, [fetchReport])
+  // An architecture change decided in the queue moves onto the card below.
+  useEffect(() => onArchitectureChange('card', () => { void fetchReport() }), [fetchReport])
 
   const setLevel = async (level: Level) => {
     if (!data || level === data.level || saving) return

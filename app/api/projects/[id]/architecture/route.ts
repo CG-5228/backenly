@@ -14,6 +14,9 @@
  *        approve  { findingId, planVersion }   consent to that exact version;
  *                                               the spec is read from the
  *                                               request row, never the body
+ *        dismiss  { findingId }                 decline a waiting approval
+ *                                               (remembered), or set a stopped
+ *                                               change's queue row aside
  *        pause    { decisionId }               stop before the next step
  *        resume   { decisionId }
  *        undo     { decisionId }               lossless, or refused
@@ -37,6 +40,7 @@ import {
   approveRequest,
   architectureSummary,
   decisionDetail,
+  dismissRequest,
   isActionRefusal,
   isApprovalRefusal,
   liveStatements,
@@ -64,8 +68,9 @@ export async function GET(request: NextRequest, _props: { params: Promise<{ id: 
       const detail = await decisionDetail(projectId, decisionId)
       return detail ? NextResponse.json(detail) : NextResponse.json({ error: 'No such change' }, { status: 404 })
     }
-    const summary = await architectureSummary(projectId)
-    if (url.searchParams.get('detail') !== '1') return NextResponse.json(summary)
+    const detail = url.searchParams.get('detail') === '1'
+    const summary = await architectureSummary(projectId, { detail })
+    if (!detail) return NextResponse.json(summary)
 
     const priors = priorsFor(summarizeDecisions(await readMemory(projectId)))
     const analyses = []
@@ -96,6 +101,15 @@ export async function POST(request: NextRequest, _props: { params: Promise<{ id:
         : NextResponse.json({ ok: true, message: r.message, state: r.state })
     }
 
+    if (action === 'dismiss') {
+      const findingId = str(body.findingId)
+      if (!findingId) return NextResponse.json({ error: 'dismiss needs findingId' }, { status: 400 })
+      const r = await dismissRequest({ projectId, findingId, userId })
+      return isActionRefusal(r)
+        ? NextResponse.json({ error: r.error }, { status: r.status })
+        : NextResponse.json({ ok: true, message: r.message, state: r.state })
+    }
+
     if (action === 'pause' || action === 'resume' || action === 'undo' || action === 'advance') {
       const decisionId = str(body.decisionId)
       if (!decisionId) return NextResponse.json({ error: `${action} needs decisionId` }, { status: 400 })
@@ -119,7 +133,7 @@ export async function POST(request: NextRequest, _props: { params: Promise<{ id:
       return NextResponse.json({ ok: true, ...r })
     }
 
-    return NextResponse.json({ error: 'action must be approve, pause, resume, advance, undo or assess' }, { status: 400 })
+    return NextResponse.json({ error: 'action must be approve, dismiss, pause, resume, advance, undo or assess' }, { status: 400 })
     // Every action here decides what happens to a production table, like
     // maintenance consent: an organization ADMIN's call, never a VIEWER's.
   }, { floor: 'administer' })

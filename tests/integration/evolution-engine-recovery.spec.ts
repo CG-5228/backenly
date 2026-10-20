@@ -38,7 +38,6 @@ import {
   listChanges,
   observe,
   pause,
-  proposeChanges,
   recordDecline,
   resume,
   undo,
@@ -50,7 +49,7 @@ import { structuralExtraction } from '@/lib/structural-evolution/primitive'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
 import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { ladderNames } from '@/lib/structural-evolution/sql'
-import { asService, buildProject, drain, dropProject, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
+import { asService, buildProject, drain, dropProject, proposeWhereItRuns, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
 
 jest.setTimeout(300_000)
 
@@ -73,7 +72,7 @@ const mutations = (on: boolean) => {
 
 /** Propose, and return the waiting request. */
 async function proposed(f: Fixture) {
-  const pass = await proposeChanges(f.projectId)
+  const pass = await proposeWhereItRuns(f.projectId)
   expect(pass.requested).toBe(1)
   const [req] = await requestsOf(f.projectId)
   return req
@@ -279,7 +278,7 @@ describe('memory', () => {
     await prisma.auditLog.createMany({ data: Array.from({ length: RECENT_ASSESSMENTS + 50 }, (_, i) => later('assessed', 2_000 + i)) })
 
     expect(await priorOf(f)).toMatchObject({ kind: 'declined' })
-    const pass = await proposeChanges(f.projectId)
+    const pass = await proposeWhereItRuns(f.projectId)
     expect(pass.requested).toBe(0)
     expect((await requestsOf(f.projectId)).filter(r => r.status === 'pending_approval')).toHaveLength(0)
   })
@@ -303,7 +302,7 @@ describe('a request for a table that was dropped', () => {
     mutations(false)
     const req = await proposed(f)
     await q(`DROP TABLE "${f.schema}"."orders" CASCADE`)
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     const [row] = await requestsOf(f.projectId)
     expect(row.status).toBe('resolved')
     expect((await stateOf(f.projectId, req.ev.decisionId)).state).toBe('blocked')
@@ -325,12 +324,12 @@ describe('a proposal pass cut off part-way', () => {
     jest.spyOn(structuralExtraction, 'rehearse').mockImplementationOnce(() => {
       throw new Error('the process died')
     })
-    await expect(proposeChanges(f.projectId)).rejects.toThrow('the process died')
+    await expect(proposeWhereItRuns(f.projectId)).rejects.toThrow('the process died')
     const [d] = summarizeDecisions(await readMemory(f.projectId)).filter(x => x.concernKey === CONCERN)
     expect(d.state).toBe('blocked')
     expect(await requestsOf(f.projectId)).toHaveLength(0)
 
-    const later = await proposeChanges(f.projectId, { now: new Date(Date.now() + 25 * HOUR) })
+    const later = await proposeWhereItRuns(f.projectId, { now: new Date(Date.now() + 25 * HOUR) })
     expect(later.refreshed).toBe(1)
     expect((await requestsOf(f.projectId))[0].status).toBe('pending_approval')
     expect((await stateOf(f.projectId, d.decisionId)).state).toBe('awaiting_approval')
@@ -354,8 +353,8 @@ describe('a proposal pass cut off part-way', () => {
     await remember({ projectId: f.projectId, record: record('rehearsing', 1), milestone: false, sentence: 'rehearsing' })
 
     // Still being worked on, as far as anyone can tell: left alone.
-    expect((await proposeChanges(f.projectId)).requested + (await proposeChanges(f.projectId)).refreshed).toBe(0)
-    const pass = await proposeChanges(f.projectId, { now: new Date(Date.now() + ABANDONED_AFTER_MS + HOUR) })
+    expect((await proposeWhereItRuns(f.projectId)).requested + (await proposeWhereItRuns(f.projectId)).refreshed).toBe(0)
+    const pass = await proposeWhereItRuns(f.projectId, { now: new Date(Date.now() + ABANDONED_AFTER_MS + HOUR) })
     expect(pass.refreshed).toBe(1)
     expect((await stateOf(f.projectId, 'abandoned-decision')).state).toBe('awaiting_approval')
     expect((await requestsOf(f.projectId))[0].ev.decisionId).toBe('abandoned-decision')
@@ -380,7 +379,7 @@ describe('resuming a change nobody approved', () => {
       detail: 'a planted failure',
       report: null,
     })
-    expect((await proposeChanges(f.projectId)).rehearsalFailed).toBe(1)
+    expect((await proposeWhereItRuns(f.projectId)).rehearsalFailed).toBe(1)
     const [d] = summarizeDecisions(await readMemory(f.projectId)).filter(x => x.concernKey === CONCERN)
     expect(d).toMatchObject({ state: 'blocked', everApproved: false })
 
@@ -479,7 +478,7 @@ describe('an undo that stops part-way', () => {
     const again = await resume({ projectId: f.projectId, decisionId, userId: f.ownerId })
     expect(!again.ok && again.error).toMatch(/already undone/)
     const [view] = await listChanges(f.projectId)
-    expect(view.actions).toEqual({ undo: true, pause: false, resume: false })
+    expect(view.actions).toEqual({ undo: true, pause: false, resume: false, keep: false })
     expect((await requestsOf(f.projectId)).filter(x => x.status === 'pending_approval')).toHaveLength(0)
 
     // Undo again, for real, finishes it.
@@ -531,7 +530,7 @@ describe('an approval claim', () => {
       )
     await age()
     expect((await requestsOf(f.projectId))[0].status).toBe('approving')
-    await proposeChanges(f.projectId)
+    await proposeWhereItRuns(f.projectId)
     expect((await requestsOf(f.projectId))[0].status).toBe('pending_approval')
 
     // …and an approval arriving before that pass takes the dead claim over.

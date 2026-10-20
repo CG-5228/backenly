@@ -359,8 +359,13 @@ export interface BenefitReport {
    * existing apps kept working.
    */
   safety: 'held' | 'regressed' | 'unknown'
-  /** Two or three sentences for a business owner. */
+  /** Two or three sentences for a business owner, with the numbers behind them. */
   summary: string
+  /**
+   * The same verdict in one or two sentences without a number: what a person
+   * reads by default. `summary` is for whoever opens the details.
+   */
+  plain: string
   /** What could not be measured, and why, one line each. */
   unmeasured: string[]
   /** What the change costs, one line each. Never part of the verdict. */
@@ -383,6 +388,16 @@ function movement(m: Measurement, verb: 'went' | 'moved'): string {
 
 const sentenceList = (xs: string[]) =>
   xs.length <= 2 ? xs.join(' and ') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`
+
+/** What a guardrail that got worse means for the apps it watches, without its numbers. */
+function harm(m: Measurement): string {
+  if (m.unit === 'ms') return 'requests got slower'
+  if (m.unit === 'ratio') return 'requests failed more often'
+  return `${m.name} got worse`
+}
+
+/** What a benefit that moved means, without its numbers: "fewer problems found on refund columns". */
+const gain = (m: Measurement) => `${m.better === 'lower' ? 'fewer' : 'more'} ${m.name}`
 
 /** The comparison's own detail, without its name, for a sentence. */
 const why = (c: Comparison) => c.text.slice(c.name.length + 2)
@@ -408,40 +423,57 @@ export function assessBenefit(checks: CorrectnessChecks, measurements: Measureme
   const required = requiredGuardrails(guardrails)
   const checked = required.length > 0 && required.every(p => p.c.direction !== 'not_comparable')
   const safety: BenefitReport['safety'] = regressed.length > 0 ? 'regressed' : checked ? 'held' : 'unknown'
-  const report = (verdict: BenefitVerdict, summary: string): BenefitReport => ({
+  const report = (verdict: BenefitVerdict, summary: string, plain: string): BenefitReport => ({
     verdict,
     checks,
     comparisons,
     safety,
     summary,
+    plain,
     unmeasured,
     costs,
   })
 
   const failed = (Object.keys(CHECK_WORDS) as Array<keyof CorrectnessChecks>).filter(k => checks[k] === 'fail')
   if (failed.length > 0) {
-    return report('regressed', `It made things worse: ${sentenceList(failed.map(k => CHECK_WORDS[k]))}.`)
+    const words = `It made things worse: ${sentenceList(failed.map(k => CHECK_WORDS[k]))}.`
+    return report('regressed', words, words)
   }
   if (regressed.length > 0) {
-    return report('regressed', `It made things worse: ${sentenceList(regressed.map(p => movement(p.m, 'moved')))}.`)
+    return report(
+      'regressed',
+      `It made things worse: ${sentenceList(regressed.map(p => movement(p.m, 'moved')))}.`,
+      `It made things worse: ${sentenceList([...new Set(regressed.map(p => harm(p.m)))])}.`,
+    )
   }
 
   const lead = checks.correctness === 'pass' ? 'It works correctly.' : 'Backenly could not confirm its data still matches.'
+  // The plain sentence says only what is not already said beside it: a change
+  // that works is said to work by the milestone it sits in.
+  const plainLead = checks.correctness === 'pass' ? '' : `${lead} `
   const improved = benefits.filter(p => p.c.direction === 'improved')
   const worsened = benefits.filter(p => p.c.direction === 'regressed')
   const measured = benefits.filter(p => p.c.direction !== 'not_comparable')
   const helped = improved.map(p => `${movement(p.m, 'went')}${p.m.scope ? ` (${p.m.scope})` : ''}`)
 
   if (improved.length > 0 && worsened.length === 0 && checked) {
-    return report('beneficial', `${lead} It helped: ${sentenceList(helped)}.`)
+    return report('beneficial', `${lead} It helped: ${sentenceList(helped)}.`, `${plainLead}It helped: ${sentenceList(improved.map(p => gain(p.m)))}.`)
   }
   if (measured.length > 0 && checked) {
     if (worsened.length > 0) {
       const worse = sentenceList(worsened.map(p => movement(p.m, 'moved')))
       const also = improved.length > 0 ? `, although ${sentenceList(improved.map(p => movement(p.m, 'went')))}` : ''
-      return report('neutral', `${lead} Existing apps were unaffected, but what it was made to improve got worse: ${worse}${also}.`)
+      return report(
+        'neutral',
+        `${lead} Existing apps were unaffected, but what it was made to improve got worse: ${worse}${also}.`,
+        `${plainLead}Existing apps were unaffected, but what it was made to improve got worse.`,
+      )
     }
-    return report('neutral', `${lead} Existing apps were unaffected, but it has not paid off yet: ${measured.map(p => p.c.text).join('; ')}.`)
+    return report(
+      'neutral',
+      `${lead} Existing apps were unaffected, but it has not paid off yet: ${measured.map(p => p.c.text).join('; ')}.`,
+      `${plainLead}Existing apps were unaffected, but it has not paid off yet.`,
+    )
   }
 
   // Undecided. Say the most useful reason: first what the change was made
@@ -455,7 +487,11 @@ export function assessBenefit(checks: CorrectnessChecks, measurements: Measureme
       ? 'nothing could show whether existing apps were affected'
       : `${required.filter(p => p.c.direction === 'not_comparable').map(p => p.m.name).join(', ')} could not be measured`
   if (improved.length > 0) {
-    return report('insufficient_evidence', `${lead} It may have helped (${sentenceList(improved.map(p => movement(p.m, 'went')))}), but ${clients}.`)
+    return report(
+      'insufficient_evidence',
+      `${lead} It may have helped (${sentenceList(improved.map(p => movement(p.m, 'went')))}), but ${clients}.`,
+      `${plainLead}It may have helped, but it is too early to say.`,
+    )
   }
   // A benefit that was not measured explains itself in its detail ("refund has
   // not changed since"); one measured on too little keeps its name and counts.
@@ -468,5 +504,5 @@ export function assessBenefit(checks: CorrectnessChecks, measurements: Measureme
       : benefitWhy.length > 0
         ? benefitWhy.join('; ')
         : clients
-  return report('insufficient_evidence', `${lead} Too early to say whether it helped: ${cause}.`)
+  return report('insufficient_evidence', `${lead} Too early to say whether it helped: ${cause}.`, `${plainLead}Too early to say whether it helped.`)
 }

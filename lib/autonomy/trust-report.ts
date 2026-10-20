@@ -393,14 +393,16 @@ function humanize(action: string, details: string | null): string {
  * An architecture milestone row, rendered from what the engine wrote.
  *
  * The sentence is composed when the milestone is recorded (lib/evolution-engine),
- * so the feed never has to understand the engine's states; the kind comes from
- * the state so a paused or undone change can never read as routine.
+ * so the feed never has to understand the engine's states. Only what the engine
+ * marked a problem (a step that did not finish, a regression, an undo that
+ * stopped part-way) reads as a failure: a request it withdrew, or a pause a
+ * person asked for, is an architecture event like any other.
  */
 function architectureItem(details: string | null): { kind: ActivityItem['kind']; summary: string } {
-  let d: { sentence?: string; state?: string | null } = {}
+  let d: { sentence?: string; state?: string | null; problem?: boolean } = {}
   try { d = details ? JSON.parse(details) : {} } catch { /* written by us; tolerate anyway */ }
   const kind: ActivityItem['kind'] =
-    d.state === 'failed' || d.state === 'blocked'
+    d.problem === true
       ? 'failed'
       : d.state === 'rolled_back' || d.state === 'rolling_back'
         ? 'rollback'

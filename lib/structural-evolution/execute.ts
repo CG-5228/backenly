@@ -36,7 +36,7 @@ import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-f
 import { readLiveEvolutionApproval } from './consent'
 import { requiredTier, type ExtractionPlan, type ExtractionStep } from './plan'
 import { runStep, rungAlreadyApplied } from './primitives'
-import { inspectEvolutionChain, queueEvolutionBackfill } from './backfill-job'
+import { inspectEvolutionChain, queueEvolutionBackfill, stoppedForDrift } from './backfill-job'
 import type { StopReason } from '@/lib/evolution-engine/primitive'
 import { resolveExtractionPlan, isResolveRefusal } from './resolve'
 import { workspaceAt } from './workspace'
@@ -182,7 +182,7 @@ async function runLadder(input: {
         })
         steps.push({ ordinal: step.ordinal, kind: step.kind, status: 'failed', detail: job.detail })
         // A backfill that stopped because the table changed shape is drift, not a broken step.
-        return halt(executionId, plan, steps, `step ${step.ordinal} (${step.kind}) failed: ${job.detail}`, /changed shape|no longer exists/.test(job.detail) ? 'drift' : 'rung_failed')
+        return halt(executionId, plan, steps, `step ${step.ordinal} (${step.kind}) failed: ${job.detail}`, stoppedForDrift(job.detail, plan.spec.host) ? 'drift' : 'rung_failed')
       }
       await prisma.maintenanceStepExecution.update({
         where: { id: existing.id },

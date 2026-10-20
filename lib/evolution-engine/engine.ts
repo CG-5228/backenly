@@ -96,7 +96,7 @@ import {
   setRequestStatus,
   type EvolutionRequestDetails,
 } from './request'
-import type { ArchitectureChangeView, ArchitectureSummary, NoChangeView, RecommendationView } from './views'
+import type { ArchitectureChangeView, ArchitectureSummary, Continuation, NoChangeView, RecommendationView } from './views'
 import { prisma } from '@/lib/db'
 import { quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
 import { EVOLUTION_FINDING_TYPE } from '@/lib/core/types'
@@ -156,6 +156,29 @@ export function executionEnabled(): { enabled: boolean; reason: string | null } 
       }
 }
 
+/**
+ * Whether approved changes carry on by themselves for this project: the
+ * deployment runs them, its scheduler takes them through the backfill,
+ * observation and judging, and the project's autonomy is not OFF. A person is
+ * asked to approve only a change that then finishes without them: anything
+ * else would have them operate the engine by hand, step by step.
+ */
+export async function continuation(projectId: string): Promise<Continuation> {
+  if (!FLAGS.ENABLE_EVOLUTION_MUTATIONS) {
+    return { unattended: false, byHand: false, why: "Backenly isn't running architecture changes in this deployment right now." }
+  }
+  if (!FLAGS.ENABLE_EVOLUTION_SCHEDULER) {
+    return { unattended: false, byHand: true, why: "This deployment doesn't carry architecture changes on by itself." }
+  }
+  if ((await getProjectAutonomyLevel(projectId)) === 'OFF') {
+    return { unattended: false, byHand: true, why: 'Autonomy is off for this project, so Backenly does not carry changes on by itself.' }
+  }
+  return { unattended: true, byHand: true, why: null }
+}
+
+/** A sentence as a clause after a colon: "Autonomy is off…" → "autonomy is off…". Backenly keeps its capital. */
+const asAfterColon = (s: string) => s.replace(/^(?!Backenly)[A-Z]/, c => c.toLowerCase())
+
 // ── Memory helpers ───────────────────────────────────────────────────────────
 
 async function decision(projectId: string, decisionId: string): Promise<{ summary: DecisionSummary | null; trail: MemoryEntry[] }> {
@@ -176,7 +199,7 @@ async function enter(
   projectId: string,
   d: DecisionRef,
   to: LifecycleState,
-  o: { sentence: string; milestone?: boolean; payload?: Record<string, unknown>; userId?: string | null },
+  o: { sentence: string; milestone?: boolean; payload?: Record<string, unknown>; userId?: string | null; problem?: boolean },
 ): Promise<boolean> {
   const { summary, trail } = await decision(projectId, d.decisionId)
   const from = summary?.state ?? null
@@ -191,6 +214,7 @@ async function enter(
     milestone: !!o.milestone,
     sentence: o.sentence,
     userId: o.userId ?? null,
+    problem: o.problem,
   })
   return r.written
 }
@@ -287,6 +311,7 @@ export async function proposeChanges(projectId: string, opts: { now?: Date } = {
   const now = opts.now ?? new Date()
   const out: ProposalPassResult = { assessed: 0, requested: 0, refreshed: 0, rehearsalFailed: 0, skipped: [] }
   await releaseAbandonedClaims(projectId)
+  const runs = await continuation(projectId)
   const memory = await readMemory(projectId)
   const decisions = summarizeDecisions(memory)
   const recommendations: RecommendationView[] = []
@@ -332,6 +357,21 @@ export async function proposeChanges(projectId: string, opts: { now?: Date } = {
       if (opp.level !== 'executable_proposal') continue
 
       const open = openDecision(decisions, opp.concernKey)
+      if (!runs.unattended) {
+        // Nobody is asked for a change that would then wait on them at every
+        // step: until approved changes carry on here by themselves, it is said
+        // like a recommendation, and a request already waiting is withdrawn.
+        if (open?.state === 'awaiting_approval' && open.primitive === primitive.id) {
+          await withdrawRequest(projectId, refOf(open), 'approved changes cannot carry on by themselves here right now')
+        }
+        recommendations.push({
+          subject: opp.subject,
+          concernKey: opp.concernKey,
+          sentence: `A change to ${opp.subject} is ready, but Backenly is not asking for it: ${asAfterColon(runs.why ?? '')}`,
+        })
+        out.skipped.push({ concernKey: opp.concernKey, reason: `not asked: ${runs.why}` })
+        continue
+      }
       if (open) {
         const refreshed = await refreshIfStale(projectId, primitive, open, opp, now)
         if (refreshed === 'refreshed') out.refreshed++
@@ -698,12 +738,16 @@ export async function approveRequest(input: {
   })
 
   const exec = executionEnabled()
-  if (!exec.enabled) return { ok: true, message: `Approved. ${exec.reason}`, state: 'approved' }
+  const runs = await continuation(projectId)
+  // Requests are raised only where approved changes carry on by themselves;
+  // a deployment or a dial that changed since is said, never papered over.
+  if (!exec.enabled) return { ok: true, message: `Approved. ${runs.why} It starts when it can; your app works as before.`, state: 'approved' }
   // Consent is recorded whatever happens next; a failure to start is the
   // change's state to report, not the approval's.
   try {
     const advanced = await advance({ projectId, decisionId: ev.decisionId, actor: userId })
-    return { ok: true, message: `Approved. ${advanced.message}`, state: advanced.state }
+    const byHand = runs.unattended ? '' : ` ${runs.why} Resume carries it on.`
+    return { ok: true, message: `Approved. ${advanced.message}${byHand}`, state: advanced.state }
   } catch (err) {
     console.error('[evolution] advance after approval failed:', err)
     return { ok: true, message: 'Approved. It could not start just now; it will be retried, or you can resume it.', state: 'approved' }
@@ -751,10 +795,52 @@ export async function recordDecline(projectId: string, findingId: string, userId
       event: 'declined',
       attempt: trail.filter(e => e.record.event === 'declined').length + 1,
     },
-    milestone: false,
-    sentence: `You declined: ${ev.summary.headline}. Backenly will not raise it again unless something new is measured.`,
+    milestone: true,
+    sentence: `You declined: ${ev.summary.headline}. Backenly won't ask again unless something new is measured.`,
     userId,
   })
+}
+
+/**
+ * A person set a waiting request aside from the queue (POST /architecture
+ * { action: 'dismiss' }, the same role floor as approving).
+ *
+ * For an approval that is a decline, and Backenly remembers it: the change is
+ * not asked for again unless something new is measured. For a change that
+ * stopped, nothing about the change moves: it stays exactly as it is, and the
+ * decision leaves the queue for the Architecture changes card, which still
+ * offers what it did.
+ */
+export async function dismissRequest(input: { projectId: string; findingId: string; userId: string }): Promise<ActionResult> {
+  const { projectId, findingId, userId } = input
+  const req = await requestById(projectId, findingId)
+  if (!req) return { ok: false, status: 404, error: 'No such request in this project.' }
+  const moved: ActionResult = { ok: false, status: 409, error: 'This change was already decided. Refresh to see where it is now.' }
+  if (req.status !== 'pending_approval') return moved
+  const ev = req.evolution
+  const { summary } = await decision(projectId, ev.decisionId)
+  if (ev.ask === 'approve') {
+    // Only a change still waiting for its approval can be declined: a stale
+    // tab must not set aside a change someone already approved, which runs.
+    if (summary?.state !== 'awaiting_approval') return moved
+    const set = await prisma.healthFinding.updateMany({
+      where: { id: findingId, projectId, status: 'pending_approval' },
+      data: { status: 'dismissed', details: { evolution: ev, dismissedAt: new Date().toISOString() } as object },
+    })
+    if (set.count === 0) return moved
+    await recordDecline(projectId, findingId, userId)
+    return { ok: true, message: "Declined. Backenly won't ask again unless something new is measured.", state: summary.state }
+  }
+  const set = await prisma.healthFinding.updateMany({
+    where: { id: findingId, projectId, status: 'pending_approval' },
+    data: { status: 'approved', details: { evolution: { ...ev, ask: 'approve', stoppedBecause: undefined } } as object },
+  })
+  if (set.count === 0) return moved
+  return {
+    ok: true,
+    message: 'Set aside. The change stays exactly as it is; you can still decide on it under Architecture changes.',
+    state: summary?.state ?? null,
+  }
 }
 
 // ── Advance ──────────────────────────────────────────────────────────────────
@@ -825,15 +911,20 @@ export async function advance(input: {
     await walkTo(projectId, d, 'cutover', traceFor)
     const s = summaryOf(trail)
     const hours = policy.observationHours
+    const watched = (await continuation(projectId)).unattended
     await enter(projectId, d, 'observing', {
-      sentence: `Backenly ${s?.did ?? `changed ${subject}`}. Existing apps keep working; it is being watched for ${hours} hours before it counts as done.`,
+      sentence:
+        `Backenly ${s?.did ?? `changed ${subject}`}. Existing apps keep working; ` +
+        (watched
+          ? `it is being watched for ${hours} hours before it counts as done.`
+          : 'Backenly is not watching changes in this deployment, so it cannot yet say whether this one helped.'),
       milestone: true,
       payload: { cutoverAt: doneAt.toISOString() },
     })
     const spec = primitive.normaliseSpec(summary.spec)
     const resolved = spec ? await primitive.resolvePlan(projectId, spec) : null
     if (resolved && !('refusal' in resolved)) await snapshot(projectId, d, primitive, resolved.plan, 'S1', doneAt)
-    return { state: 'observing', message: `The change is in place and being watched for ${hours} hours.`, outcome }
+    return { state: 'observing', message: `The change is in place${watched ? ` and being watched for ${hours} hours` : ''}.`, outcome }
   }
 
   if (outcome.status === 'awaiting_background_work') {
@@ -844,29 +935,37 @@ export async function advance(input: {
   // halted or refused
   if (outcome.stoppedBecause === 'mutations_disabled') {
     if (furthest) await walkTo(projectId, d, furthest, traceFor)
-    return { state: furthest ?? summary.state, message: exec.reason ?? 'Changes are switched off here.', outcome }
+    return { state: furthest ?? summary.state, message: "Backenly isn't running architecture changes in this deployment right now; nothing ran.", outcome }
   }
   const failedStep = outcome.steps.find(s => s.status === 'failed')
   if (furthest) await walkTo(projectId, d, furthest, traceFor)
-  const reason = plainReason(outcome)
+  // In the words a person reads; the executor's own account stays in the payload.
+  const reason = plainReason(outcome, summaryOf(trail))
   const failed = outcome.stoppedBecause === 'rung_failed' && failedStep?.stage !== 'rehearsal'
   const target: LifecycleState = failed ? 'failed' : 'blocked'
   await enter(projectId, d, target, {
     sentence: failed
-      ? `A step of the change to ${subject} did not complete: ${reason}. Your app works as before; you can resume or undo it.`
+      ? `The change to ${subject} stopped: ${reason}. Your app works as before; you can resume or undo it.`
       : `Backenly paused the change to ${subject}: ${reason}. Your app works as before.`,
     milestone: true,
+    problem: failed || outcome.stoppedBecause === 'verification',
     payload: { reason, stoppedBecause: outcome.stoppedBecause, haltReason: outcome.haltReason },
   })
   // A pause the person asked for is theirs to lift from the changes list; any
   // other stop is put back in front of them.
   if (outcome.stoppedBecause !== 'consent' || !summary.withdrawn) {
-    await askToResumeOrUndo(projectId, d, reason)
+    await askToResumeOrUndo(projectId, d, reason, 'resume_or_undo')
   }
   return { state: target, message: `The change stopped: ${reason}.`, outcome }
 }
 
-function plainReason(outcome: ExecutionOutcome): string {
+/**
+ * Why a run stopped, as a clause a person reads. A failed step is told by what
+ * its stage was doing, in the primitive's words (`stages`), never by its
+ * internal name, a job id or the database's message: those stay in the
+ * decision's history.
+ */
+function plainReason(outcome: ExecutionOutcome, words: UserFacingSummary | null): string {
   switch (outcome.stoppedBecause) {
     case 'consent':
       return 'its approval is no longer in place'
@@ -876,17 +975,20 @@ function plainReason(outcome: ExecutionOutcome): string {
       return 'part of it cannot run in this deployment'
     case 'verification':
       return 'the old and new shapes did not match when checked, so nothing more was opened'
-    case 'rung_failed':
-      return outcome.haltReason ?? 'a step failed'
+    case 'rung_failed': {
+      const step = outcome.steps.find(s => s.status === 'failed')
+      const doing = step ? words?.stages?.[step.stage] : undefined
+      return doing ? `${doing} did not finish` : 'one of its steps did not finish'
+    }
     default:
-      return outcome.haltReason ?? 'it stopped'
+      return 'it stopped before it finished'
   }
 }
 
-async function askToResumeOrUndo(projectId: string, d: DecisionRef, reason: string): Promise<void> {
+async function askToResumeOrUndo(projectId: string, d: DecisionRef, reason: string, ask: 'resume_or_undo' | 'keep_or_undo'): Promise<void> {
   const req = await requestForDecision(projectId, d.decisionId)
   if (!req) return
-  await raiseRequest(projectId, { ...req.evolution, ask: 'resume_or_undo', stoppedBecause: reason })
+  await raiseRequest(projectId, { ...req.evolution, ask, stoppedBecause: reason })
 }
 
 // ── Pause, resume, undo ──────────────────────────────────────────────────────
@@ -935,13 +1037,28 @@ export async function resume(input: { projectId: string; decisionId: string; use
 
   // A change regressed in observation, kept on purpose: watching resumes.
   const stoppedIn = lastActiveState(trail)
+  const runs = await continuation(projectId)
   if (summary.state === 'blocked' && stoppedIn === 'observing') {
-    await enter(projectId, d, 'observing', { sentence: `You kept the change to ${summary.subject}; Backenly is watching it again.`, milestone: true, userId })
+    await enter(projectId, d, 'observing', {
+      sentence: runs.unattended
+        ? `You kept the change to ${summary.subject}; Backenly is watching it again.`
+        : `You kept the change to ${summary.subject}.`,
+      milestone: true,
+      userId,
+    })
     await clearQueue(projectId, decisionId)
-    return { ok: true, message: 'Kept. Backenly watches it again from now.', state: 'observing' }
+    return { ok: true, message: runs.unattended ? 'Kept. Backenly watches it again from now.' : `Kept. ${runs.why}`, state: 'observing' }
   }
   if (!['blocked', 'failed', ...ADVANCEABLE].includes(summary.state)) {
     return { ok: false, status: 409, error: 'This change is not stopped.' }
+  }
+  // Never "Resumed." when nothing can run: consent stays as it was.
+  if (!executionEnabled().enabled) {
+    return {
+      ok: false,
+      status: 409,
+      error: "Backenly isn't running architecture changes in this deployment right now, so this one can't carry on yet. Your app works as before, and undo is still available.",
+    }
   }
 
   // Consent must be live for the exact version, rebuilt from the live system.
@@ -972,8 +1089,6 @@ export async function resume(input: { projectId: string; decisionId: string; use
     await enter(projectId, d, back, { sentence: `You resumed the change to ${summary.subject}.`, milestone: true, userId })
   }
   await clearQueue(projectId, decisionId)
-  const exec = executionEnabled()
-  if (!exec.enabled) return { ok: true, message: `Resumed. ${exec.reason}`, state: (await decision(projectId, decisionId)).summary?.state ?? null }
   const r = await advance({ projectId, decisionId, actor: userId })
   return { ok: true, message: r.message, state: r.state }
 }
@@ -989,7 +1104,7 @@ function lastActiveState(trail: MemoryEntry[]): LifecycleState | null {
 
 async function clearQueue(projectId: string, decisionId: string): Promise<void> {
   const req = await requestForDecision(projectId, decisionId)
-  if (req && req.status === 'pending_approval' && req.evolution.ask === 'resume_or_undo') {
+  if (req && req.status === 'pending_approval' && req.evolution.ask !== 'approve') {
     await setRequestStatus(projectId, req.findingId, 'approved', { ask: 'approve', stoppedBecause: undefined })
   }
 }
@@ -1057,6 +1172,7 @@ export async function undo(input: { projectId: string; decisionId: string; userI
       `Backenly could not finish undoing the change to ${summary.subject}: ${reason}. ` +
       `It had already done this: ${removed.map(a => a.detail).join('; ')}. Undo it again to finish once that is fixed.`,
     milestone: true,
+    problem: true,
     userId,
     payload: { reason, rollback: result, undoIncomplete: true },
   })
@@ -1128,7 +1244,8 @@ export async function observe(input: { projectId: string; decisionId: string; no
   }
   const benefit = judged.benefit
   if (benefit.verdict === 'regressed') {
-    await stopForRegression(projectId, d, summary.subject, asClause(benefit.summary), policy, input)
+    await remember({ projectId, record: { ...base(d), event: 'outcome', payload: { benefit, phase: 'S2' } }, milestone: false, sentence: benefit.summary })
+    await stopForRegression(projectId, d, summary.subject, asClause(benefit.plain), policy, input)
     return { state: 'blocked', verdict: 'regressed', reason: benefit.summary, benefit }
   }
   const s = summaryOf(trail)
@@ -1136,8 +1253,8 @@ export async function observe(input: { projectId: string; decisionId: string; no
     benefit.verdict === 'beneficial'
       ? `Backenly improved your ${s?.subjectTitle ?? summary.subject} architecture: it ${s?.did ?? 'restructured it'}.`
       : `Backenly ${s?.did ?? `restructured ${summary.subject}`}.`
-  // The milestone already says it works; the benefit summary's own lead would repeat it.
-  const outcome = benefit.summary.replace(/^It works correctly\.\s*/, '')
+  // Plain: the numbers are in the outcome record, for whoever opens the details.
+  const outcome = benefit.plain
   const later = benefit.verdict === 'beneficial' ? '' : ' Backenly will look again a month after the change.'
   // "Existing apps kept working" only where their traffic was compared and held.
   const held =
@@ -1154,7 +1271,7 @@ export async function observe(input: { projectId: string; decisionId: string; no
   return { state: 'stable', verdict: 'stable', reason: verdict.reason, benefit }
 }
 
-/** "It made things worse: x rose from a to b." → "x rose from a to b", to sit inside a sentence. */
+/** "It made things worse: requests got slower." → "requests got slower", to sit inside a sentence. */
 const asClause = (summary: string) => summary.replace(/^It made things worse:\s*/, '').replace(/[.\s]+$/, '')
 
 /** `reason` is a clause: no lead-in, no closing stop. */
@@ -1169,13 +1286,15 @@ async function stopForRegression(
   await enter(projectId, d, 'blocked', {
     sentence: `Backenly stopped the change to ${subject} because it saw a problem: ${reason}.`,
     milestone: true,
+    problem: true,
     payload: { reason, verdict: 'regressed' },
   })
   if (shouldAutoRollback(policy, true)) {
     const r = await undo({ projectId, decisionId: input.decisionId, userId: AUTOMATIC_REQUESTER, automatic: true })
     if (r.ok) return
   }
-  await askToResumeOrUndo(projectId, d, reason)
+  // It was already in place: nothing is left to resume, only to keep or undo.
+  await askToResumeOrUndo(projectId, d, reason, 'keep_or_undo')
 }
 
 type Judged = { benefit: BenefitReport } | { error: string }
@@ -1263,7 +1382,7 @@ async function longHorizon(projectId: string, d: DecisionSummary, now: Date, pol
   const previous = d.outcome?.verdict
   if (benefit.verdict === 'regressed') {
     await remember({ projectId, record: { ...base(ref), event: 'outcome', payload: { benefit, phase: due } }, milestone: false, sentence: benefit.summary })
-    await stopForRegression(projectId, ref, d.subject, asClause(benefit.summary), policy, { projectId, decisionId: d.decisionId })
+    await stopForRegression(projectId, ref, d.subject, asClause(benefit.plain), policy, { projectId, decisionId: d.decisionId })
     return
   }
   const changed = benefit.verdict !== previous
@@ -1275,8 +1394,9 @@ async function longHorizon(projectId: string, d: DecisionSummary, now: Date, pol
     sentence: !shown
       ? benefit.summary
       : benefit.verdict === 'beneficial'
-        ? `${when} on, the change to ${d.subject} has paid off: ${benefit.summary}`
-        : `${when} on, Backenly can no longer show that the change to ${d.subject} helped: ${benefit.summary}`,
+        ? `${when} on, the change to ${d.subject} has paid off. ${benefit.plain}`
+        : `${when} on, Backenly can no longer show that the change to ${d.subject} helped.` +
+          (benefit.verdict === 'insufficient_evidence' ? '' : ` ${benefit.plain}`),
   })
 }
 
@@ -1373,8 +1493,77 @@ const LISTED: LifecycleState[] = [
   'rolled_back',
 ]
 
-/** Recent architecture changes for the Autonomy page, newest first. */
-export async function listChanges(projectId: string, opts: { limit?: number; now?: Date } = {}): Promise<ArchitectureChangeView[]> {
+/** What a verdict means in a sentence, for an outcome recorded before `plain` was. */
+const VERDICT_WORDS: Record<BenefitVerdict, string> = {
+  beneficial: 'It helped.',
+  neutral: 'Existing apps were unaffected, but it has not paid off yet.',
+  regressed: 'It made things worse.',
+  insufficient_evidence: 'Too early to say whether it helped.',
+}
+
+const titleCase = (s: string) => s.replace(/^./, c => c.toUpperCase())
+
+/**
+ * The card's words for one change: a short headline for where it is, and the
+ * sentence or two under it. The owner reads "Backenly improved your Orders
+ * architecture." and, under it, what was done and that it can be undone: never
+ * a rung, a count or the latest notebook line.
+ */
+function cardWords(
+  state: LifecycleState,
+  d: DecisionSummary,
+  s: UserFacingSummary | null,
+  runs: Continuation,
+  keptStopped: boolean,
+): { headline: string; detail: string } {
+  const title = s?.subjectTitle ?? titleCase(d.subject)
+  const did = s?.did ? `It ${s.did}.` : ''
+  const stopped = d.stoppedBecause ? `It stopped because ${d.stoppedBecause.replace(/[.\s]+$/, '')}.` : 'It stopped part-way.'
+  switch (state) {
+    case 'stable':
+      return {
+        headline: d.outcome?.verdict === 'beneficial' ? `Backenly improved your ${title} architecture.` : `Backenly changed your ${title} architecture.`,
+        detail: `${did} Verification passed. Undo is available.`.trim(),
+      }
+    case 'observing':
+      return {
+        headline: `Backenly changed your ${title} architecture.`,
+        detail: `${did} Verification passed.${runs.unattended ? ' Backenly is watching the result.' : ''} Undo is available.`.trim(),
+      }
+    case 'blocked':
+      if (d.withdrawn) {
+        return { headline: `You paused the change to your ${title} architecture.`, detail: 'Nothing further runs until you resume it. Your app works as before.' }
+      }
+      return {
+        headline: `The change to your ${title} architecture stopped.`,
+        detail: `${stopped} ${keptStopped ? 'It is still in place; keep it, or undo it.' : 'Your app works as before.'}`,
+      }
+    case 'failed':
+      return { headline: `The change to your ${title} architecture stopped.`, detail: `${stopped} Your app works as before.` }
+    case 'rolling_back':
+      return { headline: `Backenly is undoing the change to your ${title} architecture.`, detail: 'Your app works as before.' }
+    case 'rolled_back':
+      return { headline: `The change to your ${title} architecture was undone.`, detail: `${d.subject} is exactly as it was before, and no data was lost.` }
+    default:
+      return { headline: `Backenly is changing your ${title} architecture.`, detail: 'Existing apps keep working while it runs.' }
+  }
+}
+
+/** The status tag, with what this deployment and project allow taken into account. */
+function statusFor(state: LifecycleState, d: DecisionSummary, runs: Continuation): ArchitectureChangeView['status'] {
+  if (state === 'blocked' && d.withdrawn) return { label: 'Paused by you', tone: 'neutral' }
+  if (!runs.unattended && ADVANCEABLE.includes(state)) {
+    return { label: state === 'approved' ? 'Waiting to start' : 'Waiting to continue', tone: 'attention' }
+  }
+  if (!runs.unattended && state === 'observing') return { label: 'Applied', tone: 'progress' }
+  return userFacingStatus(state)
+}
+
+/** Recent architecture changes for the Autonomy page, newest first. `detail` adds the internal state. */
+export async function listChanges(
+  projectId: string,
+  opts: { limit?: number; now?: Date; detail?: boolean } = {},
+): Promise<ArchitectureChangeView[]> {
   const now = opts.now ?? new Date()
   const memory = await readMemory(projectId)
   const decisions = summarizeDecisions(memory).filter(d => d.primitive !== '*')
@@ -1385,7 +1574,7 @@ export async function listChanges(projectId: string, opts: { limit?: number; now
   const pendingBy = new Map(
     pending.map(p => [((p.details ?? {}) as { evolution?: { decisionId?: string } }).evolution?.decisionId, p.id] as const),
   )
-  const schedulerOn = FLAGS.ENABLE_EVOLUTION_SCHEDULER
+  const runs = await continuation(projectId)
   return decisions
     // Only what a person approved: a proposal whose rehearsal failed was never
     // shown to anyone and is the engine's business, not news.
@@ -1398,23 +1587,36 @@ export async function listChanges(projectId: string, opts: { limit?: number; now
     .map(d => {
       const state = d.state!
       const s = summaryOfDecision(memory, d.decisionId)
+      const moving = ADVANCEABLE.includes(state)
+      // Stopped after it was in place: nothing is left to resume, only to keep.
+      const keptStopped = state === 'blocked' && !d.withdrawn && lastActiveState(memory.filter(e => e.record.decisionId === d.decisionId)) === 'observing'
+      const waiting = (moving || state === 'observing') && !runs.unattended ? runs.why : null
+      const words = cardWords(state, d, s, runs, keptStopped)
+      const verdict = d.outcome?.verdict as BenefitVerdict | undefined
       return {
         decisionId: d.decisionId,
         primitive: d.primitive,
         subject: d.subject,
-        headline: d.headline ?? s?.headline ?? `A change to ${d.subject}`,
+        headline: words.headline,
+        detail: words.detail,
         change: s?.change ?? '',
-        status: userFacingStatus(state),
-        state,
+        status: statusFor(state, d, runs),
+        ...(opts.detail ? { state } : {}),
         ...(d.stoppedBecause ? { stoppedBecause: d.stoppedBecause } : {}),
-        ...(d.outcome ? { outcome: { verdict: d.outcome.verdict as BenefitVerdict, summary: d.outcome.summary } } : {}),
+        ...(waiting ? { waiting } : {}),
+        ...(d.outcome && verdict
+          ? { outcome: { verdict, plain: d.outcome.plain || VERDICT_WORDS[verdict] || '', summary: d.outcome.summary } }
+          : {}),
+        ...(s?.rollback && canUndoFrom(state) ? { undoEffect: s.rollback } : {}),
         at: d.updatedAt.toISOString(),
         actions: {
           undo: canUndoFrom(state),
-          pause: ADVANCEABLE.includes(state),
-          // Without the scheduler, a person pushes an in-progress change on.
-          // After a part-way undo only undo remains.
-          resume: !d.undoIncomplete && (state === 'blocked' || state === 'failed' || (!schedulerOn && ADVANCEABLE.includes(state))),
+          // Pause stops something that is moving by itself; resume carries on
+          // something that is not. Never both. After a part-way undo only undo
+          // remains, and nothing resumes where nothing can run.
+          pause: moving && runs.unattended,
+          resume: !d.undoIncomplete && !keptStopped && runs.byHand && (state === 'blocked' || state === 'failed' || (moving && !runs.unattended)),
+          keep: !d.undoIncomplete && keptStopped,
         },
         ...(pendingBy.get(d.decisionId) ? { findingId: pendingBy.get(d.decisionId)! } : {}),
       }
@@ -1425,10 +1627,13 @@ function summaryOfDecision(memory: MemoryEntry[], decisionId: string): UserFacin
   return summaryOf(memory.filter(e => e.record.decisionId === decisionId))
 }
 
-/** GET /api/projects/[id]/architecture — the concise default. Reads memory only; never re-analyses. */
-export async function architectureSummary(projectId: string): Promise<ArchitectureSummary> {
+/**
+ * GET /api/projects/[id]/architecture — the concise default. Reads memory only;
+ * never re-analyses. `detail` adds each change's internal state.
+ */
+export async function architectureSummary(projectId: string, opts: { detail?: boolean } = {}): Promise<ArchitectureSummary> {
   const memory = await readMemory(projectId)
-  const changes = await listChanges(projectId)
+  const changes = await listChanges(projectId, { detail: opts.detail })
   const waitingOnYou = await prisma.healthFinding.count({
     where: { projectId, type: EVOLUTION_FINDING_TYPE, status: 'pending_approval' },
   })

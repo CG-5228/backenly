@@ -28,7 +28,6 @@ import {
   type Opportunity,
   type Rehearsal,
   type RungStage,
-  type UserFacingSummary,
 } from '@/lib/evolution-engine/primitive'
 import type { PlanTraits } from '@/lib/evolution-engine/policy'
 import { analyzeStructuralEvolution, type ProposalView } from './index'
@@ -44,6 +43,9 @@ import { reconcileExtraction } from './reconcile'
 import { rollbackExtraction } from './rollback'
 import { measureExtraction, observeExtraction, snapshotExtraction } from './telemetry'
 import type { ExtractionSpec } from './sql'
+import { describeExtraction, whyOf } from './words'
+
+export { describeExtraction } from './words'
 
 export const STRUCTURAL_EXTRACTION = 'structural_extraction'
 
@@ -89,39 +91,6 @@ export function toEnginePlan(plan: ExtractionPlan): StructuralPlan {
       mutates: !READ_ONLY.includes(s.kind),
     })),
   }
-}
-
-const titleCase = (s: string) => s.replace(/^./, c => c.toUpperCase())
-const list = (xs: string[]) => (xs.length <= 2 ? xs.join(' and ') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`)
-
-/** Plain sentences about one extraction. No SQL, no internal state names. */
-export function describeExtraction(spec: ExtractionSpec, why?: string): UserFacingSummary {
-  const { host, satellite, label, members } = spec
-  return {
-    headline: `Move ${label} data out of ${host} into its own table`,
-    change:
-      `Backenly would create ${satellite} for ${list(members)}, keep it in step with ${host} in both directions, ` +
-      `and copy the existing ${label} data across. Nothing is removed from ${host}.`,
-    reason: why ?? `${list(members)} behave as one responsibility of their own.`,
-    compatibility:
-      `Every app that reads or writes ${host} today keeps working unchanged; new code can use ${satellite} when it is ready. ` +
-      `Who may read or change ${label} data stays exactly the same.`,
-    rollback: `Undo removes ${satellite} and leaves ${host} exactly as it was. Backenly refuses to undo if that would lose a write.`,
-    subjectTitle: titleCase(host),
-    did: `moved ${label} data out of ${host} into its own table, ${satellite}`,
-  }
-}
-
-function whyOf(c: ConcernAssessment): string {
-  const measured = c.families.filter(f => f.verdict === 'supports').map(f => f.detail)
-  const cost = c.pressure.map(p => p.detail)
-  const emerging = (c.emerging ?? []).map(e => e.detail)
-  const parts = [
-    measured.length ? `They behave as one responsibility: ${measured.slice(0, 2).join('; ')}.` : null,
-    cost.length ? `Keeping them on ${c.host} has a measured cost: ${cost.slice(0, 2).join('; ')}.` : null,
-    !cost.length && emerging.length ? `They are starting to evolve on their own: ${emerging.slice(0, 2).join('; ')}.` : null,
-  ].filter((x): x is string => !!x)
-  return parts.join(' ') || c.levelReason
 }
 
 function opportunityOf(projectId: string, c: ConcernAssessment, view?: ProposalView): Opportunity<ExtractionSpec> {

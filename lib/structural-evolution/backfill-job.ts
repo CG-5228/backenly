@@ -124,6 +124,19 @@ async function startingCursor(payload: EvolutionBackfillPayload): Promise<{ curs
   return typeof kept?.cursor === 'string' ? { cursor: kept.cursor } : { refusal: CURSOR_NOT_KEPT }
 }
 
+/** The batch's refusals when the table itself moved since the plan was approved. */
+const tableGone = (host: string) => `${host} no longer exists`
+const tableReshaped = (host: string) => `${host} changed shape since the plan was approved; the backfill stopped rather than adapt`
+
+/**
+ * Whether a stopped chain stopped because its TABLE moved: drift, which asks
+ * the person again for the table as it is now. A job that vanished, died or
+ * timed out is not drift, whatever its words: that is a step that failed.
+ */
+export function stoppedForDrift(detail: string, host: string): boolean {
+  return detail.includes(`refused: ${tableGone(host)}`) || detail.includes(`refused: ${tableReshaped(host)}`)
+}
+
 class IncompleteView extends Error {
   constructor(public reason: string) {
     super(`incomplete view: ${reason}`)
@@ -145,10 +158,8 @@ export async function handleEvolutionBackfillJob(payload: EvolutionBackfillPaylo
   const at = await workspaceAt(payload.projectId)
   const { schema } = at
   const host = await readTableFacts(at, payload.spec.host)
-  if (!host) return stop(`${payload.spec.host} no longer exists`)
-  if (basisFingerprint(host) !== payload.basisFingerprint) {
-    return stop(`${payload.spec.host} changed shape since the plan was approved; the backfill stopped rather than adapt`)
-  }
+  if (!host) return stop(tableGone(payload.spec.host))
+  if (basisFingerprint(host) !== payload.basisFingerprint) return stop(tableReshaped(payload.spec.host))
 
   const live = await readLiveEvolutionApproval(payload.projectId, payload.planId)
   if (!live || live.planVersion !== payload.planVersion) {

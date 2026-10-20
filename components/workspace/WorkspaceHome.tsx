@@ -126,6 +126,8 @@ interface HealthData {
   needsAttention: number
   /** Calls the user's coding agent parked for approval (not findings). */
   agentApprovalsPending?: number
+  /** Architecture changes Backenly prepared, waiting for approval (not findings, not broken guarantees). */
+  architectureRequestsPending?: number
   criticalCount?: number
   warningCount?: number
   /** Uncapped count of everything still needing attention (open + held). */
@@ -405,6 +407,10 @@ export function WorkspaceHome({
   // below does not count them; this panel was the one place left to say so,
   // and it said "No issues detected" over a parked drop (OV-1).
   const agentWaiting = health?.agentApprovalsPending ?? 0
+  // Changes Backenly prepared and holds for the owner: its own held repairs,
+  // and architecture changes waiting for approval. The loop rail below counts
+  // only the repairs: an architecture change is not a broken guarantee.
+  const reviewWaiting = autonomyPending + (health?.architectureRequestsPending ?? 0)
   const agent: {
     headline: string
     body: string
@@ -415,8 +421,8 @@ export function WorkspaceHome({
       headline: 'Your agent is waiting on you',
       body:
         `Your coding agent parked ${agentWaiting === 1 ? 'a call' : `${agentWaiting} calls`} for your approval` +
-        (autonomyPending > 0
-          ? `, and Backenly is holding ${autonomyPending} change${autonomyPending === 1 ? '' : 's'} of its own`
+        (reviewWaiting > 0
+          ? `, and Backenly is holding ${reviewWaiting} change${reviewWaiting === 1 ? '' : 's'} of its own`
           : '') +
         `. Nothing runs until you decide, and ${agentWaiting === 1 ? 'the request expires' : 'each request expires'} after a day.`,
       cta: {
@@ -424,10 +430,10 @@ export function WorkspaceHome({
         onClick: () => router.push(`/app/projects/${projectId}/autonomy`),
       },
     }
-    : autonomyPending > 0 ? {
+    : reviewWaiting > 0 ? {
       headline: 'Waiting on your review',
-      body: `Backenly prepared ${autonomyPending} change${autonomyPending === 1 ? '' : 's'} and is holding ${autonomyPending === 1 ? 'it' : 'them'}. Destructive and auth-related changes never ship without your OK.`,
-      cta: { label: `Review ${autonomyPending === 1 ? 'the change' : `${autonomyPending} changes`}`, onClick: () => router.push(`/app/projects/${projectId}/autonomy`) },
+      body: `Backenly prepared ${reviewWaiting} change${reviewWaiting === 1 ? '' : 's'} and is holding ${reviewWaiting === 1 ? 'it' : 'them'}. Destructive and auth-related changes never ship without your OK.`,
+      cta: { label: `Review ${reviewWaiting === 1 ? 'the change' : `${reviewWaiting} changes`}`, onClick: () => router.push(`/app/projects/${projectId}/autonomy`) },
     }
     : (verdict === 'credentials_needed' || liveBlocked > 0) ? {
       headline: 'Paused: a key is missing',

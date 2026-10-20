@@ -48,6 +48,11 @@ export type RequestAsk =
   | 'approve'
   /** A change stopped part-way and needs a decision: resume it or undo it. */
   | 'resume_or_undo'
+  /**
+   * A change that was already in place stopped for a problem: keep it as it is
+   * (and be watched again), or undo it. Nothing is left to resume.
+   */
+  | 'keep_or_undo'
 
 export type RequestStatus = 'pending_approval' | 'approving' | 'approved' | 'dismissed' | 'resolved'
 
@@ -77,7 +82,7 @@ export interface EvolutionRequestDetails {
     detail: string
     at: string
   }
-  /** Why a change stopped, for `ask: 'resume_or_undo'`. */
+  /** Why a change stopped, for `ask: 'resume_or_undo'` and `'keep_or_undo'`. In plain words. */
   stoppedBecause?: string
   /** When an approval attempt claimed the row; a claim older than CLAIM_LEASE_MS is abandoned. */
   claimedAt?: string
@@ -244,6 +249,11 @@ export async function setRequestStatus(
       ...(status === 'resolved' ? { fixAppliedAt: new Date() } : {}),
     },
   })
+}
+
+/** How many architecture changes wait for a person's decision in the queue. */
+export async function countWaitingRequests(projectId: string): Promise<number> {
+  return prisma.healthFinding.count({ where: { projectId, type: EVOLUTION_FINDING_TYPE, status: 'pending_approval' } })
 }
 
 /** Has the person declined this concern, and when? Read from dismissed requests. */

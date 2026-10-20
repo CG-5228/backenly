@@ -16,32 +16,38 @@
  * WHAT IT SHOWS
  * -------------
  * Each row is an ArchitectureChangeView (lib/evolution-engine/views.ts), read
- * from the trust report's `architectureChanges`: the headline, one plain
- * status, the measured outcome when there is one, and when it last changed.
- * Never the internal lifecycle state, never SQL, never evidence; those are for
- * `GET /api/projects/[id]/architecture?detail=1` and the queue row's opt-in
- * technical details.
+ * from the trust report's `architectureChanges`: a short headline ("Backenly
+ * improved your Orders architecture."), the sentence under it (what was done,
+ * that verification passed, that undo is available, or why it stopped), one
+ * plain status, whether it helped in one clause, and when it last changed.
+ * Never the internal lifecycle state, a step, SQL, evidence or a count.
+ *
+ * "View details" is the one way further in: the change's own history, each
+ * sentence Backenly wrote about it, and the measured numbers behind the
+ * outcome, read when asked (GET /api/projects/[id]/architecture?decision=).
  *
  * WHAT IT LETS YOU DO
  * -------------------
  * Only what the engine says is possible now (`actions`), each through
- * POST /api/projects/[id]/architecture { action, decisionId }:
+ * POST /api/projects/[id]/architecture { action, decisionId }, which needs an
+ * organization admin:
  *
- *   Undo     puts the table back exactly as it was; asks once more first
- *   Pause    stops before the next step
- *   Resume   carries on from where it stopped
+ *   Undo     says what it removes and what stops working; asks once more first
+ *   Pause    stops before the next step, while the change carries itself on
+ *   Resume   carries on from where it stopped, where nothing carries it on
+ *   Keep it  a change that stopped after it was in place stays, watched again
  *
- * A change that is also waiting in the queue above (it has a `findingId` and
- * its status asks for attention) is shown here without buttons, so one
- * decision is never offered in two places with two sets of buttons. There is
- * no button to remove the old columns, here or anywhere: that step is planned
- * and explained, never run by software.
+ * Pause and Resume are never offered together. A change that also has a row
+ * waiting in the queue above is shown here without buttons, so one decision is
+ * never offered in two places. There is no button to remove the old columns,
+ * here or anywhere: that step is planned and explained, never run by software.
  */
 
-import { useCallback, useState } from 'react'
-import { Layers, Loader2, Pause, Play, Undo2, XCircle } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { ChevronDown, Layers, Loader2, Pause, Play, Undo2, XCircle } from 'lucide-react'
 import { KIT, KitButton, Tag } from '@/components/inspector/kit'
 import type { ArchitectureChangeView } from '@/lib/evolution-engine/views'
+import { ADMIN_ONLY, announceArchitectureChange } from './architecture-decisions'
 
 type Action = 'undo' | 'pause' | 'resume'
 
@@ -75,7 +81,7 @@ function timeAgo(iso: string): string {
 
 /** Waiting in the queue above: decided there, not here. */
 function inQueue(c: ArchitectureChangeView): boolean {
-  return !!c.findingId && c.status.tone === 'attention'
+  return !!c.findingId
 }
 
 export function ArchitectureChangesPanel({
@@ -108,9 +114,13 @@ export function ArchitectureChangesPanel({
         if (res.ok && j.ok) {
           setRow(c.decisionId, { phase: 'idle', note: j.message })
           onChanged()
+          announceArchitectureChange('card')
           return
         }
-        setRow(c.decisionId, { phase: 'error', message: j.error || 'That did not go through. Try again in a moment.' })
+        setRow(c.decisionId, {
+          phase: 'error',
+          message: res.status === 403 ? ADMIN_ONLY : j.error || 'That did not go through. Try again in a moment.',
+        })
         // A refusal means the change moved on (someone else decided, or the
         // table changed). Re-read so the buttons match what is possible now.
         if (res.status === 409) onChanged()
@@ -131,13 +141,14 @@ export function ArchitectureChangesPanel({
         <h3 id="architecture-changes" className="text-[13px] font-semibold tracking-tight text-zinc-100">
           Architecture changes
         </h3>
-        <span className="text-[12px] tabular-nums text-zinc-600">{shown.length}</span>
+        <span className="text-[12px] tabular-nums text-zinc-400">{shown.length}</span>
       </div>
 
       <ul className="divide-y divide-white/[0.04]">
         {shown.map(c => (
           <ChangeRow
             key={c.decisionId}
+            projectId={projectId}
             change={c}
             state={rowState[c.decisionId] ?? { phase: 'idle' }}
             onUndo={() => setRow(c.decisionId, { phase: 'confirm_undo' })}
@@ -155,6 +166,7 @@ export function ArchitectureChangesPanel({
 // ── Row ──────────────────────────────────────────────────────────────────────
 
 function ChangeRow({
+  projectId,
   change: c,
   state,
   onUndo,
@@ -163,6 +175,7 @@ function ChangeRow({
   onResume,
   onCancel,
 }: {
+  projectId: string
   change: ArchitectureChangeView
   state: RowState
   onUndo: () => void
@@ -175,46 +188,60 @@ function ChangeRow({
   const busyWith = (a: Action) => state.phase === 'busy' && state.action === a
   const queued = inQueue(c)
   const note = state.phase === 'idle' ? state.note : undefined
+  const undoEffect = c.undoEffect || `Undo puts ${c.subject} back exactly as it was.`
+  const buttons = useRef<HTMLDivElement>(null)
+  const previous = useRef<RowState['phase']>('idle')
+
+  // Keyboard focus follows the confirmation, as on the queue row.
+  useEffect(() => {
+    const all = () => [...(buttons.current?.querySelectorAll('button') ?? [])]
+    if (state.phase === 'confirm_undo') all()[0]?.focus()
+    else if (previous.current === 'confirm_undo' && state.phase === 'idle') all().find(b => /Undo/.test(b.textContent ?? ''))?.focus()
+    previous.current = state.phase
+  }, [state.phase])
+
+  const announced = note ?? (state.phase === 'confirm_undo' ? `Undo? ${undoEffect}` : '')
 
   return (
     <li className={`px-5 py-3.5 ${state.phase === 'error' ? 'bg-rose-500/[0.03]' : ''}`}>
+      <p className="sr-only" role="status" aria-live="polite">{announced}</p>
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <p className="text-[12.5px] leading-snug text-zinc-100">{c.headline}</p>
+          <p className="text-[13px] font-medium leading-snug text-zinc-100">{c.headline}</p>
+          {c.detail && <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{c.detail}</p>}
+          {c.waiting && <p className="mt-1 text-[12.5px] leading-snug text-zinc-400">{c.waiting}</p>}
+          {c.outcome?.plain && <p className="mt-1 text-[12.5px] leading-snug text-zinc-300">{c.outcome.plain}</p>}
           <div className="mt-1.5 flex flex-wrap items-center gap-2">
             <Tag tone={TONE[c.status.tone] ?? 'neutral'}>{c.status.label}</Tag>
-            <span className="text-[12px] tabular-nums text-zinc-600">{timeAgo(c.at)}</span>
+            <span className="text-[12px] tabular-nums text-zinc-400">{timeAgo(c.at)}</span>
           </div>
-          {c.outcome?.summary && (
-            <p className="mt-1.5 text-[12.5px] leading-snug text-zinc-400">{c.outcome.summary}</p>
-          )}
-          {queued && <p className="mt-1.5 text-[12px] text-zinc-500">Waiting on you in the queue above.</p>}
+          {queued && <p className="mt-1.5 text-[12px] text-zinc-400">Waiting on you in the queue above.</p>}
           {note && <p className="mt-1.5 text-[12.5px] leading-snug text-zinc-400">{note}</p>}
+
+          <Details projectId={projectId} decisionId={c.decisionId} measured={c.outcome?.summary} />
 
           {state.phase === 'confirm_undo' && (
             <div className="mt-2 flex items-start gap-2 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2">
               <Undo2 className="mt-px size-3.5 shrink-0 text-zinc-400" />
-              <p className="text-[12.5px] leading-snug text-zinc-300">
-                Undo puts {c.subject} back exactly as it was. Nothing is lost.
-              </p>
+              <p className="text-[12.5px] leading-snug text-zinc-300">{undoEffect}</p>
             </div>
           )}
 
           {state.phase === 'error' && (
             <div className="mt-2 flex items-start gap-2">
               <XCircle className="mt-px size-3.5 shrink-0 text-rose-400" />
-              <p className="text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
+              <p role="alert" className="text-[12.5px] leading-snug text-rose-300/90">{state.message}</p>
             </div>
           )}
         </div>
 
         {!queued && (
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div ref={buttons} className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             {state.phase === 'error' ? (
               <KitButton variant="secondary" onClick={onCancel}>Try again</KitButton>
             ) : state.phase === 'confirm_undo' ? (
               <>
-                <KitButton variant="secondary" onClick={onCancel}>Keep it</KitButton>
+                <KitButton variant="secondary" onClick={onCancel}>Cancel</KitButton>
                 <KitButton variant="danger" onClick={onConfirmUndo}>
                   <Undo2 className="size-3.5" /> Undo
                 </KitButton>
@@ -227,10 +254,10 @@ function ChangeRow({
                     Pause
                   </KitButton>
                 )}
-                {c.actions.resume && (
+                {(c.actions.resume || c.actions.keep) && (
                   <KitButton variant="secondary" onClick={onResume} disabled={busy}>
                     {busyWith('resume') ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-                    Resume
+                    {c.actions.keep ? 'Keep it' : 'Resume'}
                   </KitButton>
                 )}
                 {c.actions.undo && (
@@ -245,5 +272,64 @@ function ChangeRow({
         )}
       </div>
     </li>
+  )
+}
+
+// ── View details (opt-in) ────────────────────────────────────────────────────
+
+type History = { phase: 'closed' | 'loading' } | { phase: 'error' } | { phase: 'open'; entries: Array<{ at: string; sentence: string }> }
+
+/**
+ * The change's own history, read when asked: every sentence Backenly wrote for
+ * a person about it, oldest first, and the numbers behind its outcome.
+ */
+function Details({ projectId, decisionId, measured }: { projectId: string; decisionId: string; measured?: string }) {
+  const [history, setHistory] = useState<History>({ phase: 'closed' })
+  const open = history.phase === 'open' || history.phase === 'loading'
+
+  const toggle = async () => {
+    if (open) return setHistory({ phase: 'closed' })
+    setHistory({ phase: 'loading' })
+    try {
+      const res = await fetch(`/api/projects/${projectId}/architecture?decision=${encodeURIComponent(decisionId)}`, { credentials: 'include' })
+      const j = (await res.json().catch(() => ({}))) as { trail?: Array<{ at: string; sentence: string; milestone: boolean }> }
+      if (!res.ok || !Array.isArray(j.trail)) return setHistory({ phase: 'error' })
+      setHistory({ phase: 'open', entries: j.trail.filter(t => t.milestone && t.sentence).map(t => ({ at: t.at, sentence: t.sentence })) })
+    } catch {
+      setHistory({ phase: 'error' })
+    }
+  }
+
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        className="inline-flex items-center gap-1 text-[12.5px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
+      >
+        View details
+        <ChevronDown className={`size-3 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {history.phase === 'loading' && <p className="mt-1 text-[12.5px] text-zinc-400">Reading its history…</p>}
+      {history.phase === 'error' && <p role="alert" className="mt-1 text-[12.5px] text-rose-300/90">Its history could not be read. Try again in a moment.</p>}
+      {history.phase === 'open' && (
+        <div className="mt-2 space-y-2 border-l border-white/[0.08] pl-3 text-[12.5px] leading-snug">
+          {measured && (
+            <div>
+              <p className="font-medium text-zinc-300">What was measured</p>
+              <p className="mt-0.5 text-zinc-400">{measured}</p>
+            </div>
+          )}
+          <ol className="space-y-1">
+            {history.entries.map((e, i) => (
+              <li key={i} className="text-zinc-400">
+                <span className="tabular-nums">{timeAgo(e.at)}</span> {e.sentence}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </div>
   )
 }
