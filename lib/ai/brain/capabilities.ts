@@ -111,7 +111,7 @@ export const TOOL_CAPABILITIES: Capability[] = [
   {
     id: 'drop_column',
     name: 'Drop a column (destructive)',
-    what: 'Permanently drop a column and all of its data. Reserved columns (id, createdAt, updatedAt) cannot be dropped. The table\'s REST API is regenerated so the column disappears from CRUD payloads. Reversible via the version history. Requires explicit user confirmation.',
+    what: 'Drop a column from a table. Reserved columns (id, createdAt, updatedAt) cannot be dropped. The table\'s REST API is regenerated so the column disappears from CRUD payloads. Its values are kept: restoring the state before the change (Database → Changes) brings the column back with them. Requires explicit user confirmation.',
     tool: 'drop_column',
   },
   {
@@ -568,7 +568,7 @@ export const MANUAL_CAPABILITIES: Capability[] = [
   {
     id: 'mcp_connect',
     name: 'Connect an AI coding agent over MCP (top-bar "Connect agent" button)',
-    what: 'Backenly ships a native MCP server (`@backenly/mcp-server` on npm) so Claude Code, Cursor, Codex, or ANY MCP-compatible host can drive this backend directly — this IS the "Connect agent" button in the top bar, which reads "Agent connected" once their agent is (both open the Connect page). Setup: (1) open Connect and generate a project-scoped MCP key, (2) for Claude Code run `claude mcp add backenly -- npx -y @backenly/mcp-server --project <projectId> --key <mcpKey>` (other hosts get a copy-paste config snippet on the same page), (3) open a new conversation in the host — Backenly appears as `backenly` in its tool list; an agent that installed it mid-conversation keeps working through `npx -y @backenly/cli@latest call <tool>` until then, and should not stop to ask for a restart. The connected agent gets the same governed vocabulary as this chat (read backend state, build tables/APIs/RLS/realtime, run brain chat); destructive ops like drop_table and delete_bucket are deliberately NOT exposed over MCP and stay confirmation-gated in the dashboard. When a user asks how to connect Claude Code, Cursor, or "their AI assistant", give these steps — NEVER say Backenly has no Claude Code / MCP integration.',
+    what: 'Backenly ships a native MCP server (`@backenly/mcp-server` on npm) so Claude Code, Cursor, Codex, or ANY MCP-compatible host can drive this backend directly — this IS the "Connect agent" button in the top bar, which reads "Agent connected" once their agent is (both open the Connect page). Setup: (1) open Connect and generate a project-scoped MCP key, (2) for Claude Code run `claude mcp add backenly -- npx -y @backenly/mcp-server --project <projectId> --key <mcpKey>` (other hosts get a copy-paste config snippet on the same page), (3) open a new conversation in the host — Backenly appears as `backenly` in its tool list; an agent that installed it mid-conversation keeps working through `npx -y @backenly/cli@latest call <tool>` until then, and should not stop to ask for a restart. The connected agent gets the same governed vocabulary as this chat (read backend state, build tables/APIs/RLS/realtime, run brain chat); destructive ops like drop_table and delete_bucket never run on its word: it can ask for one, and the exact call waits in the Review Queue until a person approves it. When a user asks how to connect Claude Code, Cursor, or "their AI assistant", give these steps — NEVER say Backenly has no Claude Code / MCP integration.',
     manualOnly: true,
   },
   {
@@ -611,16 +611,12 @@ export const NON_FEATURES = [
     why: 'Mutations go through typed actions so every change is planned, verified and reversible. Reading is different: run_query executes read-only SQL — joins, aggregates, window functions, EXPLAIN — as a SELECT-only role scoped to this project.',
   },
   {
-    pattern: 'Manual schema editing',
-    why: 'There is no SQL editor. Schema changes happen through the AI agent or the Tables UI, never as raw DDL.',
+    pattern: 'Schema edits in the SQL editor',
+    why: 'The Database page\'s SQL tab is read-only. Schema changes go through typed tools, the Tables UI, or a coding agent\'s apply_migration, which turns ordinary DDL into the same governed, reversible changes; DDL run over a direct read-write connection, which only the owner can arm, is observed as drift and adopted afterwards.',
   },
   {
-    pattern: 'Custom server-side code that is not a generated function',
-    why: 'Backend logic is built through the AI agent\'s tool calls. Arbitrary handwritten Node.js code is not deployed by the platform.',
-  },
-  {
-    pattern: 'Webhooks as a manual config surface',
-    why: 'Webhooks are emitted by triggers and consumed by integrations. There is no separate "create a webhook URL" surface — describe the event source instead.',
+    pattern: 'Hosting a long-running server process',
+    why: 'Server-side code runs as Backenly functions: generate_function writes one from a description, and a coding agent can deploy code it wrote with deploy_function_code (an HTTP route module, or a sandboxed body for any other trigger). There is no host for an arbitrary server.',
   },
   {
     pattern: 'Email sending without a configured provider',
