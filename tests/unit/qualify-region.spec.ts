@@ -16,7 +16,21 @@ import '../helpers/real-web-standard'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { SseReader, connectingFetch, describeError, parseArgs, pendingApproval, qualify, toolBody, toolData } from '@/scripts/qualify-region'
+import {
+  SseReader,
+  clockOffsetFromDate,
+  connectingFetch,
+  describeError,
+  describesTable,
+  freshStatus,
+  generatedFunctionsFor,
+  parseArgs,
+  pendingApproval,
+  qualify,
+  toolBody,
+  toolData,
+  untilAnswering,
+} from '@/scripts/qualify-region'
 
 const PROJECT = '0b9e3a52-7a5d-4c1e-9a2b-1f2e3d4c5b6a'
 const ENV = {
@@ -100,7 +114,7 @@ describe('arguments', () => {
   it('runs the rollback drills, with what each needs from the run', () => {
     const plain = parseArgs(ARGV, ENV)
     // Without a member or a kill command those two drills are not run, and say so.
-    expect(plain).toMatchObject({ freshnessSeconds: 30, skipDeletionDrill: false, member: null, killCommand: null, killAfterSeconds: 8, settleWaitMinutes: 30 })
+    expect(plain).toMatchObject({ freshnessSeconds: 30, skipDeletionDrill: false, member: null, killCommand: null, killAfterSeconds: 8, killDrainSeconds: 70, killChangeTables: 4, settleWaitMinutes: 30 })
 
     expect(parseArgs([...ARGV, '--freshness-seconds', '45'], ENV).freshnessSeconds).toBe(45)
     expect(() => parseArgs([...ARGV, '--freshness-seconds', '0'], ENV)).toThrow(/--freshness-seconds/)
@@ -120,6 +134,14 @@ describe('arguments', () => {
     expect(kill).toMatchObject({ killCommand: 'aws ecs stop-task --cluster c --task t', killAfterSeconds: 5, settleWaitMinutes: 40 })
     expect(() => parseArgs([...ARGV, '--kill-after-seconds', '0'], ENV)).toThrow(/--kill-after-seconds/)
     expect(() => parseArgs([...ARGV, '--settle-wait-minutes', '0'], ENV)).toThrow(/--settle-wait-minutes/)
+    // The wait after the kill fits the environment's drain and stop timeout; 0 is allowed, for an abrupt kill.
+    expect(parseArgs([...ARGV, '--kill-drain-seconds', '0'], ENV).killDrainSeconds).toBe(0)
+    expect(parseArgs([...ARGV, '--kill-drain-seconds', '120'], ENV).killDrainSeconds).toBe(120)
+    expect(() => parseArgs([...ARGV, '--kill-drain-seconds', '601'], ENV)).toThrow(/--kill-drain-seconds/)
+    expect(() => parseArgs([...ARGV, '--kill-drain-seconds', '-1'], ENV)).toThrow(/--kill-drain-seconds/)
+    // How many tables one of the drill's changes creates, so it can outlast a graceful stop.
+    expect(parseArgs([...ARGV, '--kill-change-tables', '6'], ENV).killChangeTables).toBe(6)
+    for (const bad of ['0', '21', '2.5']) expect(() => parseArgs([...ARGV, '--kill-change-tables', bad], ENV)).toThrow(/--kill-change-tables/)
   })
 
   it('names projects of other regions for the region host to refuse, and nothing else', () => {
@@ -181,6 +203,60 @@ describe('the transport', () => {
   })
 })
 
+describe('fresh connections, after a kill', () => {
+  let server: http.Server
+  let port: number
+  let connections = 0
+  /** The statuses the server answers with, in order; 200 once they run out. */
+  let script: number[] = []
+
+  beforeAll(async () => {
+    server = http.createServer((_req, res) => {
+      res.writeHead(script.shift() ?? 200)
+      res.end()
+    })
+    server.on('connection', () => connections++)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    port = (server.address() as AddressInfo).port
+  })
+
+  afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())))
+
+  it('asks on a connection of its own every time, so a draining one is never reused', async () => {
+    script = []
+    const before = connections
+    expect(await freshStatus(`http://127.0.0.1:${port}/api/health`)).toBe(200)
+    expect(await freshStatus(`http://127.0.0.1:${port}/api/health`)).toBe(200)
+    expect(connections - before).toBe(2)
+  })
+
+  it('goes where --connect says and keeps the hostname, and reads nothing answering as 0', async () => {
+    script = [503]
+    expect(await freshStatus(`http://home.test:${port}/api/health`, { 'home.test': '127.0.0.1' })).toBe(503)
+    const closed = http.createServer()
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve))
+    const gone = (closed.address() as AddressInfo).port
+    await new Promise<void>((resolve) => closed.close(() => resolve()))
+    expect(await freshStatus(`http://127.0.0.1:${gone}/api/health`)).toBe(0)
+  })
+
+  it('waits for answers in a row, not for one answer between refusals', async () => {
+    script = [503, 200, 503, 200]
+    const before = connections
+    await untilAnswering(`http://127.0.0.1:${port}/api/health`, {}, { consecutive: 2, byMs: Date.now() + 10_000, intervalMs: 1 })
+    // 503, 200, 503, then the two in a row.
+    expect(connections - before).toBe(5)
+  })
+
+  it('gives up at its deadline, saying what it last got', async () => {
+    script = Array(50).fill(503)
+    await expect(
+      untilAnswering(`http://127.0.0.1:${port}/api/health`, {}, { consecutive: 2, byMs: Date.now() + 50, intervalMs: 5 }),
+    ).rejects.toThrow(/did not answer 2 fresh connections in a row \(the last got 503\)/)
+    script = []
+  })
+})
+
 describe('the event stream', () => {
   it('assembles events across chunks, as servers send them', () => {
     const r = new SseReader()
@@ -220,6 +296,58 @@ describe('tool answers', () => {
     expect(toolBody({ text: 'Migration failed part-way', structured: refused })).toEqual(refused)
     expect(toolBody({ text: JSON.stringify(refused), structured: null })).toEqual(refused)
     expect(toolBody({ text: 'not JSON', structured: null })).toBeNull()
+  })
+})
+
+describe('what an agent reads about a table', () => {
+  // The schema section as staging answered it after a restore removed
+  // qualify_kept_4e3a9bbd: the table is gone, its generated endpoint is not.
+  const afterRestore = {
+    projectId: '13eab7a0-5e15-4714-b3c5-aba760004421',
+    tables: [{ name: 'qualify_notes', recordCount: 5 }, { name: 'users', recordCount: 2 }],
+    relationships: [],
+    realtime: { tables: ['qualify_notes'] },
+    functions: { count: 3, names: ['qualify-ping', 'qualify_notes-schema', 'qualify_kept_4e3a9bbd-schema'] },
+  }
+
+  it('describes a table only where the table itself is named, never by a function named after it', () => {
+    expect(describesTable(afterRestore, 'qualify_notes')).toBe(true)
+    expect(describesTable(afterRestore, 'qualify_kept_4e3a9bbd')).toBe(false)
+  })
+
+  it('still sees a table that lingers in relationships or realtime', () => {
+    expect(describesTable({ ...afterRestore, realtime: { tables: ['qualify_kept_4e3a9bbd'] } }, 'qualify_kept_4e3a9bbd')).toBe(true)
+    expect(
+      describesTable(
+        { ...afterRestore, relationships: [{ from: 'qualify_kept_4e3a9bbd', column: 'note_id', to: 'qualify_notes', toColumn: 'id' }] },
+        'qualify_kept_4e3a9bbd',
+      ),
+    ).toBe(true)
+  })
+
+  it('matches whole names: a table is not described by another whose name starts the same', () => {
+    expect(describesTable({ tables: [{ name: 'qualify_kept_4e3a9bbd_old' }] }, 'qualify_kept_4e3a9bbd')).toBe(false)
+  })
+
+  it('lists the functions generated for a table, and only those', () => {
+    expect(generatedFunctionsFor(afterRestore, 'qualify_kept_4e3a9bbd')).toEqual(['qualify_kept_4e3a9bbd-schema'])
+    expect(generatedFunctionsFor(afterRestore, 'qualify')).toEqual(['qualify-ping'])
+    expect(generatedFunctionsFor(afterRestore, 'users')).toEqual([])
+    expect(generatedFunctionsFor({ tables: [] }, 'users')).toEqual([])
+  })
+})
+
+describe('the service clock', () => {
+  it('measures how far this machine is behind the service from its Date header', () => {
+    // A machine 3.5 min slow: the header says 19:05:30, the request took 200 ms.
+    const sent = Date.parse('2026-10-19T19:02:00.000Z')
+    const offset = clockOffsetFromDate('Mon, 19 Oct 2026 19:05:30 GMT', sent, sent + 200)
+    expect(offset).toBe(210_000 + 500 - 100)
+  })
+
+  it('leaves this machine in charge when the header is missing or unreadable', () => {
+    expect(clockOffsetFromDate(null, 1_000, 1_200)).toBe(0)
+    expect(clockOffsetFromDate('soon', 1_000, 1_200)).toBe(0)
   })
 })
 
@@ -279,6 +407,8 @@ describe('a region that cannot be reached', () => {
       'restore-refused-under-a-later-change', 'drill-tables-removed', 'deleted-with-its-history',
       // What a coding agent reads of the schema, after each of them.
       'described-after-undo', 'described-after-a-change', 'described-after-acknowledged-restore', 'described-after-reapply',
+      // And the functions generated for a table: gone when a restore removed it, back when a reapply returned it.
+      'functions-after-undo', 'functions-after-acknowledged-restore', 'functions-after-reapply', 'functions-after-drill-restores',
     ]) {
       expect([check, status(check)]).toEqual([check, 'skip'])
     }
