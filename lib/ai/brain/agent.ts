@@ -40,10 +40,12 @@ import { classify, type BrainIntent, type Classification } from './classifier'
 import {
   BRAIN_MODEL_TOOLS,
   dispatchTool,
+  isReadOnlyCall,
   isReadOnlyTool,
   humanTitle,
   type ToolDispatchContext,
   type ToolName,
+  type ToolResult,
 } from './tools'
 import { getBlueprintForPrompt, isExplicitSpec } from '../blueprints'
 import { looksLikeBuildDescription } from './build-signals'
@@ -65,6 +67,7 @@ import { createSeedContext, runSeedStep, type SeedTableResult } from '../bluepri
 import type { FixLoopResult } from '../agentic-fix-loop'
 import { recordToolExecutionMemory, type BackendEventStatus } from '@/lib/operational-memory/ledger'
 import { needsApproval } from '@/lib/mcp/domains'
+import type { DataMigrationEstimate } from '@/lib/execution/data-migration'
 import { redactArgs } from './redact'
 import { currentPageContext, isAgentDoor, type BrainDoor } from './input-context'
 
@@ -86,12 +89,22 @@ export interface BlockedCall {
 
 /**
  * Control-flow tools — neither mutations nor reads of backend state.
- * (Reads are tracked in tools.READ_ONLY_TOOLS; mutations are everything else.)
+ * (Reads are tracked in tools.READ_ONLY_TOOLS, per call by tools.isReadOnlyCall;
+ * mutations are everything else.)
  */
 const CONTROL_TOOLS = new Set<string>([
   'finish', 'propose_plan', 'ask_user', 'answer_question',
   'apply_proposal', 'run_test', 'rollback',
 ])
+
+/**
+ * Whether one call can change the backend: what lists it in the turn's
+ * `applied` and sends a later finish back for verification. Exported so
+ * tests/unit/brain-mutation-accounting.spec.ts can list every tool it counts.
+ */
+export function isMutationCall(name: string, args: Record<string, unknown>): boolean {
+  return !CONTROL_TOOLS.has(name) && !isReadOnlyCall(name, args)
+}
 
 /**
  * Tools that read their own result back out of the live catalog before they
@@ -1257,6 +1270,32 @@ async function describeDanger(
   }
 }
 
+/** What a call that waits for a person affects, as its card and the model are told. */
+type Danger = Awaited<ReturnType<typeof describeDanger>>
+
+/**
+ * A real data migration the executor stopped at its own gate (RUN_DATA_MIGRATION
+ * in lib/ai/minimal-executor.ts), described by the rows that gate counted, so
+ * what each operation would change is what a person approves. Null for any
+ * other result, operations the executor refused as invalid included.
+ */
+function migrationAwaitingApproval(tool: string, result: ToolResult): Danger | null {
+  if (tool !== 'run_data_migration' || result.ok) return null
+  const data = result.data as { requiresApproval?: boolean; estimates?: DataMigrationEstimate[] } | undefined
+  if (data?.requiresApproval !== true || !Array.isArray(data.estimates)) return null
+  const tables = [...new Set(data.estimates.map((e) => `\`${e.table}\``))]
+  const counted = data.estimates.map((e) => `${e.detail}: ${e.affectedRows} of ${e.totalRows} rows`)
+  return {
+    tool,
+    target: `rows in ${tables.join(', ')} (${counted.join('; ')})`,
+    // Summed over the operations: a row two of them rewrite counts twice.
+    rowCount: data.estimates.reduce((sum, e) => sum + e.affectedRows, 0),
+    // The executor copies each table it rewrites before it changes a row.
+    reversible: true,
+    confirmPhrase: 'Confirm — run the data migration',
+  }
+}
+
 /** Dispatch one tool and treat its result as the terminal answer. */
 async function singleToolTurn(
   tool: ToolName,
@@ -1387,6 +1426,40 @@ async function runAgentLoop(
   // BrainResult.blockedCalls so the caller can queue each one for a human;
   // nothing here is ever executed by the brain itself.
   const blockedCalls: BlockedCall[] = []
+  /**
+   * Hold one call for a person: return it exactly as issued, once however often
+   * the model repeats it, and tell the model it waits. Every call that needs
+   * approval gets this one answer, whichever gate stopped it.
+   */
+  const holdForApproval = (toolUseId: string, tool: string, args: Record<string, unknown>, danger: Danger) => {
+    emit({ type: 'danger', ...danger })
+    const dup = blockedCalls.some(
+      (b) => b.tool === tool && JSON.stringify(b.args) === JSON.stringify(args),
+    )
+    if (!dup) {
+      blockedCalls.push({
+        tool,
+        args,
+        target: danger.target,
+        rowCount: danger.rowCount,
+        reversible: danger.reversible,
+      })
+    }
+    return toolResultBlock(
+      toolUseId,
+      {
+        ok: false,
+        blocked: 'needs_human_approval',
+        summary:
+          `\`${tool}\` on ${danger.target} needs a human's approval and was NOT run` +
+          (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
+          `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
+          `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
+          `Do not ask for a confirmation phrase: no message can approve it.`,
+      },
+      true,
+    )
+  }
   let verificationToolRejected = false
 
   const unverifiedMutationSummary = async () => {
@@ -1553,42 +1626,24 @@ async function runAgentLoop(
       // what needs a person. A gated call never runs here; it is returned
       // exactly as issued so the caller can queue it for a human.
       if (needsApproval(toolName)) {
-        const danger = await describeDanger(input.projectId, toolName, args)
-        emit({ type: 'danger', ...danger })
-        const dup = blockedCalls.some(
-          (b) => b.tool === toolName && JSON.stringify(b.args) === JSON.stringify(args),
-        )
-        if (!dup) {
-          blockedCalls.push({
-            tool: toolName,
-            args,
-            target: danger.target,
-            rowCount: danger.rowCount,
-            reversible: danger.reversible,
-          })
-        }
-        results.push(
-          toolResultBlock(
-            toolCall.id,
-            {
-              ok: false,
-              blocked: 'needs_human_approval',
-              summary:
-                `\`${toolName}\` on ${danger.target} needs a human's approval and was NOT run` +
-                (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
-                `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
-                `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
-                `Do not ask for a confirmation phrase: no message can approve it.`,
-            },
-            true,
-          ),
-        )
+        results.push(holdForApproval(toolCall.id, toolName, args, await describeDanger(input.projectId, toolName, args)))
         continue
       }
 
       // Redacted for the log only; the call itself receives the real arguments.
       console.log(`[Brain] tool=${toolName} args=${JSON.stringify(redactArgs(args)).slice(0, 200)}`)
       const result = await dispatchTool(toolName, args, ctx)
+      // A real data migration is stopped by the executor's own gate, which
+      // counts the rows it would change. That answer used to reach the model as
+      // a failure asking for a "confirm" no message could deliver, so from here
+      // only a dry run ever happened. It waits for a person like a gated call
+      // instead, with those counts as what they approve. Nothing ran: it is not
+      // a mutation, a refusal or a tool run of this turn.
+      const migration = migrationAwaitingApproval(toolName, result)
+      if (migration) {
+        results.push(holdForApproval(toolCall.id, toolName, args, migration))
+        continue
+      }
       toolsRun.push(toolName)
       toolStatuses.push(result.ok ? 'applied' : 'failed')
       console.log(`[Brain] tool=${toolName} ok=${result.ok} terminal=${!!result.terminal} summary="${result.summary.slice(0, 120)}"`)
@@ -1597,10 +1652,11 @@ async function runAgentLoop(
       if (toolName === 'read_backend_state' && mutated) verifiedAfterMutation = result.ok
       if (toolName === 'run_test' && mutated) verifiedAfterMutation = true
       // Allowlist-driven: a mutation is anything that is NOT a control tool and
-      // NOT a read-only tool. Adding a new read tool to tools.READ_ONLY_TOOLS
-      // (or a control tool to CONTROL_TOOLS above) keeps this honest without
-      // editing this branch every time.
-      const isMutation = !isReadOnlyTool(toolName) && !CONTROL_TOOLS.has(toolName)
+      // NOT a read. Adding a new read tool to tools.READ_ONLY_TOOLS (or a
+      // control tool to CONTROL_TOOLS above) keeps this honest without editing
+      // this branch every time; a tool whose arguments decide, like a dry-run
+      // migration, has its rule in tools.READ_ONLY_WHEN.
+      const isMutation = isMutationCall(toolName, args)
       if (isMutation) {
         mutated = true
         verificationSteered = false
