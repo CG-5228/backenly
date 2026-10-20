@@ -44,6 +44,7 @@ import { loopPrincipals, principalsToMetadata } from '@/lib/principal'
 import { canReach } from './region-skip'
 import { quotedError, quotesKeptHere } from '@/lib/data-plane/residency'
 import { outsideAnyChange } from '@/lib/changes/context'
+import { changeLockHeld } from '@/lib/changes/lock'
 
 export type ReconcileAction =
   | 'WOULD_AUTO_APPLY'     // tier within dial + breaker budget available
@@ -1020,6 +1021,15 @@ async function reconcile(projectId: string): Promise<ReconciliationPlan | LiveRe
   // recorded (lib/autonomy/region-skip.ts). Reconciling it here would read its
   // failures as an empty or healthy backend.
   if (!(await canReach(projectId, 'reconciler'))) return null
+
+  // A governed change holds the project's change lock from its checkpoint until
+  // it has settled, its automatic recovery included. Read in between, the
+  // project shows that change's half-done state as drift: a table a failing
+  // migration created looked like a shadow mutation, and the repair wrote
+  // generated endpoints for it while the recovery was removing it. Wait for the
+  // change to settle (the kick re-arms itself; the schedulers come back). If the
+  // lock cannot be read, nothing says the project has settled either.
+  if (await changeLockHeld(projectId).catch(() => true)) return null
 
   // Plan-driven cadence gate. The "tick" is any prior reconciler audit row
   // — live, shadow, change-freeze, or the dispatcher-written TICK marker. The
