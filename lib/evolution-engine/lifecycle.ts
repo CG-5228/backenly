@@ -105,7 +105,8 @@ const NEXT: Readonly<Record<LifecycleState, readonly LifecycleState[]>> = {
   verifying: ['cutover', 'blocked', 'failed', 'rolling_back'],
   cutover: ['observing', 'blocked', 'failed', 'rolling_back'],
   observing: ['stable', 'blocked', 'rolling_back'],
-  stable: ['rolling_back'],
+  // A regression found at a later look (30 or 90 days on) stops it for a person.
+  stable: ['blocked', 'rolling_back'],
   // Unblocking resumes the stage that stopped, after a person acted.
   blocked: ['rehearsing', 'awaiting_approval', 'approved', 'expanding', 'backfilling', 'verifying', 'cutover', 'observing', 'rolling_back'],
   failed: ['rolling_back', 'expanding', 'backfilling', 'verifying', 'cutover'],

@@ -14,18 +14,22 @@
  *   - a number resting on too few samples deciding anything
  *   - "insufficient evidence" being rounded up to "neutral" or "beneficial"
  *   - a benefit that did not pay off being called a regression of the change
+ *   - "beneficial" needing less evidence than "neutral": both need the
+ *     existing clients checked, and thin traffic must not hide a decisive rise
+ *     in errors (the measurement review's probe C)
+ *   - a count that moved within chance (3 → 2) reading as a benefit, or one
+ *     benefit that improved hiding another that got worse
  */
 
 import {
   assessBenefit,
   compare,
-  COUNT_IMPROVEMENT,
+  binomialAtMost,
   LATENCY_MIN_MS,
   pooledZ,
   RATE_MIN_EVENTS,
   type CorrectnessChecks,
 } from '@/lib/evolution-engine/benefit'
-import { MATERIAL_CHANGE } from '@/lib/autonomy/maintenance/outcome'
 import type { Measurement } from '@/lib/evolution-engine/primitive'
 
 const PASS: CorrectnessChecks = { correctness: 'pass', compatibility: 'pass', authorization: 'pass' }
@@ -62,33 +66,37 @@ const rate = (eb: number, nb: number, ea: number, na: number, over: Partial<Meas
   ...over,
 })
 
-/** hot_host_change: of `total` concern changes since, `onHost` still locked the host. */
-const locks = (total: number, onHost: number): Measurement => ({
-  name: 'refund changes that locked orders',
+/** hot_host_change: changes to the concern that locked all of the host, in two equal windows. */
+const locks = (before: number, after: number): Measurement => ({
+  name: 'refund changes that locked all of orders',
   role: 'benefit',
   unit: 'changes',
-  before: total,
-  after: onHost,
-  better: 'lower',
-  samplesBefore: total,
-  samplesAfter: total,
-  minSamples: 1,
-  scope: `${total} change(s) to refund since the change: ${total - onHost} on order_refunds, ${onHost} on orders`,
-})
-
-/** attributed_repairs: repairs on the concern's columns in equal windows. */
-const repairs = (before: number, after: number): Measurement => ({
-  name: 'repairs on refund columns',
-  role: 'benefit',
-  unit: 'repairs',
   before,
   after,
   better: 'lower',
   samplesBefore: before,
-  samplesAfter: null,
-  minSamples: 3,
-  scope: 'repairs located on refund_amount in the 30 days before and after',
+  samplesAfter: after,
+  minSamples: 0,
+  scope: 'in the 30 days before the change and the 30 days after',
 })
+
+/** attributed_repairs: problems found on the concern's columns, in two equal windows. */
+const problems = (before: number, after: number): Measurement => ({
+  name: 'problems found on refund columns',
+  role: 'benefit',
+  unit: 'problems',
+  before,
+  after,
+  better: 'lower',
+  samplesBefore: before,
+  samplesAfter: after,
+  minSamples: 0,
+  scope: 'problems located on refund_amount in the 30 days before and after',
+})
+
+/** The database's own statement time on the host, which watches clients the API does not see. */
+const dbTime = (over: Partial<Measurement> = {}): Measurement =>
+  latency({ name: 'orders write time in the database', minSamples: 100, population: 'database', ...over })
 
 const storage = (bytes: number): Measurement => ({
   name: 'storage taken by order_refunds',
@@ -203,8 +211,8 @@ describe('samples', () => {
     expect(compare(latency({ before: 40, after: 400, samplesAfter: null })).direction).toBe('not_comparable')
   })
 
-  it('lets a benefit side without a sample size be zero: that is the answer hoped for', () => {
-    expect(compare(repairs(6, 0)).direction).toBe('improved')
+  it('lets a counted benefit be zero after: that is the answer hoped for, and the test says when it is enough', () => {
+    expect(compare(problems(6, 0)).direction).toBe('improved')
   })
 
   it('never claims anything it could not measure', () => {
@@ -222,27 +230,53 @@ describe('samples', () => {
 
 // ── Benefits ─────────────────────────────────────────────────────────────────
 
-describe('benefits counted in whole events', () => {
-  it('hot_host_change: beneficial only when every change since stayed off the host', () => {
-    expect(compare(locks(2, 0)).direction).toBe('improved')
+describe('benefits counted in whole events: an exact test between equal windows', () => {
+  it('puts each event in either window with even odds, were nothing different', () => {
+    expect(binomialAtMost(0, 5)).toBeCloseTo(1 / 32, 10)
+    expect(binomialAtMost(2, 5)).toBeCloseTo(16 / 32, 10)
+    expect(binomialAtMost(5, 5)).toBe(1)
+    // Past a thousand events, the normal approximation.
+    expect(binomialAtMost(1000, 2000)).toBeCloseTo(0.509, 2)
+  })
+
+  it('calls a fall a benefit only when chance alone rarely gives it', () => {
+    expect(compare(locks(5, 0)).direction).toBe('improved') // p = 1/32
+    expect(compare(locks(4, 0)).direction).toBe('unchanged') // p = 1/16
     expect(compare(locks(2, 1)).direction).toBe('unchanged')
-    expect(compare(locks(1, 1)).direction).toBe('unchanged')
-    expect(compare(locks(0, 0)).direction).toBe('not_comparable')
+    expect(compare(problems(10, 2)).direction).toBe('improved') // p ≈ 0.019
+    expect(compare(problems(10, 7)).direction).toBe('unchanged')
   })
 
-  it('attributed_repairs: needs three incidents before, and a 30% fall', () => {
-    expect(COUNT_IMPROVEMENT.repairs).toBe(MATERIAL_CHANGE)
-    expect(compare(repairs(10, 7)).direction).toBe('improved')
-    expect(compare(repairs(10, 8)).direction).toBe('unchanged')
-    const thin = compare(repairs(2, 0))
-    expect(thin.direction).toBe('not_comparable')
-    expect(thin.text).toBe('repairs on refund columns: 2 → 0, too few to judge (2 before; 3 needed)')
+  it('3 → 2 is chance, and says so (probe A)', () => {
+    const c = compare(problems(3, 2))
+    expect(c.direction).toBe('unchanged')
+    expect(c.text).toBe('problems found on refund columns: 3 → 2, within what chance alone gives')
+    expect(assessBenefit(PASS, [latency(), problems(3, 2)]).verdict).toBe('neutral')
   })
 
-  it('reports a benefit that did not pay off, and does not call the change a regression for it', () => {
-    const worse = compare(repairs(3, 5))
-    expect(worse).toMatchObject({ direction: 'regressed', role: 'benefit' })
-    expect(assessBenefit(PASS, [repairs(3, 5)]).verdict).toBe('neutral')
+  it('has nothing to compare when nothing happened on either side', () => {
+    const c = compare(locks(0, 0))
+    expect(c).toMatchObject({ direction: 'not_comparable', reason: 'insufficient_sample' })
+    expect(c.text).toBe('refund changes that locked all of orders: none before or since, so nothing to compare yet')
+  })
+
+  it('reports a benefit that got worse, and does not call the change a regression for it', () => {
+    expect(compare(problems(2, 12))).toMatchObject({ direction: 'regressed', role: 'benefit' })
+    const r = assessBenefit(PASS, [latency(), problems(2, 12)])
+    expect(r.verdict).toBe('neutral')
+    expect(r.summary).toBe(
+      'It works correctly. Existing apps were unaffected, but what it was made to improve got worse: ' +
+        'problems found on refund columns rose from 2 to 12.',
+    )
+  })
+
+  it('is never beneficial while another benefit it was made for got worse (probe D)', () => {
+    const r = assessBenefit(PASS, [latency(), locks(6, 0), problems(2, 12)])
+    expect(r.verdict).toBe('neutral')
+    expect(r.summary).toBe(
+      'It works correctly. Existing apps were unaffected, but what it was made to improve got worse: ' +
+        'problems found on refund columns rose from 2 to 12, although refund changes that locked all of orders went from 6 to 0.',
+    )
   })
 
   it('any other benefit: a 10% move', () => {
@@ -266,32 +300,58 @@ describe('the verdict, in order of precedence', () => {
   })
 
   it('2. a regressed guardrail outranks an improved benefit', () => {
-    const r = assessBenefit(PASS, [locks(2, 0), latency({ name: 'orders write p95', before: 40, after: 90 })])
+    const r = assessBenefit(PASS, [locks(5, 0), latency({ name: 'orders write p95', before: 40, after: 90 })])
     expect(r.verdict).toBe('regressed')
   })
 
-  it('3. an improved benefit is beneficial, even when traffic was too thin for the guardrails', () => {
-    const r = assessBenefit(PASS, [thinTraffic, locks(2, 0)])
-    expect(r.verdict).toBe('beneficial')
-    expect(r.summary).toBe(
-      'It works correctly. It helped: refund changes that locked orders went from 2 to 0 ' +
-        '(2 change(s) to refund since the change: 2 on order_refunds, 0 on orders).',
-    )
-    // …and says what was not checked, so nobody reads the guardrails as passed.
-    expect(r.unmeasured).toEqual(['orders read p95: 240ms → 240ms, too few to judge (30 before, 12 after; 200 needed)'])
+  it('2. …including a decisive rise in errors on fewer requests than a p95 needs (probe C)', () => {
+    // 0 of 1,000 requests failing before, 100 of 150 after, and a benefit that
+    // improved: it used to be called beneficial because too few requests
+    // followed the change for the guardrail to be compared at all.
+    const errors = rate(0, 1_000, 100, 150, { population: 'api' })
+    const p95 = latency({ name: 'orders write p95', before: 40, after: 900, samplesAfter: 150, population: 'api' })
+    const c = compare(errors)
+    expect(c.direction).toBe('regressed')
+    expect(c.text).toBe('orders server errors: 0% → 66.7%, on few requests (1000 before, 150 after; 200 needed) but beyond chance')
+    expect(compare(p95).direction).toBe('not_comparable')
+    const r = assessBenefit(PASS, [errors, p95, locks(5, 0)])
+    expect(r).toMatchObject({ verdict: 'regressed', safety: 'regressed' })
+    expect(r.summary).toBe('It made things worse: orders server errors rose from 0% to 66.7%.')
+    // A rise the test does not call decisive is still not decided on so few.
+    expect(compare(rate(0, 1_000, 3, 150)).direction).toBe('not_comparable')
   })
 
-  it('4. a measured benefit that did not move, with every guardrail compared, is neutral', () => {
+  it('3. an improved benefit is beneficial only once existing clients were checked', () => {
+    const r = assessBenefit(PASS, [latency(), locks(5, 0)])
+    expect(r).toMatchObject({ verdict: 'beneficial', safety: 'held' })
+    expect(r.summary).toBe(
+      'It works correctly. It helped: refund changes that locked all of orders went from 5 to 0 ' +
+        '(in the 30 days before the change and the 30 days after).',
+    )
+    // Thin traffic: no longer beneficial, and it says why, naming what moved.
+    const thin = assessBenefit(PASS, [thinTraffic, locks(5, 0)])
+    expect(thin).toMatchObject({ verdict: 'insufficient_evidence', safety: 'unknown' })
+    expect(thin.summary).toBe(
+      'It works correctly. It may have helped (refund changes that locked all of orders went from 5 to 0), ' +
+        'but there is too little traffic so far to show existing apps were unaffected.',
+    )
+    expect(thin.unmeasured).toEqual(['orders read p95: 240ms → 240ms, too few to judge (30 before, 12 after; 200 needed)'])
+  })
+
+  it('4. a measured benefit that did not move, with existing clients checked, is neutral', () => {
     const r = assessBenefit(PASS, [latency(), locks(3, 1)])
     expect(r.verdict).toBe('neutral')
-    expect(r.summary).toMatch(/^It works correctly\. Nothing got worse, but what it was made to improve has not improved yet: refund changes that locked orders: 3 → 1/)
+    expect(r.summary).toBe(
+      'It works correctly. Existing apps were unaffected, but it has not paid off yet: ' +
+        'refund changes that locked all of orders: 3 → 1, within what chance alone gives.',
+    )
   })
 
   it('5. otherwise insufficient evidence, saying why in plain words', () => {
     // The benefit moved nothing, but a guardrail could not be compared.
     const thin = assessBenefit(PASS, [thinTraffic, locks(3, 1)])
     expect(thin.verdict).toBe('insufficient_evidence')
-    expect(thin.summary).toBe('It works correctly. Too early to say whether it helped: too little traffic so far to rule out a slowdown.')
+    expect(thin.summary).toBe('It works correctly. Too early to say whether it helped: there is too little traffic so far to show existing apps were unaffected.')
 
     // The concern has not changed since: the saving has not had a chance to show.
     const quiet = assessBenefit(PASS, [
@@ -316,9 +376,42 @@ describe('the verdict, in order of precedence', () => {
   })
 
   it('does not say it works correctly when correctness was not checked', () => {
-    const r = assessBenefit({ ...PASS, correctness: 'not_run' }, [locks(2, 0)])
+    const r = assessBenefit({ ...PASS, correctness: 'not_run' }, [latency(), locks(5, 0)])
     expect(r.verdict).toBe('beneficial')
     expect(r.summary).toMatch(/^Backenly could not confirm its data still matches\. It helped:/)
+  })
+})
+
+describe('whose traffic must be checked', () => {
+  const api = (over: Partial<Measurement> = {}) => latency({ population: 'api', ...over })
+  const notServed = (name: string) =>
+    api({ name, before: null, after: null, reason: 'table_not_served_over_api', unavailableReason: 'no writes to orders were recorded' })
+  const evicted = () => dbTime({ before: null, after: null, reason: 'statements_evicted' })
+
+  it("the API's clients, when the table has them; the database's statements do not then decide (probe F)", () => {
+    const r = assessBenefit(PASS, [api(), notServed('orders write p95'), evicted(), locks(5, 0)])
+    expect(r).toMatchObject({ verdict: 'beneficial', safety: 'held' })
+    // What was not compared is listed, so nobody reads it as checked.
+    expect(r.unmeasured).toEqual([
+      'orders write p95: not measured (no writes to orders were recorded)',
+      'orders write time in the database: not measured (the statement statistics dropped entries in between)',
+    ])
+  })
+
+  it("the database's statements, when nothing reaches the table over the API", () => {
+    const everyApi = [notServed('orders read p95'), notServed('orders write p95')]
+    expect(assessBenefit(PASS, [...everyApi, dbTime(), locks(5, 0)])).toMatchObject({ verdict: 'beneficial', safety: 'held' })
+    const r = assessBenefit(PASS, [...everyApi, evicted(), locks(5, 0)])
+    expect(r).toMatchObject({ verdict: 'insufficient_evidence', safety: 'unknown' })
+    expect(r.summary).toBe(
+      'It works correctly. It may have helped (refund changes that locked all of orders went from 5 to 0), ' +
+        'but orders write time in the database could not be measured.',
+    )
+  })
+
+  it('holds neutral to exactly the same check as beneficial', () => {
+    expect(assessBenefit(PASS, [api({ samplesAfter: 12 }), locks(3, 1)]).verdict).toBe('insufficient_evidence')
+    expect(assessBenefit(PASS, [api(), locks(3, 1)]).verdict).toBe('neutral')
   })
 })
 
@@ -327,6 +420,6 @@ describe('costs', () => {
     const r = assessBenefit(PASS, [storage(48 * 1024)])
     expect(r.verdict).toBe('insufficient_evidence')
     expect(r.costs).toEqual(['storage taken by order_refunds: 0 B → 48 KB (from zero)'])
-    expect(assessBenefit(PASS, [storage(10 * 1024 ** 3), locks(1, 0)]).verdict).toBe('beneficial')
+    expect(assessBenefit(PASS, [latency(), storage(10 * 1024 ** 3), locks(5, 0)]).verdict).toBe('beneficial')
   })
 })

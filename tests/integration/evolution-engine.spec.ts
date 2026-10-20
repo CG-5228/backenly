@@ -17,6 +17,10 @@
  *               with an outcome that never claims more than was measured
  *   undo        lossless; afterwards memory keeps the same change from being
  *               proposed again on the same evidence
+ *   look again  a month and three months on: an outcome that can no longer be
+ *               shown is said where the person reads it, the data is reconciled
+ *               again, and a problem found then stops the change for a person
+ *               (the measurement step is replaced only to choose a verdict)
  *   decline     "not now" is remembered the same way
  *
  * Every assertion about state reads it from architecture memory, the store the
@@ -33,6 +37,7 @@ import {
   isActionRefusal,
   isApprovalRefusal,
   listChanges,
+  lookAgain,
   observe,
   pause,
   proposeChanges,
@@ -43,6 +48,8 @@ import {
 import { decisionTrail, readMemory, summarizeDecisions, priorsFor } from '@/lib/evolution-engine/memory'
 import { DEFAULT_POLICY } from '@/lib/evolution-engine/policy'
 import { readTableFacts } from '@/lib/structural-evolution/facts'
+import { structuralExtraction } from '@/lib/structural-evolution/primitive'
+import type { Measurement } from '@/lib/evolution-engine/primitive'
 import { workspaceOn } from '@/lib/structural-evolution/workspace'
 import { asService, buildProject, drain, dropProject, q, requestsOf, stateOf, type Fixture } from '../helpers/evolution-engine-fixture'
 
@@ -185,7 +192,10 @@ describe('one architecture change, from proposal to undo', () => {
     expect(['insufficient_evidence', 'neutral']).toContain(r.benefit!.verdict)
     const s = await stateOf(f.projectId, decisionId)
     expect(s.state).toBe('stable')
-    expect(s.headline).toMatch(/Existing apps kept working, the data matches, and it can be undone/)
+    // No request followed the change in this fixture, so nobody's traffic was
+    // compared: it says what it saw, and not that existing apps kept working.
+    expect(s.headline).toMatch(/Nothing failed while it was watched, the data matches, and it can be undone/)
+    expect(s.headline).not.toMatch(/Existing apps kept working/)
     expect(s.headline).not.toMatch(/improved/)
     // Said once, and with when it will be judged again.
     expect(s.headline).not.toMatch(/It works correctly/)
@@ -199,7 +209,7 @@ describe('one architecture change, from proposal to undo', () => {
   it('reaches the Autonomy page as plain sentences, and the engine\'s notebook does not', async () => {
     const report = await buildTrustReport(f.projectId, 30)
     const arch = report.recentActivity.filter(a => a.kind === 'architecture')
-    expect(arch.map(a => a.summary).join('\n')).toMatch(/Existing apps kept working/)
+    expect(arch.map(a => a.summary).join('\n')).toMatch(/Nothing failed while it was watched/)
     expect(arch.map(a => a.summary).join('\n')).toMatch(/You approved/)
     // Traces (rehearsing, snapshots, observation passes) are memory, not news.
     expect(report.recentActivity.some(a => /snapshot|consistency: ok|Rehearsing/.test(a.summary))).toBe(false)
@@ -269,6 +279,111 @@ describe('a change that misbehaves under observation', () => {
     expect(priorsFor(summarizeDecisions(await readMemory(f.projectId)))['orders:refund']).toMatchObject({ kind: 'reversed' })
     const rows = await asService<{ n: bigint }>(`SELECT count(*)::bigint AS n FROM "${f.schema}"."orders" WHERE refund_amount IS NOT NULL`)
     expect(Number(rows[0].n)).toBe(60)
+  })
+})
+
+// ── After it is done ─────────────────────────────────────────────────────────
+
+describe('after a change is done, its outcome is looked at again, and a later problem is not hidden', () => {
+  let f: Fixture
+  let decisionId = ''
+  let cutoverAt = new Date()
+  const at = (hours: number) => new Date(cutoverAt.getTime() + hours * HOUR)
+  /** A busy table's numbers: its API clients compared and unaffected, and host locks before and after. */
+  const measured = (locksAfter: number): Measurement[] => [
+    {
+      name: 'orders write p95', role: 'guardrail', unit: 'ms', before: 40, after: 40, better: 'lower',
+      samplesBefore: 5_000, samplesAfter: 5_000, minSamples: 200, population: 'api', scope: 'requests to orders',
+    },
+    {
+      name: 'refund changes that locked all of orders', role: 'benefit', unit: 'changes', before: 5, after: locksAfter, better: 'lower',
+      samplesBefore: 5, samplesAfter: locksAfter, minSamples: 0, scope: 'in the 30 days before the change and the 30 days after',
+    },
+  ]
+
+  beforeAll(async () => {
+    process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
+    f = await buildProject('horizon')
+    await proposeChanges(f.projectId)
+    const [req] = await requestsOf(f.projectId)
+    decisionId = req.ev.decisionId
+    const a = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
+    if (isApprovalRefusal(a)) throw new Error(a.error)
+    await drain(f.projectId)
+    await advance({ projectId: f.projectId, decisionId })
+    cutoverAt = (await stateOf(f.projectId, decisionId)).cutoverAt!
+  }, 180_000)
+  afterAll(async () => {
+    jest.restoreAllMocks()
+    await dropProject(f)
+  }, 60_000)
+
+  it('keeps watching, instead of calling it done, while its outcome cannot be measured', async () => {
+    await observe({ projectId: f.projectId, decisionId, now: at(1) })
+    await observe({ projectId: f.projectId, decisionId, now: at(12) })
+    const spy = jest.spyOn(structuralExtraction, 'measure').mockRejectedValueOnce(new Error('the request log is unavailable'))
+    try {
+      const r = await observe({ projectId: f.projectId, decisionId, now: at(25) })
+      expect(r).toMatchObject({ state: 'observing', verdict: 'continue' })
+    } finally {
+      spy.mockRestore()
+    }
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('observing')
+    const noted = (await decisionTrail(f.projectId, decisionId)).filter(e => e.record.event === 'noted')
+    expect(noted.map(e => e.sentence)).toEqual(['the outcome could not be measured: the request log is unavailable'])
+  })
+
+  it('says existing apps kept working, and that it improved things, when the numbers show both', async () => {
+    const spy = jest.spyOn(structuralExtraction, 'measure').mockResolvedValueOnce(measured(0))
+    try {
+      const r = await observe({ projectId: f.projectId, decisionId, now: at(26) })
+      expect(r).toMatchObject({ verdict: 'stable', benefit: { verdict: 'beneficial', safety: 'held' } })
+    } finally {
+      spy.mockRestore()
+    }
+    const s = await stateOf(f.projectId, decisionId)
+    expect(s.state).toBe('stable')
+    expect(s.headline).toMatch(/^Backenly improved your Orders architecture: .*Existing apps kept working, the data matches, and it can be undone\./)
+  })
+
+  it('a month on, takes "improved" back where the person reads it when the numbers no longer show it', async () => {
+    const spy = jest.spyOn(structuralExtraction, 'measure').mockResolvedValueOnce(measured(4))
+    try {
+      await lookAgain({ projectId: f.projectId, decisionId, now: at(31 * 24) })
+    } finally {
+      spy.mockRestore()
+    }
+    const s = await stateOf(f.projectId, decisionId)
+    expect(s.state).toBe('stable')
+    expect(s.outcome?.verdict).toBe('neutral')
+    expect(s.headline).toMatch(/^A month on, Backenly can no longer show that the change to orders helped: /)
+    expect(s.headline).not.toMatch(/improved/)
+  })
+
+  it('three months on, reconciles the data again, and stops the change for a person when it no longer matches', async () => {
+    // A write behind the triggers' back, long after the change was called done.
+    await prisma.$transaction(async tx => {
+      await tx.$executeRawUnsafe(`SET LOCAL session_replication_role = replica`)
+      await tx.$executeRawUnsafe(`DELETE FROM "${f.schema}"."order_refunds" WHERE ctid IN (SELECT ctid FROM "${f.schema}"."order_refunds" LIMIT 1)`)
+    })
+    const spy = jest.spyOn(structuralExtraction, 'measure').mockResolvedValueOnce(measured(4))
+    try {
+      await lookAgain({ projectId: f.projectId, decisionId, now: at(91 * 24) })
+    } finally {
+      spy.mockRestore()
+    }
+    const s = await stateOf(f.projectId, decisionId)
+    expect(s.state).toBe('blocked')
+    expect(s.headline).toBe('Backenly stopped the change to orders because it saw a problem: its data stopped matching.')
+    // Back in front of the person: the request settled when it was done, so a new one is raised.
+    const waiting = (await requestsOf(f.projectId)).filter(r => r.ev.decisionId === decisionId && r.status === 'pending_approval')
+    expect(waiting.map(r => [r.ev.ask, r.ev.stoppedBecause])).toEqual([['resume_or_undo', 'its data stopped matching']])
+  })
+
+  it('kept on purpose, it is watched again from now', async () => {
+    const r = await resume({ projectId: f.projectId, decisionId, userId: f.ownerId })
+    expect(isActionRefusal(r) ? r.error : r.message).toBe('Kept. Backenly watches it again from now.')
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('observing')
   })
 })
 

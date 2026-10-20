@@ -8,15 +8,20 @@
  * answers it only as far as the numbers allow:
  *
  *   beneficial             something the change was made to improve improved
- *                          beyond noise, and nothing regressed
+ *                          beyond chance, nothing it was made to improve got
+ *                          worse, and the change's existing clients were
+ *                          checked and unaffected
  *   neutral                what it was made to improve was measured and did
- *                          not improve, and every guardrail could be compared
- *                          and held
+ *                          not improve beyond chance (or got worse), and the
+ *                          existing clients were checked and unaffected
  *   regressed              a correctness check failed, or a guardrail got
  *                          worse beyond noise
  *   insufficient_evidence  the numbers that would decide it are not available
  *                          or rest on too few samples. Said plainly, never
  *                          rounded up to "beneficial".
+ *
+ * "Beneficial" never needs less evidence than "neutral": both need the same
+ * check of the existing clients, and "beneficial" needs a benefit on top.
  *
  * ── Three kinds of number, three different powers ──────────────────────────
  *
@@ -29,13 +34,24 @@
  *              so a p95 that fell afterwards is a change in the traffic mix.
  *              The improvement is shown in the comparisons and never counted.
  *   benefit    tied to the cost that justified the change: schema changes to
- *              the concern no longer locking the host, fewer repairs on its
- *              columns. The only kind that can make a change "beneficial". A
- *              benefit that got worse is shown too, and is not a regression of
- *              the change: the change did not pay off, it did not break
- *              anything.
+ *              the concern no longer locking the host, fewer problems found on
+ *              its columns. The only kind that can make a change "beneficial".
+ *              A benefit that got worse is shown too, and is not a regression
+ *              of the change: the change did not pay off, it did not break
+ *              anything — but the change is then never called beneficial.
  *   cost       the price: storage, extra row writes. Reported in words so the
  *              owner sees it, and never a verdict on its own.
+ *
+ * ── Who must be checked ─────────────────────────────────────────────────────
+ *
+ * A guardrail names the clients it watches (`population`). The clients who
+ * reach the table through Backenly's API are watched by the request log; when
+ * there are such clients, their guardrails must all be comparable for either
+ * "beneficial" or "neutral". A guardrail of a kind the table has no clients of
+ * (no reads, or no writes, over the API in either window) does not apply.
+ * Only when nothing reaches the table over the API do the database's own
+ * statement statistics decide instead. A guardrail with no population is
+ * always required. Whatever was not compared is listed in `unmeasured`.
  *
  * ── When a number moved enough to matter ───────────────────────────────────
  *
@@ -43,18 +59,20 @@
  *                          RATE_MIN_EVENTS bad events after, an absolute rise
  *                          of RATE_MIN_ABS, and a pooled two-proportion z of
  *                          RATE_MIN_Z with the request counts as denominators.
- *                          An absolute floor alone flips on one extra error in
- *                          two hundred; a z-test alone calls 0.01% → 0.02%
- *                          significant on a busy table. Together they need
- *                          both size and certainty.
+ *                          Because the test weighs the counts, a rise this
+ *                          decisive regresses even below the measurement's
+ *                          own minimum of requests; nothing else does.
  *   latency (unit 'ms')    after/before of LATENCY_RATIO and a rise of
  *                          LATENCY_MIN_MS. Request durations are whole
  *                          milliseconds end to end, so 2ms → 3ms is +50% and
  *                          means nothing.
- *   anything else          a relative move of REGRESSION.
- *   benefits               a relative move of IMPROVEMENT, or, for benefits
- *                          counted in whole events, the threshold their unit
- *                          names in COUNT_IMPROVEMENT.
+ *   counted benefits       whole events (COUNT_UNITS) in two windows of equal
+ *                          length: an exact one-sided binomial test at
+ *                          COUNT_SIGNIFICANCE. Were nothing different, each
+ *                          event would fall in either window with even odds;
+ *                          3 → 2 is that, 5 → 0 is not (p ≈ 0.03).
+ *   anything else          a relative move of REGRESSION for a guardrail, of
+ *                          IMPROVEMENT for a benefit.
  *
  * The same thresholds, mirrored, decide whether a guardrail "improved" — which
  * is reported and decides nothing.
@@ -62,28 +80,19 @@
  * ── Samples ─────────────────────────────────────────────────────────────────
  *
  * Each measurement carries its own minimum, because a p95 needs more requests
- * than a mean of statement times and a repair count needs three incidents
- * before it says anything. Both sides must reach it, or the measurement is
- * `not_comparable` and the counts are in its text. A missing side is not a
- * zero: it is "not measured", with the reason.
- *
- * A benefit or cost side whose sample size is null is an event count over a
- * window as long as the other side's, where zero is the answer hoped for; it
- * has no minimum. A guardrail with an unknown sample size is never compared.
+ * than a mean of statement times. Both sides must reach it, or the measurement
+ * is `not_comparable` and the counts are in its text. A missing side is not a
+ * zero: it is "not measured", with the reason. A guardrail with an unknown
+ * sample size is never compared. A counted benefit has no minimum: the test
+ * is its own measure of how much the counts can say.
  *
  * ── The verdict, in order ───────────────────────────────────────────────────
  *
  *   1. a correctness check failed                                → regressed
  *   2. a guardrail regressed                                     → regressed
- *   3. a benefit improved                                        → beneficial
- *   4. a benefit was measured with enough evidence and did not
- *      improve, and every guardrail could be compared            → neutral
+ *   3. a benefit improved, none got worse, clients were checked  → beneficial
+ *   4. a benefit was measured, clients were checked              → neutral
  *   5. anything else                                             → insufficient_evidence
- *
- * Guardrails that lacked samples do not block (3): the benefits that can fire
- * it are counted in schema changes and repairs, which do not depend on how
- * busy the table is. They are listed in `unmeasured`, so the report never
- * implies they were checked.
  *
  * Pure.
  */
@@ -104,21 +113,17 @@ export const LATENCY_RATIO = 1.25
 export const LATENCY_MIN_MS = 20
 /** Relative move that counts as worse, for units with no rule of their own. */
 export const REGRESSION = 0.2
-/** Relative move that counts as a real benefit. */
+/** Relative move that counts as a real benefit, for units with no rule of their own. */
 export const IMPROVEMENT = 0.1
+/** One-sided significance a counted benefit needs, either way. */
+export const COUNT_SIGNIFICANCE = 0.05
 
 /**
- * Benefits counted in whole events, by unit, and how far the count must fall
- * to be called an improvement.
- *
- *   repairs  MATERIAL_CHANGE (0.3), the same bar lib/autonomy/maintenance/
- *            outcome.ts sets for "the repair helped". Restated, not imported,
- *            to keep this module free of the database; a test holds them equal.
- *   changes  1: every change to the concern since must have stayed off the
- *            table it left. One that still landed there means the concern is
- *            still growing in the old place, and the saving has not shown.
+ * Units of benefits counted in whole events over two windows of equal length:
+ * schema changes to the concern that locked the host, problems found on its
+ * columns. Judged by an exact test (see the header), never by a relative move.
  */
-export const COUNT_IMPROVEMENT: Readonly<Record<string, number>> = { repairs: 0.3, changes: 1 }
+export const COUNT_UNITS: ReadonlySet<string> = new Set(['changes', 'problems'])
 
 export interface Comparison {
   name: string
@@ -140,7 +145,7 @@ const REASON_TEXT: Record<UnavailableReason, string> = {
   statements_evicted: 'the statement statistics dropped entries in between',
   relation_recreated: 'the table was dropped and created again in between',
   request_log_unreadable: 'the request log could not be read',
-  history_unreadable: "Backenly's own record of repairs could not be read",
+  history_unreadable: "Backenly's own record of problems could not be read",
   no_traffic_recorded: 'no requests were recorded',
   table_not_served_over_api: 'the table is not reached through the API',
   insufficient_sample: 'too few samples',
@@ -159,7 +164,7 @@ function fmt(v: number, unit: string): string {
     for (const [size, label] of steps) if (v >= size) return `${round(v / size, 1)} ${label}`
     return `${Math.round(v)} B`
   }
-  if (unit in COUNT_IMPROVEMENT) return String(Math.round(v))
+  if (COUNT_UNITS.has(unit)) return String(Math.round(v))
   return `${round(v, 2)}${unit ? ` ${unit}` : ''}`
 }
 
@@ -170,6 +175,32 @@ export function pooledZ(eventsBefore: number, nBefore: number, eventsAfter: numb
   const se = Math.sqrt(p * (1 - p) * (1 / nBefore + 1 / nAfter))
   if (se === 0) return 0
   return (eventsAfter / nAfter - eventsBefore / nBefore) / se
+}
+
+/** The standard normal distribution function, to six decimals (Abramowitz and Stegun 7.1.26). */
+function normalCdf(z: number): number {
+  const t = 1 / (1 + (0.3275911 * Math.abs(z)) / Math.SQRT2)
+  const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+  const erf = 1 - poly * Math.exp(-(z * z) / 2)
+  return z >= 0 ? (1 + erf) / 2 : (1 - erf) / 2
+}
+
+/**
+ * P(X ≤ k) for X ~ Binomial(n, 1/2): how often chance alone puts k or fewer of
+ * n events in one of two equal windows. Exact up to a thousand events, and the
+ * normal approximation with a continuity correction beyond.
+ */
+export function binomialAtMost(k: number, n: number): number {
+  if (k < 0) return 0
+  if (k >= n) return 1
+  if (n > 1000) return normalCdf((k + 0.5 - n / 2) / Math.sqrt(n / 4))
+  let pmf = 2 ** -n
+  let sum = pmf
+  for (let i = 1; i <= k; i++) {
+    pmf = (pmf * (n - i + 1)) / i
+    sum += pmf
+  }
+  return Math.min(1, sum)
 }
 
 interface Side {
@@ -214,12 +245,47 @@ function samplesText(m: Measurement): string {
   return `${sides.join(', ')}; ${m.minSamples} needed`
 }
 
+/** A counted benefit: an exact test between two windows of equal length. */
+function compareCounts(m: Measurement, base: Pick<Comparison, 'name' | 'scope' | 'role'>): Comparison {
+  const before = Math.round(m.before!)
+  const after = Math.round(m.after!)
+  const n = before + after
+  if (n === 0) {
+    return {
+      ...base,
+      direction: 'not_comparable',
+      text: `${m.name}: none before or since, so nothing to compare yet`,
+      relativeChange: null,
+      reason: 'insufficient_sample',
+    }
+  }
+  const [fewer, more] = m.better === 'lower' ? [after, before] : [before, after]
+  // The chance of so few on the side hoped to be smaller, and of so few on
+  // the other side, were nothing different.
+  const pImproved = fewer < more ? binomialAtMost(fewer, n) : 1
+  const pWorse = more < fewer ? binomialAtMost(more, n) : 1
+  const direction: Comparison['direction'] =
+    pImproved < COUNT_SIGNIFICANCE ? 'improved' : pWorse < COUNT_SIGNIFICANCE ? 'regressed' : 'unchanged'
+  const moved = before !== after && direction === 'unchanged' ? ', within what chance alone gives' : ''
+  return {
+    ...base,
+    direction,
+    text: `${m.name}: ${before} → ${after}${moved}`,
+    relativeChange: before === 0 ? null : (after - before) / before,
+    reason: null,
+  }
+}
+
 export function compare(m: Measurement): Comparison {
   const base = { name: m.name, scope: m.scope, role: m.role }
   if (m.before === null || m.after === null) {
     const why = m.unavailableReason ?? (m.reason ? REASON_TEXT[m.reason] : 'no value was recorded')
     return { ...base, direction: 'not_comparable', text: `${m.name}: not measured (${why})`, relativeChange: null, reason: m.reason ?? 'not_yet_measurable' }
   }
+  if (m.role === 'benefit' && COUNT_UNITS.has(m.unit)) return compareCounts(m, base)
+
+  const beforeSide: Side = { value: m.before, samples: m.samplesBefore, events: m.eventsBefore ?? null }
+  const afterSide: Side = { value: m.after, samples: m.samplesAfter, events: m.eventsAfter ?? null }
 
   // A guardrail must know its sample sizes; a benefit or cost side without one
   // is an event count over an equal window and has no minimum (see header).
@@ -235,6 +301,17 @@ export function compare(m: Measurement): Comparison {
     }
   }
   if (thin(m.samplesBefore) || thin(m.samplesAfter)) {
+    // A rate rise the test calls decisive is a regression however few the
+    // requests: the test weighs exactly that. Nothing else is decided on so few.
+    if (m.role === 'guardrail' && m.unit === 'ratio' && worseBeyondNoise(m, beforeSide, afterSide)) {
+      return {
+        ...base,
+        direction: 'regressed',
+        text: `${m.name}: ${fmt(m.before, m.unit)} → ${fmt(m.after, m.unit)}, on few requests (${samplesText(m)}) but beyond chance`,
+        relativeChange: relative(m.before, m.after),
+        reason: null,
+      }
+    }
     return {
       ...base,
       direction: 'not_comparable',
@@ -255,15 +332,11 @@ export function compare(m: Measurement): Comparison {
 
   let direction: Comparison['direction'] = 'unchanged'
   if (m.role === 'benefit') {
-    const threshold = COUNT_IMPROVEMENT[m.unit] ?? IMPROVEMENT
     const better = m.better === 'lower' ? m.after < m.before : m.after > m.before
-    const moved = Math.abs(rel) >= threshold - 1e-9
-    if (moved) direction = better ? 'improved' : 'regressed'
+    if (Math.abs(rel) >= IMPROVEMENT - 1e-9) direction = better ? 'improved' : 'regressed'
   } else {
-    const before: Side = { value: m.before, samples: m.samplesBefore, events: m.eventsBefore ?? null }
-    const after: Side = { value: m.after, samples: m.samplesAfter, events: m.eventsAfter ?? null }
-    if (worseBeyondNoise(m, before, after)) direction = 'regressed'
-    else if (worseBeyondNoise(m, after, before)) direction = 'improved'
+    if (worseBeyondNoise(m, beforeSide, afterSide)) direction = 'regressed'
+    else if (worseBeyondNoise(m, afterSide, beforeSide)) direction = 'improved'
   }
 
   return { ...base, direction, text, relativeChange: Number.isFinite(rel) ? rel : null, reason: null }
@@ -279,6 +352,13 @@ export interface BenefitReport {
   verdict: BenefitVerdict
   checks: CorrectnessChecks
   comparisons: Comparison[]
+  /**
+   * Whether the change's existing clients were checked: `held` when every
+   * guardrail that must be compared was, and none regressed; `regressed` when
+   * any guardrail regressed; `unknown` otherwise. Only `held` lets anyone say
+   * existing apps kept working.
+   */
+  safety: 'held' | 'regressed' | 'unknown'
   /** Two or three sentences for a business owner. */
   summary: string
   /** What could not be measured, and why, one line each. */
@@ -307,15 +387,32 @@ const sentenceList = (xs: string[]) =>
 /** The comparison's own detail, without its name, for a sentence. */
 const why = (c: Comparison) => c.text.slice(c.name.length + 2)
 
+type Pair = { m: Measurement; c: Comparison }
+
+/** The guardrails that must be compared for anyone to say existing clients were unaffected (see "Who must be checked"). */
+function requiredGuardrails(guardrails: Pair[]): Pair[] {
+  const always = guardrails.filter(p => p.m.population === undefined)
+  const api = guardrails.filter(p => p.m.population === 'api' && p.c.reason !== 'table_not_served_over_api')
+  const database = guardrails.filter(p => p.m.population === 'database')
+  return [...always, ...(api.length > 0 ? api : database)]
+}
+
 export function assessBenefit(checks: CorrectnessChecks, measurements: Measurement[]): BenefitReport {
   const comparisons = measurements.map(compare)
-  const pairs = measurements.map((m, i) => ({ m, c: comparisons[i] }))
+  const pairs: Pair[] = measurements.map((m, i) => ({ m, c: comparisons[i] }))
   const unmeasured = comparisons.filter(c => c.direction === 'not_comparable').map(c => c.text)
   const costs = comparisons.filter(c => c.role === 'cost' && c.direction !== 'not_comparable').map(c => c.text)
+  const guardrails = pairs.filter(p => p.m.role === 'guardrail')
+  const benefits = pairs.filter(p => p.m.role === 'benefit')
+  const regressed = guardrails.filter(p => p.c.direction === 'regressed')
+  const required = requiredGuardrails(guardrails)
+  const checked = required.length > 0 && required.every(p => p.c.direction !== 'not_comparable')
+  const safety: BenefitReport['safety'] = regressed.length > 0 ? 'regressed' : checked ? 'held' : 'unknown'
   const report = (verdict: BenefitVerdict, summary: string): BenefitReport => ({
     verdict,
     checks,
     comparisons,
+    safety,
     summary,
     unmeasured,
     costs,
@@ -325,35 +422,41 @@ export function assessBenefit(checks: CorrectnessChecks, measurements: Measureme
   if (failed.length > 0) {
     return report('regressed', `It made things worse: ${sentenceList(failed.map(k => CHECK_WORDS[k]))}.`)
   }
-
-  const guardrails = pairs.filter(p => p.m.role === 'guardrail')
-  const benefits = pairs.filter(p => p.m.role === 'benefit')
-  const regressed = guardrails.filter(p => p.c.direction === 'regressed')
   if (regressed.length > 0) {
     return report('regressed', `It made things worse: ${sentenceList(regressed.map(p => movement(p.m, 'moved')))}.`)
   }
 
   const lead = checks.correctness === 'pass' ? 'It works correctly.' : 'Backenly could not confirm its data still matches.'
   const improved = benefits.filter(p => p.c.direction === 'improved')
-  if (improved.length > 0) {
-    const helped = improved.map(p => `${movement(p.m, 'went')}${p.m.scope ? ` (${p.m.scope})` : ''}`)
+  const worsened = benefits.filter(p => p.c.direction === 'regressed')
+  const measured = benefits.filter(p => p.c.direction !== 'not_comparable')
+  const helped = improved.map(p => `${movement(p.m, 'went')}${p.m.scope ? ` (${p.m.scope})` : ''}`)
+
+  if (improved.length > 0 && worsened.length === 0 && checked) {
     return report('beneficial', `${lead} It helped: ${sentenceList(helped)}.`)
   }
-
-  const measured = benefits.filter(p => p.c.direction !== 'not_comparable')
-  const guardrailsComparable = guardrails.every(p => p.c.direction !== 'not_comparable')
-  if (measured.length > 0 && guardrailsComparable) {
-    return report(
-      'neutral',
-      `${lead} Nothing got worse, but what it was made to improve has not improved yet: ${measured.map(p => p.c.text).join('; ')}.`,
-    )
+  if (measured.length > 0 && checked) {
+    if (worsened.length > 0) {
+      const worse = sentenceList(worsened.map(p => movement(p.m, 'moved')))
+      const also = improved.length > 0 ? `, although ${sentenceList(improved.map(p => movement(p.m, 'went')))}` : ''
+      return report('neutral', `${lead} Existing apps were unaffected, but what it was made to improve got worse: ${worse}${also}.`)
+    }
+    return report('neutral', `${lead} Existing apps were unaffected, but it has not paid off yet: ${measured.map(p => p.c.text).join('; ')}.`)
   }
 
-  // Say the most useful reason it is undecided: first what the change was made
-  // for, then whether too little traffic kept a slowdown from being ruled out.
-  const thinTraffic = guardrails.some(
+  // Undecided. Say the most useful reason: first what the change was made
+  // for, then whether existing clients could be checked.
+  const thinTraffic = required.some(
     p => p.c.reason === 'insufficient_sample' || p.c.reason === 'no_traffic_recorded' || p.c.reason === 'table_not_served_over_api',
   )
+  const clients = thinTraffic
+    ? 'there is too little traffic so far to show existing apps were unaffected'
+    : required.length === 0
+      ? 'nothing could show whether existing apps were affected'
+      : `${required.filter(p => p.c.direction === 'not_comparable').map(p => p.m.name).join(', ')} could not be measured`
+  if (improved.length > 0) {
+    return report('insufficient_evidence', `${lead} It may have helped (${sentenceList(improved.map(p => movement(p.m, 'went')))}), but ${clients}.`)
+  }
   // A benefit that was not measured explains itself in its detail ("refund has
   // not changed since"); one measured on too little keeps its name and counts.
   const benefitWhy = benefits
@@ -364,8 +467,6 @@ export function assessBenefit(checks: CorrectnessChecks, measurements: Measureme
       ? 'nothing it was made to improve can be measured here'
       : benefitWhy.length > 0
         ? benefitWhy.join('; ')
-        : thinTraffic
-          ? 'too little traffic so far to rule out a slowdown'
-          : `${guardrails.filter(p => p.c.direction === 'not_comparable').map(p => p.m.name).join(', ')} could not be measured`
+        : clients
   return report('insufficient_evidence', `${lead} Too early to say whether it helped: ${cause}.`)
 }

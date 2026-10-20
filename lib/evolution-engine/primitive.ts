@@ -205,6 +205,13 @@ export interface Measurement {
    */
   eventsBefore?: number | null
   eventsAfter?: number | null
+  /**
+   * For a guardrail: which clients it watches. `api` — requests through
+   * Backenly's API; `database` — statements other roles run in the database.
+   * Unset: a guardrail every verdict needs (see benefit.ts, "Who must be
+   * checked").
+   */
+  population?: 'api' | 'database'
   scope: string
   reason?: UnavailableReason
   /** Plain-language detail, shown with the reason. */

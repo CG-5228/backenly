@@ -69,6 +69,8 @@ export type MemoryEvent =
   | 'measured'
   /** A verdict on whether the change helped (payload.benefit). May be revised later. */
   | 'outcome'
+  /** Something the engine could not do and will try again (payload.note). Decides nothing. */
+  | 'noted'
 
 export interface EvolutionRecord {
   v: 1
@@ -213,7 +215,7 @@ export async function readMemory(projectId: string): Promise<MemoryEntry[]> {
   const base = { projectId, type: ARCHITECTURE_LOG_TYPE }
   const [decisive, assessments] = await Promise.all([
     prisma.auditLog.findMany({
-      where: { ...base, NOT: [eventIs('assessed'), eventIs('observed'), eventIs('measured')] },
+      where: { ...base, NOT: [eventIs('assessed'), eventIs('observed'), eventIs('measured'), eventIs('noted')] },
       orderBy: { timestamp: 'asc' },
       select: SELECT_ROW,
     }),

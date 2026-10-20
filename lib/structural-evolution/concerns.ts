@@ -49,7 +49,7 @@
  *
  *   repeating_group     the concern is a list squeezed into numbered columns,
  *                       so it has a hard ceiling (`coupon_1`, `coupon_2`)
- *   attributed_repairs  the healing loop has had to repair these columns
+ *   attributed_repairs  Backenly keeps finding problems on these columns
  *   hot_host_change     a change to this concern took an exclusive lock on a
  *                       table that was serving real traffic at the time
  *
@@ -150,6 +150,8 @@ export interface RepairRecord {
   type: string
   column: string
   at: string
+  /** The finding's status now: open, proposed, pending_approval, auto_fixed, fixed. Never dismissed. */
+  status: string
 }
 
 export interface PressureInputs {
@@ -760,7 +762,7 @@ function assessPressure(
     const ids = new Set(repairs.map(r => r.findingId))
     signals.push({
       kind: 'attributed_repairs',
-      detail: `the healing loop repaired these columns ${ids.size} time(s) in the last ${p.windowDays} days (${[...new Set(repairs.map(r => r.type))].join(', ')})`,
+      detail: `Backenly found problems on these columns ${ids.size} time(s) in the last ${p.windowDays} days (${[...new Set(repairs.map(r => r.type))].join(', ')})`,
       at: repairs.map(r => r.at).sort().at(-1),
     })
   }

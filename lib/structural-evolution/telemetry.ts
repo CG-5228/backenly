@@ -25,12 +25,20 @@
  * only honest benefits are the ones tied to the cost that fired the proposal,
  * and only those named in `firedBy` are measured:
  *
- *   hot_host_change     later changes to the concern land on the satellite and
- *                       take no lock on the host
- *   attributed_repairs  fewer repairs located on the concern's columns
+ *   hot_host_change     fewer changes to the concern take a lock on all of the
+ *                       host: those that locked it in the window before the
+ *                       change against those that did in an equal window after
+ *   attributed_repairs  fewer problems found on the concern's columns, in the
+ *                       same two windows; dismissed findings are not problems,
+ *                       and while one is still open the count says nothing,
+ *                       because a recurrence of an open finding is folded into
+ *                       it rather than recorded
  *
  * Both are counted in schema history and health findings, which are kept, so
- * both can be judged at L30 and L90, long after the request log has aged out.
+ * both can be judged at L30 and L90, long after the request log has aged out —
+ * as far back as that history reaches: a window it does not cover in full is
+ * not measured. Both are whole events, judged by an exact test
+ * (lib/evolution-engine/benefit.ts).
  *
  * ── Request windows ─────────────────────────────────────────────────────────
  *
@@ -83,14 +91,14 @@ import type {
   UnavailableReason,
 } from '@/lib/evolution-engine/primitive'
 import { CONSISTENCY_SIGNAL } from '@/lib/evolution-engine/observe'
-import { MIN_INCIDENTS } from '@/lib/autonomy/maintenance/outcome'
+import { nonTableSegmentsParam, tableOfRequestPathSql } from '@/lib/traffic/table-path'
 import type { ExtractionPlan } from './plan'
 import { readTableFacts } from './facts'
 import { workspaceAt, type WorkspaceAt } from './workspace'
 import { dbWords } from './residency'
 import { reconcileExtraction } from './reconcile'
 import { isOurSatellite } from './primitives'
-import { columnHistory, readRepairs, readSnapshots, type SnapshotRow } from './sensing'
+import { columnHistory, MAX_SNAPSHOTS, readRepairs, readSnapshots, readUnsettledProblems, UNSETTLED_FINDING, type SnapshotRow } from './sensing'
 import { hostStem, readName } from './lexicon'
 
 // ── Thresholds ───────────────────────────────────────────────────────────────
@@ -221,11 +229,11 @@ function span(ms: number): string {
 // ── Requests ─────────────────────────────────────────────────────────────────
 
 /**
- * The table a recorded path is for, in SQL: `/db/<t>` on v1, `/<t>` on v2.
- * The request recorder strips the project prefix and the query string, so
- * these are the only two shapes a table request can take.
+ * The table a recorded path is for, in SQL, as every other reader of the log
+ * attributes it (lib/traffic/table-path.ts): `/db/<t>` on v1, `/<t>` on v2,
+ * and never one of v1's own routes. Its parameter is $6.
  */
-const PATH_TABLE = `COALESCE(substring(path FROM '^/db/([A-Za-z0-9_]+)'), substring(path FROM '^/([A-Za-z0-9_]+)(?:/|$)'))`
+const PATH_TABLE = tableOfRequestPathSql('path', 6)
 
 const emptyClass = (): RequestClass => ({ n: 0, p50: null, p95: null, s5xx: 0, s401: 0, s403: 0 })
 
@@ -266,6 +274,7 @@ export async function readRequestWindow(
       to,
       host,
       satellite,
+      nonTableSegmentsParam(),
     )
     const out: RequestWindow = {
       from: short(from),
@@ -435,8 +444,9 @@ export async function readStatementClasses(
     dealloc = numOrNull(info[0]?.dealloc)
     statsReset = iso(info[0]?.stats_reset ?? null)
   } catch {
-    // PostgreSQL 13 and older: no eviction or reset record. Deltas then rely
-    // on counters never going backwards, which is still checked.
+    // PostgreSQL 13 and older keep no record of resets or evictions, and a
+    // reset followed by enough new statements reads as a plausible delta.
+    return none('unreadable', 'this PostgreSQL keeps no record of when statement statistics were reset or entries evicted (pg_stat_statements_info)')
   }
   const cls = (p: string): StatementClass => ({ calls: num(row?.[`${p}_calls`]), ms: num(row?.[`${p}_ms`]), rows: num(row?.[`${p}_rows`]) })
   return {
@@ -462,11 +472,15 @@ function concernColumn(plan: ExtractionPlan): (column: string) => boolean {
 interface LiveEvidence {
   history: boolean
   historyReason: string | null
+  /** When the schema history read here begins, when it holds fewer than every snapshot since `since`. */
+  historyFrom: string | null
   hostChanges: string[]
   satChanges: string[]
-  repairs: Array<{ id: string; at: string }>
+  repairs: Array<{ id: string; at: string; status: string }>
   /** False when the findings could not be read, so `repairs` is not "none". */
   repairsReadable: boolean
+  /** When the findings read here begin, when a cap cut them short of `since`. */
+  repairsFrom: string | null
 }
 
 async function readEvidence(projectId: string, plan: ExtractionPlan, since: Date, snapshots?: SnapshotRow[] | { unavailable: string }): Promise<LiveEvidence> {
@@ -477,17 +491,22 @@ async function readEvidence(projectId: string, plan: ExtractionPlan, since: Date
   const isConcern = concernColumn(plan)
   const memberSet = new Set(members)
   const seen = new Set<string>()
-  const repairs: Array<{ id: string; at: string }> = []
+  const repairs: Array<{ id: string; at: string; status: string }> = []
   const found = await readRepairs(projectId, since)
-  for (const r of found ?? []) {
+  for (const r of found?.records ?? []) {
     if ((r.table !== host && r.table !== satellite) || !memberSet.has(r.column) || seen.has(r.findingId)) continue
     seen.add(r.findingId)
-    repairs.push({ id: r.findingId, at: r.at })
+    repairs.push({ id: r.findingId, at: r.at, status: r.status })
   }
   repairs.sort((a, b) => a.at.localeCompare(b.at))
+  // The newest MAX_SNAPSHOTS are read; when that is all of them there may be
+  // older history this read does not hold.
+  const oldest = Array.isArray(series) && series.length >= MAX_SNAPSHOTS ? series[0]?.createdAt ?? null : null
   return {
     history: hostHistory.available,
     historyReason: hostHistory.available ? null : hostHistory.reason ?? 'schema history is not available',
+    historyFrom: oldest && oldest.getTime() > since.getTime() ? oldest.toISOString() : null,
+    repairsFrom: found && found.coversFrom.getTime() > since.getTime() ? found.coversFrom.toISOString() : null,
     hostChanges: hostHistory.events.filter(e => e.columns.some(isConcern)).map(e => e.at),
     // The satellite IS the concern: every change to it is a change to the concern.
     satChanges: satHistory.available ? satHistory.events.map(e => e.at) : [],
@@ -758,7 +777,7 @@ async function requestGuardrails(projectId: string, plan: ExtractionPlan, s0: Sn
     { name: `${host} write p95`, unit: 'ms', key: 'write' as const },
   ]
   const shape = (k: (typeof kinds)[number], scope: string) =>
-    ({ name: k.name, role: 'guardrail', unit: k.unit, better: 'lower', minSamples: MIN_REQUESTS, scope }) as const
+    ({ name: k.name, role: 'guardrail', unit: k.unit, better: 'lower', minSamples: MIN_REQUESTS, population: 'api', scope }) as const
 
   if (!s0 || !s1) {
     const missing = !s0 ? 'when the change started' : 'when it finished'
@@ -827,6 +846,7 @@ function writeTimeGuardrail(plan: ExtractionPlan, r: Snap | null, s0: Snap | nul
     unit: 'ms',
     better: 'lower' as const,
     minSamples: MIN_STATEMENT_CALLS,
+    population: 'database' as const,
     scope:
       `average database time per write statement on ${host}, from the proposal to the start of the change and from its end to now; ` +
       `it includes keeping ${satellite} in step`,
@@ -891,7 +911,6 @@ async function benefits(
   projectId: string,
   plan: ExtractionPlan,
   firedBy: string[],
-  all: Snap[],
   s0: Snap | null,
   s1: Snap | null,
   now: Date,
@@ -901,72 +920,73 @@ async function benefits(
   const wants = new Set(firedBy)
   if (!wants.has('hot_host_change') && !wants.has('attributed_repairs')) return out
 
-  const L = s1 ? now.getTime() - s1.at.getTime() : 0
-  const since = s0 && s1 ? new Date(s0.at.getTime() - L) : now
-  const live = await readEvidence(projectId, plan, since)
+  const locks = {
+    name: `${label} changes that locked all of ${host}`,
+    role: 'benefit' as const,
+    unit: 'changes',
+    better: 'lower' as const,
+    minSamples: 0,
+  }
+  const problems = {
+    name: `problems found on ${label} columns`,
+    role: 'benefit' as const,
+    unit: 'problems',
+    better: 'lower' as const,
+    minSamples: 0,
+  }
+  if (!s0 || !s1 || now.getTime() <= s1.at.getTime()) {
+    if (wants.has('hot_host_change')) out.push(unmeasurable({ ...locks, scope: `schema changes to ${label}` }, 'not_yet_measurable', 'the change has not finished'))
+    if (wants.has('attributed_repairs')) {
+      out.push(unmeasurable({ ...problems, scope: `problems located on ${members.join(', ')}` }, 'not_yet_measurable', 'the change has not finished'))
+    }
+    return out
+  }
+
+  // Two windows of equal length, adjacent to the change and skipping the work
+  // in between, as the request guardrails have: [S0 − L, S0) and [S1, now).
+  const L = now.getTime() - s1.at.getTime()
+  const from = new Date(s0.at.getTime() - L)
+  const live = await readEvidence(projectId, plan, from)
+  const t = (at: string) => new Date(at).getTime()
+  const before = (at: string) => t(at) >= from.getTime() && t(at) < s0.at.getTime()
+  const after = (at: string) => t(at) >= s1.at.getTime() && t(at) < now.getTime()
+  const windows = `in the ${span(L)} before the change and the ${span(L)} after`
+  const begins = (at: string) => `the record read here begins ${short(at)}, after the ${span(L)} before the change began`
 
   if (wants.has('hot_host_change')) {
-    const base = {
-      name: `${label} changes that locked ${host}`,
-      role: 'benefit' as const,
-      unit: 'changes',
-      better: 'lower' as const,
-      minSamples: 1,
-    }
-    if (!s1) {
-      out.push(unmeasurable({ ...base, scope: `schema changes to ${label}` }, 'not_yet_measurable', 'the change has not finished'))
+    const scope =
+      `changes to ${label} that took a lock on all of ${host}, ${windows}. A change to ${label} made on ${satellite} instead ` +
+      `locks only the writes to ${host} that set ${label} data, until the old columns are removed`
+    if (!live.history) {
+      out.push(unmeasurable({ ...locks, scope }, 'not_yet_measurable', live.historyReason ?? 'schema history is not available'))
+    } else if (live.historyFrom) {
+      out.push(unmeasurable({ ...locks, scope }, 'not_yet_measurable', `schema history is incomplete: ${begins(live.historyFrom)}`))
     } else {
-      // Live history first; if it cannot be read now, the latest snapshot
-      // after the change that could read it.
-      const kept = [...all].reverse().find(x => x.at.getTime() > s1.at.getTime() && x.data.concern?.history)
-      const source = live.history
-        ? { host: live.hostChanges, sat: live.satChanges }
-        : kept
-          ? { host: kept.data.concern!.hostChanges, sat: kept.data.concern!.satChanges }
-          : null
-      const afterS1 = (at: string) => new Date(at).getTime() > s1.at.getTime() && new Date(at).getTime() <= now.getTime()
-      const h = source ? source.host.filter(afterS1).length : 0
-      const s = source ? source.sat.filter(afterS1).length : 0
-      const total = h + s
-      const scope = `${total} change(s) to ${label} since the change: ${s} on ${satellite}, ${h} on ${host}; before it, every one would have locked ${host}`
-      if (!source) {
-        out.push(unmeasurable({ ...base, scope: `schema changes to ${label}` }, 'not_yet_measurable', live.historyReason ?? 'schema history is not available'))
-      } else if (total === 0) {
-        out.push(
-          unmeasurable({ ...base, scope }, 'insufficient_sample', `${label} has not changed since the change; the saving shows when it does`),
-        )
-      } else {
-        out.push({ ...base, scope, before: total, after: h, samplesBefore: total, samplesAfter: total })
-      }
+      const nb = live.hostChanges.filter(before).length
+      const na = live.hostChanges.filter(after).length
+      out.push({ ...locks, scope, before: nb, after: na, samplesBefore: nb, samplesAfter: na })
     }
   }
 
   if (wants.has('attributed_repairs')) {
-    const base = {
-      name: `repairs on ${label} columns`,
-      role: 'benefit' as const,
-      unit: 'repairs',
-      better: 'lower' as const,
-      minSamples: MIN_INCIDENTS,
-    }
-    if (!s0 || !s1 || L <= 0) {
-      out.push(unmeasurable({ ...base, scope: `repairs located on ${members.join(', ')}` }, 'not_yet_measurable', 'the change has not finished'))
-    } else if (!live.repairsReadable) {
-      out.push(unmeasurable({ ...base, scope: `repairs located on ${members.join(', ')}` }, 'history_unreadable', 'the record of repairs could not be read'))
+    const scope = `problems Backenly found located on ${members.join(', ')}, ${windows}`
+    const unsettled = live.repairsReadable ? await readUnsettledProblems(projectId, [host, satellite], members) : null
+    if (!live.repairsReadable || unsettled === null) {
+      out.push(unmeasurable({ ...problems, scope }, 'history_unreadable', 'the record of problems could not be read'))
+    } else if (live.repairsFrom) {
+      out.push(unmeasurable({ ...problems, scope }, 'history_unreadable', `the record of problems is incomplete: ${begins(live.repairsFrom)}`))
+    } else if (unsettled > 0 || live.repairs.some(r => (UNSETTLED_FINDING as readonly string[]).includes(r.status))) {
+      out.push(
+        unmeasurable(
+          { ...problems, scope },
+          'insufficient_sample',
+          `a problem found on ${label} columns is still open, and while it is, Backenly does not record each time it recurs`,
+        ),
+      )
     } else {
-      const t = (at: string) => new Date(at).getTime()
-      const nb = live.repairs.filter(r => t(r.at) >= since.getTime() && t(r.at) < s0.at.getTime()).length
-      const na = live.repairs.filter(r => t(r.at) >= s1.at.getTime() && t(r.at) < now.getTime()).length
-      out.push({
-        ...base,
-        scope: `repairs located on ${members.join(', ')} in the ${span(L)} before the change and the ${span(L)} after`,
-        before: nb,
-        after: na,
-        samplesBefore: nb,
-        // An event count over a window as long as the "before" one; zero is
-        // the answer hoped for, so this side has no minimum.
-        samplesAfter: null,
-      })
+      const nb = live.repairs.filter(r => before(r.at)).length
+      const na = live.repairs.filter(r => after(r.at)).length
+      out.push({ ...problems, scope, before: nb, after: na, samplesBefore: nb, samplesAfter: na })
     }
   }
   return out
@@ -988,7 +1008,7 @@ export async function measureExtraction(
 
   const [guardrails, benefit] = await Promise.all([
     requestGuardrails(projectId, plan, s0, s1, now),
-    benefits(projectId, plan, context.firedBy, all, s0, s1, now),
+    benefits(projectId, plan, context.firedBy, s0, s1, now),
   ])
   return [...guardrails, writeTimeGuardrail(plan, r, s0, s1, last), ...costs(plan, s1, last), ...benefit]
 }

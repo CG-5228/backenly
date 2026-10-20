@@ -50,7 +50,7 @@ import {
   type EvolutionPolicy,
 } from './policy'
 import { observationVerdict, CONSISTENCY_SIGNAL } from './observe'
-import { assessBenefit, type BenefitReport, type BenefitVerdict } from './benefit'
+import { assessBenefit, type BenefitReport, type BenefitVerdict, type CorrectnessChecks } from './benefit'
 import {
   decisionTrail,
   evidenceHashOf,
@@ -75,6 +75,7 @@ import {
   isConsentRefusal,
   type EvolutionPrimitive,
   type ExecutionOutcome,
+  type Measurement,
   type Opportunity,
   type Rehearsal,
   type RollbackResult,
@@ -816,17 +817,19 @@ export async function advance(input: {
   const furthest = reached.sort((a, b) => FORWARD.indexOf(b) - FORWARD.indexOf(a))[0] ?? null
 
   if (outcome.status === 'completed') {
+    // "After" starts when the last rung finished, not when this pass began.
+    const doneAt = input.now ?? new Date()
     await walkTo(projectId, d, 'cutover', traceFor)
     const s = summaryOf(trail)
     const hours = policy.observationHours
     await enter(projectId, d, 'observing', {
       sentence: `Backenly ${s?.did ?? `changed ${subject}`}. Existing apps keep working; it is being watched for ${hours} hours before it counts as done.`,
       milestone: true,
-      payload: { cutoverAt: now.toISOString() },
+      payload: { cutoverAt: doneAt.toISOString() },
     })
     const spec = primitive.normaliseSpec(summary.spec)
     const resolved = spec ? await primitive.resolvePlan(projectId, spec) : null
-    if (resolved && !('refusal' in resolved)) await snapshot(projectId, d, primitive, resolved.plan, 'S1', now)
+    if (resolved && !('refusal' in resolved)) await snapshot(projectId, d, primitive, resolved.plan, 'S1', doneAt)
     return { state: 'observing', message: `The change is in place and being watched for ${hours} hours.`, outcome }
   }
 
@@ -1114,7 +1117,13 @@ export async function observe(input: { projectId: string; decisionId: string; no
   // answered from measurements only.
   if ('refusal' in resolved) return { state: 'observing', verdict: 'continue', reason: resolved.refusal }
   await snapshot(projectId, d, primitive, resolved.plan, 'S2', now)
-  const benefit = await judge(projectId, primitive, resolved.plan, decisionId, now, since)
+  const judged = await judge(projectId, primitive, resolved.plan, decisionId, now, since)
+  if ('error' in judged) {
+    // Not called done on numbers nobody could read: the watch goes on.
+    await note(projectId, d, `the outcome could not be measured: ${judged.error}`)
+    return { state: 'observing', verdict: 'continue', reason: 'the outcome could not be measured yet; it is tried again on the next pass' }
+  }
+  const benefit = judged.benefit
   if (benefit.verdict === 'regressed') {
     await stopForRegression(projectId, d, summary.subject, asClause(benefit.summary), policy, input)
     return { state: 'blocked', verdict: 'regressed', reason: benefit.summary, benefit }
@@ -1127,8 +1136,13 @@ export async function observe(input: { projectId: string; decisionId: string; no
   // The milestone already says it works; the benefit summary's own lead would repeat it.
   const outcome = benefit.summary.replace(/^It works correctly\.\s*/, '')
   const later = benefit.verdict === 'beneficial' ? '' : ' Backenly will look again a month after the change.'
+  // "Existing apps kept working" only where their traffic was compared and held.
+  const held =
+    benefit.safety === 'held'
+      ? 'Existing apps kept working, the data matches, and it can be undone.'
+      : 'Nothing failed while it was watched, the data matches, and it can be undone.'
   await enter(projectId, d, 'stable', {
-    sentence: `${lead} Existing apps kept working, the data matches, and it can be undone.${outcome ? ` ${outcome}` : ''}${later}`,
+    sentence: `${lead} ${held}${outcome ? ` ${outcome}` : ''}${later}`,
     milestone: true,
   })
   await remember({ projectId, record: { ...base(d), event: 'outcome', payload: { benefit, phase: 'S2' } }, milestone: false, sentence: benefit.summary })
@@ -1161,6 +1175,8 @@ async function stopForRegression(
   await askToResumeOrUndo(projectId, d, reason)
 }
 
+type Judged = { benefit: BenefitReport } | { error: string }
+
 async function judge(
   projectId: string,
   primitive: EvolutionPrimitive<any, any>,
@@ -1169,32 +1185,54 @@ async function judge(
   now: Date,
   /** The start of the current watch; passes before it were already decided on. */
   since: Date,
-): Promise<BenefitReport> {
+  /** Correctness checked just now, instead of as the last observation pass found it. */
+  correctness?: CorrectnessChecks['correctness'],
+): Promise<Judged> {
   const { trail } = await decision(projectId, decisionId)
   const snapshots = snapshotsOf(trail)
-  const measurements = await primitive.measure(projectId, plan, snapshots, { firedBy: firedByOf(trail), now }).catch(() => [])
+  let measurements: Measurement[]
+  try {
+    measurements = await primitive.measure(projectId, plan, snapshots, { firedBy: firedByOf(trail), now })
+  } catch (err) {
+    // Never "nothing was measured": that would read as too early to say, and
+    // the change would be called done on numbers nobody looked at.
+    return { error: await failureWords(projectId, err) }
+  }
   const passes = passesSince(trail, since)
   const lastConsistency = [...passes].reverse().flatMap(p => p.signals).find(s => s.name === CONSISTENCY_SIGNAL)
   const rehearsed = trail
     .map(e => ((e.record.payload ?? {}) as { rehearsal?: { authorization?: string } }).rehearsal)
     .filter(Boolean)
     .pop()
-  return assessBenefit(
+  const benefit = assessBenefit(
     {
-      correctness: lastConsistency?.status === 'ok' ? 'pass' : lastConsistency?.status === 'regressed' ? 'fail' : 'not_run',
+      correctness:
+        correctness ?? (lastConsistency?.status === 'ok' ? 'pass' : lastConsistency?.status === 'regressed' ? 'fail' : 'not_run'),
       compatibility: passes.some(p => p.signals.some(s => s.status === 'regressed')) ? 'fail' : 'pass',
       authorization: rehearsed?.authorization === 'passed' ? 'pass' : rehearsed?.authorization === 'failed' ? 'fail' : 'not_run',
     },
     measurements,
   )
+  return { benefit }
+}
+
+/** A trace the engine keeps for itself: what it could not do, and will try again. */
+async function note(projectId: string, d: DecisionRef, text: string): Promise<void> {
+  await remember({ projectId, record: { ...base(d), event: 'noted', payload: { note: text } }, milestone: false, sentence: text })
 }
 
 function passesSince(trail: MemoryEntry[], since: Date): ReturnType<typeof passesOf> {
   return passesOf(trail).filter(p => new Date(p.at).getTime() >= since.getTime())
 }
 
-/** Benefits that take weeks to show are re-judged 30 and 90 days after cutover. */
-async function longHorizon(projectId: string, d: DecisionSummary, now: Date): Promise<void> {
+/**
+ * Benefits that take weeks to show are re-judged 30 and 90 days after cutover,
+ * with the data reconciled again then rather than as it was when the change
+ * was called done. A regression found then stops the change for a person, as
+ * one found while it was watched does; a verdict that leaves "beneficial" is
+ * said where the person reads it, so nothing keeps saying it helped.
+ */
+async function longHorizon(projectId: string, d: DecisionSummary, now: Date, policy: EvolutionPolicy): Promise<void> {
   if (d.state !== 'stable' || !d.cutoverAt) return
   const primitive = primitiveById(d.primitive)
   const spec = primitive?.normaliseSpec(d.spec)
@@ -1208,17 +1246,41 @@ async function longHorizon(projectId: string, d: DecisionSummary, now: Date): Pr
   if ('refusal' in resolved) return
   const ref = refOf(d)
   await snapshot(projectId, ref, primitive, resolved.plan, due, now)
-  const benefit = await judge(projectId, primitive, resolved.plan, d.decisionId, now, d.observingSince ?? d.cutoverAt)
-  const changed = benefit.verdict !== d.outcome?.verdict
+  const correctness = await primitive.verify(projectId, resolved.plan).then(
+    v => (v.consistent ? ('pass' as const) : ('fail' as const)),
+    () => 'not_run' as const,
+  )
+  const judged = await judge(projectId, primitive, resolved.plan, d.decisionId, now, d.observingSince ?? d.cutoverAt, correctness)
+  if ('error' in judged) {
+    await note(projectId, ref, `the outcome could not be measured ${due === 'L30' ? 'a month' : 'three months'} on: ${judged.error}`)
+    return
+  }
+  const benefit = judged.benefit
+  const when = due === 'L30' ? 'A month' : 'Three months'
+  const previous = d.outcome?.verdict
+  if (benefit.verdict === 'regressed') {
+    await remember({ projectId, record: { ...base(ref), event: 'outcome', payload: { benefit, phase: due } }, milestone: false, sentence: benefit.summary })
+    await stopForRegression(projectId, ref, d.subject, asClause(benefit.summary), policy, { projectId, decisionId: d.decisionId })
+    return
+  }
+  const changed = benefit.verdict !== previous
+  const shown = changed && (benefit.verdict === 'beneficial' || previous === 'beneficial')
   await remember({
     projectId,
     record: { ...base(ref), event: 'outcome', payload: { benefit, phase: due } },
-    milestone: changed && benefit.verdict === 'beneficial',
-    sentence:
-      changed && benefit.verdict === 'beneficial'
-        ? `${due === 'L30' ? 'A month' : 'Three months'} on, the change to ${d.subject} has paid off: ${benefit.summary}`
-        : benefit.summary,
+    milestone: shown,
+    sentence: !shown
+      ? benefit.summary
+      : benefit.verdict === 'beneficial'
+        ? `${when} on, the change to ${d.subject} has paid off: ${benefit.summary}`
+        : `${when} on, Backenly can no longer show that the change to ${d.subject} helped: ${benefit.summary}`,
   })
+}
+
+/** The 30- and 90-day look at one change that is done, when it is due. For the sweep, and for tests. */
+export async function lookAgain(input: { projectId: string; decisionId: string; now?: Date; policy?: EvolutionPolicy }): Promise<void> {
+  const d = (await decision(input.projectId, input.decisionId)).summary
+  if (d) await longHorizon(input.projectId, d, input.now ?? new Date(), input.policy ?? DEFAULT_POLICY)
 }
 
 // ── The sweep ────────────────────────────────────────────────────────────────
@@ -1261,7 +1323,7 @@ export async function sweepArchitecture(input: { projectId: string; now?: Date; 
     await observe({ projectId, decisionId: d.decisionId, now, policy: input.policy })
     observed++
   }
-  for (const d of decisions.filter(x => x.state === 'stable')) await longHorizon(projectId, d, now)
+  for (const d of decisions.filter(x => x.state === 'stable')) await longHorizon(projectId, d, now, input.policy ?? DEFAULT_POLICY)
 
   const exec = executionEnabled()
   const resumable = decisions.filter(x => x.state && ADVANCEABLE.includes(x.state))

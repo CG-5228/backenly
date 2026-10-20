@@ -54,7 +54,8 @@ import {
   snapshotExtraction,
   type ExtractionTelemetry,
 } from '@/lib/structural-evolution/telemetry'
-import { assessBenefit } from '@/lib/evolution-engine/benefit'
+import { assessBenefit, compare } from '@/lib/evolution-engine/benefit'
+import { MAX_SNAPSHOTS } from '@/lib/structural-evolution/sensing'
 import { CONSISTENCY_SIGNAL } from '@/lib/evolution-engine/observe'
 import type { Measurement, TelemetrySnapshot } from '@/lib/evolution-engine/primitive'
 
@@ -203,8 +204,8 @@ async function schemaSnapshot(v: number, at: Date, tables: Record<string, string
   })
 }
 
-async function finding(at: Date, type: string, details: object) {
-  await prisma.healthFinding.create({ data: { projectId, detectedAt: at, type, severity: 'warning', details, status: 'fixed' } })
+async function finding(at: Date, type: string, details: object, status = 'fixed') {
+  return prisma.healthFinding.create({ data: { projectId, detectedAt: at, type, severity: 'warning', details, status } })
 }
 
 beforeAll(async () => {
@@ -542,41 +543,75 @@ describe('measurement', () => {
     expect(amp.samplesAfter).toBeGreaterThanOrEqual(110)
   })
 
-  it('hot_host_change: the change to refunds since landed on the new table, and none locked orders', () => {
-    expect(byName(ms, 'refund changes that locked orders')).toMatchObject({
-      role: 'benefit', unit: 'changes', before: 1, after: 0, samplesBefore: 1, samplesAfter: 1,
-      scope: '1 change(s) to refund since the change: 1 on order_refunds, 0 on orders; before it, every one would have locked orders',
-    })
+  it('hot_host_change: changes to refunds that locked all of orders, in the window before and the window after', () => {
+    // Refunds last changed on orders 60 days ago, and since the change only on
+    // order_refunds (v6): in neither 8-hour window did anything lock orders,
+    // so there is no saving to show yet — not a saving of one, as when the
+    // count after was set against "every change since would have locked it".
+    const m = byName(ms, 'refund changes that locked all of orders')
+    expect(m).toMatchObject({ role: 'benefit', unit: 'changes', before: 0, after: 0, samplesBefore: 0, samplesAfter: 0 })
+    expect(m.scope).toMatch(/^changes to refund that took a lock on all of orders, in the 8 hours before the change and the 8 hours after\. /)
+    expect(compare(m)).toMatchObject({ direction: 'not_comparable', text: 'refund changes that locked all of orders: none before or since, so nothing to compare yet' })
   })
 
-  it('attributed_repairs: repairs on refund columns in equal windows before and after', () => {
-    expect(byName(ms, 'repairs on refund columns')).toMatchObject({
-      role: 'benefit', unit: 'repairs', before: 4, after: 1, samplesBefore: 4, samplesAfter: null, minSamples: 3,
-    })
+  it('attributed_repairs: problems found on refund columns, in the same two windows, judged by an exact test', () => {
+    const m = byName(ms, 'problems found on refund columns')
+    expect(m).toMatchObject({ role: 'benefit', unit: 'problems', before: 4, after: 1, samplesBefore: 4, samplesAfter: 1, minSamples: 0 })
+    // Four before and one after is what chance alone gives one time in five.
+    expect(compare(m)).toMatchObject({ direction: 'unchanged', text: 'problems found on refund columns: 4 → 1, within what chance alone gives' })
   })
 
   it('judges it: slower writes make it a regression, whatever it saved', () => {
     const r = assessBenefit(PASS, ms)
     expect(r.verdict).toBe('regressed')
     expect(r.summary).toBe('It made things worse: orders write p95 rose from 30ms to 90ms.')
-    // Without that one, it is beneficial on what it was made for.
-    const without = assessBenefit(PASS, ms.filter(m => m.name !== 'orders write p95'))
-    expect(without.verdict).toBe('beneficial')
-    expect(without.summary).toMatch(/^It works correctly\. It helped: refund changes that locked orders went from 1 to 0 .* and repairs on refund columns went from 4 to 1/)
-    expect(without.costs.some(c => c.startsWith('storage taken by order_refunds: 0 B → '))).toBe(true)
+    // Without that one, existing apps were checked and held, and what it was
+    // made for has not paid off beyond chance: neutral, not beneficial.
+    const without = ms.filter(m => m.name !== 'orders write p95')
+    const held = assessBenefit(PASS, without)
+    expect(held).toMatchObject({ verdict: 'neutral', safety: 'held' })
+    expect(held.summary).toBe(
+      'It works correctly. Existing apps were unaffected, but it has not paid off yet: ' +
+        'problems found on refund columns: 4 → 1, within what chance alone gives.',
+    )
+    expect(held.costs.some(c => c.startsWith('storage taken by order_refunds: 0 B → '))).toBe(true)
+    // A fall chance rarely gives is a benefit.
+    const decisive = without.map(m => (m.name === 'problems found on refund columns' ? { ...m, before: 9, samplesBefore: 9 } : m))
+    expect(assessBenefit(PASS, decisive)).toMatchObject({ verdict: 'beneficial', safety: 'held' })
   })
 
   it('measures only the benefits that fired the proposal', async () => {
     const none = await measureExtraction(projectId, plan, all(), { firedBy: [], now: AT.S2 })
     expect(none.filter(m => m.role === 'benefit')).toEqual([])
     const one = await measureExtraction(projectId, plan, all(), { firedBy: ['attributed_repairs'], now: AT.S2 })
-    expect(one.filter(m => m.role === 'benefit').map(m => m.name)).toEqual(['repairs on refund columns'])
+    expect(one.filter(m => m.role === 'benefit').map(m => m.name)).toEqual(['problems found on refund columns'])
   })
 
-  it('a change to the concern that still lands on the host means the saving has not shown', async () => {
+  it('a change to the concern that still locks orders is counted after the change, and one is no evidence either way', async () => {
     await schemaSnapshot(7, ago(1 * HOUR), { orders: [...ORDERS_NOW, 'refund_note'], order_refunds: [...SAT, 'refund_method'] })
     const later = await measureExtraction(projectId, plan, all(), { firedBy: ['hot_host_change'], now: new Date(T) })
-    expect(byName(later, 'refund changes that locked orders')).toMatchObject({ before: 2, after: 1 })
+    const m = byName(later, 'refund changes that locked all of orders')
+    expect(m).toMatchObject({ before: 0, after: 1 })
+    expect(compare(m).direction).toBe('unchanged')
+  })
+
+  it('a problem still open on the concern\'s columns makes the count say nothing; a dismissed one is no problem', async () => {
+    // Recurrences of an open finding are folded into it, never recorded again.
+    const open = await finding(ago(40 * DAY), 'invalid_value', { tableName: 'orders', columnName: 'refund_reason' }, 'open')
+    try {
+      const m = byName(await measureExtraction(projectId, plan, all(), { firedBy: ['attributed_repairs'], now: AT.S2 }), 'problems found on refund columns')
+      expect(m).toMatchObject({ before: null, after: null, reason: 'insufficient_sample' })
+      expect(m.unavailableReason).toBe('a problem found on refund columns is still open, and while it is, Backenly does not record each time it recurs')
+    } finally {
+      await prisma.healthFinding.delete({ where: { id: open.id } })
+    }
+    const dismissed = await finding(ago(5 * HOUR), 'invalid_value', { tableName: 'orders', columnName: 'refund_amount' }, 'dismissed')
+    try {
+      const m = byName(await measureExtraction(projectId, plan, all(), { firedBy: ['attributed_repairs'], now: AT.S2 }), 'problems found on refund columns')
+      expect(m).toMatchObject({ before: 4, after: 1 })
+    } finally {
+      await prisma.healthFinding.delete({ where: { id: dismissed.id } })
+    }
   })
 })
 
@@ -661,25 +696,48 @@ describe('never a fabricated number', () => {
     expect(byName(lost, 'orders read p95')).toMatchObject({ before: null, reason: 'window_aged_out' })
   })
 
-  it('repairs that could not be read are a reason, not zero repairs', async () => {
+  it('problems that could not be read are a reason, not zero problems', async () => {
     // A read failure is simulated; everything else is the real database.
     const spy = jest.spyOn(prisma.healthFinding, 'findMany').mockRejectedValueOnce(new Error('connection reset'))
     try {
       const ms = await measureExtraction(projectId, plan, [snap.R!, S0(), snap.S1!, snap.S2!], { firedBy: ['attributed_repairs'], now: AT.S2 })
-      expect(byName(ms, 'repairs on refund columns')).toMatchObject({ before: null, after: null, reason: 'history_unreadable' })
+      expect(byName(ms, 'problems found on refund columns')).toMatchObject({ before: null, after: null, reason: 'history_unreadable' })
     } finally {
       spy.mockRestore()
     }
   })
 
-  it('the concern not changing since is "too early", not "no benefit"', async () => {
-    // Measured before the satellite's first change (v6, five hours ago).
+  it('nothing locking the host on either side is "nothing to compare yet", not "no benefit"', async () => {
     const early = await measureExtraction(projectId, plan, all6h(), { firedBy: ['hot_host_change'], now: ago(6 * HOUR) })
-    expect(byName(early, 'refund changes that locked orders')).toMatchObject({
-      before: null,
-      reason: 'insufficient_sample',
-      unavailableReason: 'refund has not changed since the change; the saving shows when it does',
+    const m = byName(early, 'refund changes that locked all of orders')
+    expect(m).toMatchObject({ before: 0, after: 0 })
+    const r = assessBenefit(PASS, early)
+    expect(r.verdict).toBe('insufficient_evidence')
+    expect(r.comparisons.find(c => c.name === m.name)).toMatchObject({ direction: 'not_comparable', reason: 'insufficient_sample' })
+  })
+
+  it('schema history that does not reach back over the window is a reason, not a count', async () => {
+    // Only the newest MAX_SNAPSHOTS are read. Fill them all with history from
+    // after the window began, as a busy project's would be.
+    const base = 1_000
+    await prisma.workspaceSchemaSnapshot.createMany({
+      data: Array.from({ length: MAX_SNAPSHOTS }, (_, i) => ({
+        projectId,
+        versionNum: base + i,
+        trigger: 'post_migration',
+        rawDdl: '',
+        createdAt: new Date(ago(90 * 60_000).getTime() + i * 1_000),
+        tables: [{ name: 'orders', columns: ORDERS_NOW.map(c => ({ name: c, type: 'text', nullable: true, default: null, isPrimary: c === 'id' })) }],
+      })),
     })
+    try {
+      const ms = await measureExtraction(projectId, plan, [snap.R!, S0(), snap.S1!, snap.S2!], { firedBy: ['hot_host_change'], now: new Date(T) })
+      const m = byName(ms, 'refund changes that locked all of orders')
+      expect(m).toMatchObject({ before: null, after: null, reason: 'not_yet_measurable' })
+      expect(m.unavailableReason).toMatch(/^schema history is incomplete: the record read here begins /)
+    } finally {
+      await prisma.workspaceSchemaSnapshot.deleteMany({ where: { projectId, versionNum: { gte: base } } })
+    }
   })
 
   function all6h(): TelemetrySnapshot[] {

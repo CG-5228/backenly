@@ -231,29 +231,58 @@ export function findingLocation(details: unknown): { table: string; column: stri
   return null
 }
 
+/** Findings read per call; the newest are kept, so a busy history never drops recent ones at random. */
+export const MAX_FINDINGS = 2_000
+
+/** A finding that is not settled: whatever recurs while it is open is folded into it, never recorded again. */
+export const UNSETTLED_FINDING = ['open', 'proposed', 'pending_approval'] as const
+
 /**
- * Repairs located on a column since `since`, newest first, or null when the
- * findings could not be read: "unreadable" must never look like "none".
+ * Problems Backenly found located on a column since `since`, newest first, or
+ * null when the findings could not be read: "unreadable" must never look like
+ * "none". A dismissed finding is left out: a person said it was no problem.
+ * `coversFrom` is when the read actually begins: `since`, unless the cap cut it
+ * short, in which case it is the oldest finding read.
  */
-export async function readRepairs(projectId: string, since: Date): Promise<Array<RepairRecord & { table: string }> | null> {
+export async function readRepairs(
+  projectId: string,
+  since: Date,
+): Promise<{ records: Array<RepairRecord & { table: string }>; coversFrom: Date } | null> {
   const rows = await prisma.healthFinding
     .findMany({
-      // Backenly's own approval requests are not repairs; see EVOLUTION_FINDING_TYPE.
-      where: { projectId, detectedAt: { gte: since }, type: { not: 'architecture_evolution' } },
-      select: { id: true, type: true, details: true, detectedAt: true },
-      // The cap keeps the newest, so a busy history never drops recent repairs at random.
+      // Backenly's own approval requests are not problems; see EVOLUTION_FINDING_TYPE.
+      where: { projectId, detectedAt: { gte: since }, type: { not: 'architecture_evolution' }, status: { not: 'dismissed' } },
+      select: { id: true, type: true, status: true, details: true, detectedAt: true },
       orderBy: { detectedAt: 'desc' },
-      take: 2_000,
+      take: MAX_FINDINGS,
     })
     .catch(() => null)
   if (!rows) return null
-  const out: Array<RepairRecord & { table: string }> = []
+  const records: Array<RepairRecord & { table: string }> = []
   for (const r of rows) {
     const at = findingLocation(r.details)
     if (!at?.column) continue
-    out.push({ findingId: r.id, type: r.type, table: at.table, column: at.column, at: r.detectedAt.toISOString() })
+    records.push({ findingId: r.id, type: r.type, table: at.table, column: at.column, at: r.detectedAt.toISOString(), status: r.status })
   }
-  return out
+  const coversFrom = rows.length >= MAX_FINDINGS ? rows[rows.length - 1].detectedAt : since
+  return { records, coversFrom }
+}
+
+/** Unsettled problems located on these columns of any of `tables`, whenever found, or null when unreadable. */
+export async function readUnsettledProblems(projectId: string, tables: string[], columns: string[]): Promise<number | null> {
+  const rows = await prisma.healthFinding
+    .findMany({
+      where: { projectId, type: { not: 'architecture_evolution' }, status: { in: [...UNSETTLED_FINDING] } },
+      select: { details: true },
+      take: MAX_FINDINGS,
+    })
+    .catch(() => null)
+  if (!rows) return null
+  const set = new Set(columns)
+  return rows.filter(r => {
+    const at = findingLocation(r.details)
+    return !!at && tables.includes(at.table) && at.column !== null && set.has(at.column)
+  }).length
 }
 
 // ── Traffic ──────────────────────────────────────────────────────────────────
