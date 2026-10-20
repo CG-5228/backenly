@@ -21,6 +21,8 @@ import { openChangeContext } from '@/lib/changes/context'
 let ownerId: string
 let projectId: string
 let schema: string
+const originalEngineMode = process.env.ENGINE_MODE
+const originalEdition = process.env.BACKENLY_EDITION
 
 /** Whether the session on `client` holds an advisory lock right now. */
 async function holdsAdvisoryLock(client: PoolClient): Promise<boolean> {
@@ -30,6 +32,10 @@ async function holdsAdvisoryLock(client: PoolClient): Promise<boolean> {
 }
 
 beforeAll(async () => {
+  // A project of its own, as Backenly Cloud provisions one (a self-hosted
+  // deployment is one project and refuses a second).
+  process.env.ENGINE_MODE = 'runtime'
+  process.env.BACKENLY_EDITION = 'cloud'
   ownerId = (await prisma.user.create({
     data: { email: `change-lock-${crypto.randomUUID()}@example.test`, password: 'test-only-hash', name: 'change lock after its change' },
   })).id
@@ -45,6 +51,10 @@ afterAll(async () => {
     await prisma.project.deleteMany({ where: { userId: ownerId } })
     await prisma.user.delete({ where: { id: ownerId } })
   }
+  if (originalEngineMode === undefined) delete process.env.ENGINE_MODE
+  else process.env.ENGINE_MODE = originalEngineMode
+  if (originalEdition === undefined) delete process.env.BACKENLY_EDITION
+  else process.env.BACKENLY_EDITION = originalEdition
 }, 60_000)
 
 describe('the change lock, after the change that held it', () => {
