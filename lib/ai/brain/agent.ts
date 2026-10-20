@@ -40,10 +40,12 @@ import { classify, type BrainIntent, type Classification } from './classifier'
 import {
   BRAIN_MODEL_TOOLS,
   dispatchTool,
+  isReadOnlyCall,
   isReadOnlyTool,
   humanTitle,
   type ToolDispatchContext,
   type ToolName,
+  type ToolResult,
 } from './tools'
 import { getBlueprintForPrompt, isExplicitSpec } from '../blueprints'
 import { looksLikeBuildDescription } from './build-signals'
@@ -65,6 +67,7 @@ import { createSeedContext, runSeedStep, type SeedTableResult } from '../bluepri
 import type { FixLoopResult } from '../agentic-fix-loop'
 import { recordToolExecutionMemory, type BackendEventStatus } from '@/lib/operational-memory/ledger'
 import { needsApproval } from '@/lib/mcp/domains'
+import type { DataMigrationEstimate } from '@/lib/execution/data-migration'
 import { redactArgs } from './redact'
 import { currentPageContext, isAgentDoor, type BrainDoor } from './input-context'
 
@@ -86,12 +89,22 @@ export interface BlockedCall {
 
 /**
  * Control-flow tools — neither mutations nor reads of backend state.
- * (Reads are tracked in tools.READ_ONLY_TOOLS; mutations are everything else.)
+ * (Reads are tracked in tools.READ_ONLY_TOOLS, per call by tools.isReadOnlyCall;
+ * mutations are everything else.)
  */
 const CONTROL_TOOLS = new Set<string>([
   'finish', 'propose_plan', 'ask_user', 'answer_question',
   'apply_proposal', 'run_test', 'rollback',
 ])
+
+/**
+ * Whether one call can change the backend: what lists it in the turn's
+ * `applied` and sends a later finish back for verification. Exported so
+ * tests/unit/brain-mutation-accounting.spec.ts can list every tool it counts.
+ */
+export function isMutationCall(name: string, args: Record<string, unknown>): boolean {
+  return !CONTROL_TOOLS.has(name) && !isReadOnlyCall(name, args)
+}
 
 /**
  * Tools that read their own result back out of the live catalog before they
@@ -200,6 +213,7 @@ export interface BrainResult {
   success: boolean
   summary: string
   needsUser: boolean
+  /** Agent-loop model calls that came back with an answer; a turn that skips the loop counts its steps. */
   iterations: number
   toolsRun: string[]
   classification: Classification
@@ -465,8 +479,14 @@ export async function runBrain(
   // message that describes an app is unambiguously a BUILD, never a
   // clarification. Also used later to route BUILD through the architect and to
   // keep the CONFIRM re-architect fallback from firing on a MODIFY confirm.
+  //
+  // Only a state that was read and is empty is fresh. A failed read leaves no
+  // proof, and counting that as empty made a project with 30 tables look brand
+  // new, so its next BUILD had the architect design a whole new backend. An
+  // unread state takes a built project's path, and the understanding block
+  // says the state could not be read.
   const proof = memory.understanding.proof
-  const isFreshProject = !proof || proof.nothingBuilt || (proof.tables?.length ?? 0) === 0
+  const isFreshProject = !!proof && (proof.nothingBuilt || (proof.tables?.length ?? 0) === 0)
 
   // ── CLASSIFY ────────────────────────────────────────────────────────────
   emit({ type: 'phase', phase: 'classify' })
@@ -1251,6 +1271,32 @@ async function describeDanger(
   }
 }
 
+/** What a call that waits for a person affects, as its card and the model are told. */
+type Danger = Awaited<ReturnType<typeof describeDanger>>
+
+/**
+ * A real data migration the executor stopped at its own gate (RUN_DATA_MIGRATION
+ * in lib/ai/minimal-executor.ts), described by the rows that gate counted, so
+ * what each operation would change is what a person approves. Null for any
+ * other result, operations the executor refused as invalid included.
+ */
+function migrationAwaitingApproval(tool: string, result: ToolResult): Danger | null {
+  if (tool !== 'run_data_migration' || result.ok) return null
+  const data = result.data as { requiresApproval?: boolean; estimates?: DataMigrationEstimate[] } | undefined
+  if (data?.requiresApproval !== true || !Array.isArray(data.estimates)) return null
+  const tables = [...new Set(data.estimates.map((e) => `\`${e.table}\``))]
+  const counted = data.estimates.map((e) => `${e.detail}: ${e.affectedRows} of ${e.totalRows} rows`)
+  return {
+    tool,
+    target: `rows in ${tables.join(', ')} (${counted.join('; ')})`,
+    // Summed over the operations: a row two of them rewrite counts twice.
+    rowCount: data.estimates.reduce((sum, e) => sum + e.affectedRows, 0),
+    // The executor copies each table it rewrites before it changes a row.
+    reversible: true,
+    confirmPhrase: 'Confirm — run the data migration',
+  }
+}
+
 /** Dispatch one tool and treat its result as the terminal answer. */
 async function singleToolTurn(
   tool: ToolName,
@@ -1381,6 +1427,40 @@ async function runAgentLoop(
   // BrainResult.blockedCalls so the caller can queue each one for a human;
   // nothing here is ever executed by the brain itself.
   const blockedCalls: BlockedCall[] = []
+  /**
+   * Hold one call for a person: return it exactly as issued, once however often
+   * the model repeats it, and tell the model it waits. Every call that needs
+   * approval gets this one answer, whichever gate stopped it.
+   */
+  const holdForApproval = (toolUseId: string, tool: string, args: Record<string, unknown>, danger: Danger) => {
+    emit({ type: 'danger', ...danger })
+    const dup = blockedCalls.some(
+      (b) => b.tool === tool && JSON.stringify(b.args) === JSON.stringify(args),
+    )
+    if (!dup) {
+      blockedCalls.push({
+        tool,
+        args,
+        target: danger.target,
+        rowCount: danger.rowCount,
+        reversible: danger.reversible,
+      })
+    }
+    return toolResultBlock(
+      toolUseId,
+      {
+        ok: false,
+        blocked: 'needs_human_approval',
+        summary:
+          `\`${tool}\` on ${danger.target} needs a human's approval and was NOT run` +
+          (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
+          `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
+          `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
+          `Do not ask for a confirmation phrase: no message can approve it.`,
+      },
+      true,
+    )
+  }
   let verificationToolRejected = false
 
   const unverifiedMutationSummary = async () => {
@@ -1397,6 +1477,10 @@ async function runAgentLoop(
   /** Set when the loop stopped to protect its verification reserve. */
   let budgetStopped = false
 
+  // Model calls that came back with an answer, which BrainResult.iterations
+  // reports. Not `iter`: every exit but running out of steps is a break, which
+  // skips `iter++`, so a turn the model answered at once reported 0.
+  let modelCalls = 0
   let iter = 0
   agentLoop: for (; iter < MAX_ITERATIONS; iter++) {
     // ── Spend the verification reserve BEFORE it can be taken ────────────────
@@ -1469,6 +1553,7 @@ async function runAgentLoop(
       clearTimeout(reserveTimer)
     }
 
+    modelCalls++
     spend(effectiveTokensOf(reply.model, reply.usage))
 
     const text = textOf(reply.message)
@@ -1541,48 +1626,45 @@ async function runAgentLoop(
       // bounded verification attempt.
       if (verificationTurn) verificationReadAttempted = true
 
+      // A question only reads. Its list offers nothing else, but a model can
+      // send a tool it was not offered or ask a read to write (get_readiness
+      // with autoFix), so a call that is neither a read nor one of the tools
+      // that end the turn is answered here: not run, counted or queued. That
+      // is wider than isMutationCall, which counts no control tool, because
+      // apply_proposal and run_test write too.
+      if (classification.intent === 'QUESTION' && !isReadOnlyCall(toolName, args) && !QUESTION_CONTROL_TOOLS.has(toolName)) {
+        results.push(toolResultBlock(toolCall.id, {
+          ok: false,
+          blocked: 'read_only_turn',
+          summary: `\`${toolName}\` was NOT run: this turn answers a question and only reads. Finish with the answer, and say in it what would need to change.`,
+        }, true))
+        continue
+      }
+
       // Approval gate — one rule for every door. `needsApproval` is the same
       // judgement the MCP tool route uses: the brain's destructive set OR an
       // executor rated high-risk, so the two doors can never disagree about
       // what needs a person. A gated call never runs here; it is returned
       // exactly as issued so the caller can queue it for a human.
       if (needsApproval(toolName)) {
-        const danger = await describeDanger(input.projectId, toolName, args)
-        emit({ type: 'danger', ...danger })
-        const dup = blockedCalls.some(
-          (b) => b.tool === toolName && JSON.stringify(b.args) === JSON.stringify(args),
-        )
-        if (!dup) {
-          blockedCalls.push({
-            tool: toolName,
-            args,
-            target: danger.target,
-            rowCount: danger.rowCount,
-            reversible: danger.reversible,
-          })
-        }
-        results.push(
-          toolResultBlock(
-            toolCall.id,
-            {
-              ok: false,
-              blocked: 'needs_human_approval',
-              summary:
-                `\`${toolName}\` on ${danger.target} needs a human's approval and was NOT run` +
-                (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
-                `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
-                `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
-                `Do not ask for a confirmation phrase: no message can approve it.`,
-            },
-            true,
-          ),
-        )
+        results.push(holdForApproval(toolCall.id, toolName, args, await describeDanger(input.projectId, toolName, args)))
         continue
       }
 
       // Redacted for the log only; the call itself receives the real arguments.
       console.log(`[Brain] tool=${toolName} args=${JSON.stringify(redactArgs(args)).slice(0, 200)}`)
       const result = await dispatchTool(toolName, args, ctx)
+      // A real data migration is stopped by the executor's own gate, which
+      // counts the rows it would change. That answer used to reach the model as
+      // a failure asking for a "confirm" no message could deliver, so from here
+      // only a dry run ever happened. It waits for a person like a gated call
+      // instead, with those counts as what they approve. Nothing ran: it is not
+      // a mutation, a refusal or a tool run of this turn.
+      const migration = migrationAwaitingApproval(toolName, result)
+      if (migration) {
+        results.push(holdForApproval(toolCall.id, toolName, args, migration))
+        continue
+      }
       toolsRun.push(toolName)
       toolStatuses.push(result.ok ? 'applied' : 'failed')
       console.log(`[Brain] tool=${toolName} ok=${result.ok} terminal=${!!result.terminal} summary="${result.summary.slice(0, 120)}"`)
@@ -1591,10 +1673,11 @@ async function runAgentLoop(
       if (toolName === 'read_backend_state' && mutated) verifiedAfterMutation = result.ok
       if (toolName === 'run_test' && mutated) verifiedAfterMutation = true
       // Allowlist-driven: a mutation is anything that is NOT a control tool and
-      // NOT a read-only tool. Adding a new read tool to tools.READ_ONLY_TOOLS
-      // (or a control tool to CONTROL_TOOLS above) keeps this honest without
-      // editing this branch every time.
-      const isMutation = !isReadOnlyTool(toolName) && !CONTROL_TOOLS.has(toolName)
+      // NOT a read. Adding a new read tool to tools.READ_ONLY_TOOLS (or a
+      // control tool to CONTROL_TOOLS above) keeps this honest without editing
+      // this branch every time; a tool whose arguments decide, like a dry-run
+      // migration, has its rule in tools.READ_ONLY_WHEN.
+      const isMutation = isMutationCall(toolName, args)
       if (isMutation) {
         mutated = true
         verificationSteered = false
@@ -1770,7 +1853,7 @@ async function runAgentLoop(
     success,
     summary: finalSummary,
     needsUser,
-    iterations: iter,
+    iterations: modelCalls,
     toolsRun,
     classification,
     tokensUsed,
@@ -1804,6 +1887,17 @@ async function runAgentLoop(
 const CONFIRM_TOOL_BLOCKLIST = new Set<string>(['propose_plan'])
 
 /**
+ * What a QUESTION turn is offered besides the reads (tools.READ_ONLY_TOOLS):
+ * the tools that end it with an answer or a question back. The hint's "Do NOT
+ * mutate anything" was all that stood between a question and create_table or
+ * drop_table. As with CONFIRM_TOOL_BLOCKLIST, the model picks from what it is
+ * offered, and the loop refuses any call it sends anyway that is neither a
+ * read nor one of these. The shorter list is also cheaper and faster on every
+ * question.
+ */
+const QUESTION_CONTROL_TOOLS = new Set<string>(['finish', 'ask_user', 'answer_question'])
+
+/**
  * The catalog as the brain's model is offered it, translated once at load so
  * every call sends byte-identical tools and the cached prefix holds across
  * turns. BRAIN_MODEL_TOOLS, not BRAIN_TOOLS: tools only an MCP agent calls are
@@ -1811,9 +1905,14 @@ const CONFIRM_TOOL_BLOCKLIST = new Set<string>(['propose_plan'])
  */
 const MODEL_TOOLS: Anthropic.Tool[] = BRAIN_MODEL_TOOLS.map(toModelTool)
 const CONFIRM_MODEL_TOOLS: Anthropic.Tool[] = MODEL_TOOLS.filter((t) => !CONFIRM_TOOL_BLOCKLIST.has(t.name))
+const QUESTION_MODEL_TOOLS: Anthropic.Tool[] = MODEL_TOOLS.filter(
+  (t) => isReadOnlyTool(t.name) || QUESTION_CONTROL_TOOLS.has(t.name),
+)
 
 function toolsForIntent(intent: BrainIntent): Anthropic.Tool[] {
-  return intent === 'CONFIRM' ? CONFIRM_MODEL_TOOLS : MODEL_TOOLS
+  if (intent === 'CONFIRM') return CONFIRM_MODEL_TOOLS
+  if (intent === 'QUESTION') return QUESTION_MODEL_TOOLS
+  return MODEL_TOOLS
 }
 
 /** "I stopped before changing anything because …", ending with what can be done next. */
@@ -1872,7 +1971,7 @@ function buildIntentHint(intent: BrainIntent): string {
         'No message approves it, including a "yes" or "confirm" in this turn or the next. Describing the operation without calling the tool queues nothing, so the owner has nothing to approve.',
       ].join(' ')
     case 'QUESTION':
-      return 'Hint: this is a QUESTION about the project state. Call read_backend_state and then finish with the answer. Do NOT mutate anything.'
+      return 'Hint: this is a QUESTION about the project state. Call read_backend_state and then finish with the answer. Do NOT mutate anything: this turn is offered only the read tools, so if something should change, say what in your answer.'
     case 'CONFIRM':
       return [
         'Hint: the user has CONFIRMED the plan you proposed in the previous assistant turn (e.g. "go ahead", "yes", "do it").',
