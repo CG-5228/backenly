@@ -35,12 +35,12 @@
  * the home database, where the project's schema is not.
  */
 
-import { AsyncLocalStorage } from 'async_hooks'
 import { Pool, type PoolClient } from 'pg'
 import { projectToLockKey } from '@/lib/autonomy/maintenance/single-flight'
 import { projectRegion, requireRegionDatabaseUrl } from '@/lib/data-plane/regional'
 import type { CloudRegionId } from '@/lib/regions'
 import { readCatalog, type CatalogSnapshot } from './catalog'
+import { heldChangeLock, openChangeContext, type HeldChangeLock } from './context'
 
 /** 'chng'. Fixed: changing it would let an old and a new instance both hold a project. */
 const CHANGE_LOCK_NAMESPACE = 0x63686e67
@@ -77,12 +77,6 @@ async function lockPool(projectId: string): Promise<Pool> {
   return pool
 }
 
-interface Held {
-  projectId: string
-  client: PoolClient
-}
-const held = new AsyncLocalStorage<Held>()
-
 /**
  * Run `fn` holding the project's change lock, with the connection that holds it.
  * Statements run on that connection are inside the lock by construction.
@@ -92,10 +86,16 @@ export async function withChangeLock<T>(
   fn: (client: PoolClient) => Promise<T>,
   opts: { waitMs?: number } = {},
 ): Promise<T> {
-  const current = held.getStore()
-  if (current && current.projectId === projectId) return fn(current.client)
+  // Re-entered only by work of the change holding it (a recovery it starts runs
+  // on its connection). Never once the lock is given back, and never from a
+  // change whose own work is over: a timer or promise it left running carries
+  // this context, and must wait for the lock like anyone else.
+  const current = heldChangeLock.getStore()
+  const inChange = openChangeContext.getStore()
+  if (current && current.projectId === projectId && !current.released && !inChange?.finished) return fn(current.client)
 
   const client = await (await lockPool(projectId)).connect()
+  const holding: HeldChangeLock = { projectId, client, released: false }
   const key = projectToLockKey(projectId)
   let locked = false
   let broken = false
@@ -121,8 +121,9 @@ export async function withChangeLock<T>(
     } finally {
       await client.query('RESET lock_timeout').catch(() => { broken = true })
     }
-    return await held.run({ projectId, client }, () => fn(client))
+    return await heldChangeLock.run(holding, () => fn(client))
   } finally {
+    holding.released = true
     if (locked) {
       const res = await client
         .query<{ released: boolean }>('SELECT pg_advisory_unlock($1::int4, $2::int4) AS released', [CHANGE_LOCK_NAMESPACE, key])

@@ -150,6 +150,14 @@ describe('the loop, kicked by a migration', () => {
     // And nothing else the loop did is folded into the migration's own record.
     const own = await prisma.backendChange.findUniqueOrThrow({ where: { id: migration.id }, select: { source: true, apiKeyId: true } })
     expect(own).toMatchObject({ source: 'mcp', apiKeyId })
+
+    // Its record holds its own statements, not the migration's: the capture the
+    // migration opened is not the repair's (lib/execution/sql-recorder.ts).
+    const recorded = await prisma.backendChange.findMany({ where: { id: { in: loopChanges.map((c) => c.id) } }, select: { statements: true } })
+    const sqls = recorded.flatMap((r) => ((r.statements as Array<{ sql: string }> | null) ?? []).map((s) => s.sql))
+    expect(sqls.some((s) => /CREATE\s+INDEX/i.test(s))).toBe(true)
+    expect(sqls.some((s) => /ADD\s+COLUMN\s+author_id/i.test(s))).toBe(false)
+    expect(JSON.stringify(repair)).not.toMatch(/ADD\s+COLUMN\s+author_id/i)
   }, 180_000)
 
   it('a person restores the migration after the repair, newest first', async () => {

@@ -20,8 +20,9 @@ jest.mock('@/lib/ai/schema-reconciler', () => ({
   detectSchemaDrift: jest.fn(async () => ({ drifts: [], hasCritical: false, hasWarnings: false })),
 }))
 
-import { openChangeContext, outsideAnyChange } from '@/lib/changes/context'
+import { heldChangeLock, openChangeContext, outsideAnyChange } from '@/lib/changes/context'
 import { currentAttribution, withChangeAttribution } from '@/lib/changes/attribution'
+import { isCapturing, withSqlCapture } from '@/lib/execution/sql-recorder'
 import { currentChange } from '@/lib/changes/ledger'
 import { kickReconciler } from '@/lib/autonomy/event-trigger'
 import { emit } from '@/lib/events/bus'
@@ -32,14 +33,28 @@ import { runMonitoredHealthScan } from '@/lib/ai/background-monitor'
 
 const PROJECT = '00000000-0000-4000-8000-00000000c0de'
 
-/** What a piece of work runs inside: the open change and who is attributed. */
-const where = () => ({ change: openChangeContext.getStore() ?? null, attribution: currentAttribution() ?? null })
-const NOWHERE = { change: null, attribution: null }
+/**
+ * What a piece of work runs inside: the open change, the change lock it holds,
+ * whether its statements are being captured, and who is attributed. All four
+ * are carried into timers; work that is its own actor must leave all four.
+ */
+const where = () => ({
+  change: openChangeContext.getStore() ?? null,
+  lock: heldChangeLock.getStore() ?? null,
+  capturing: isCapturing(),
+  attribution: currentAttribution() ?? null,
+})
+const NOWHERE = { change: null, lock: null, capturing: false, attribution: null }
 
-/** As an agent's apply_migration runs a step: its key attributed, its change open. */
-function insideAgentsChange<T>(fn: () => T): T {
+/**
+ * As an agent's apply_migration runs a step: its key attributed, its change
+ * open, the project's change lock held on its connection, its statements
+ * captured (lib/changes/ledger.ts, lib/changes/lock.ts).
+ */
+function insideAgentsChange<T>(fn: () => T): Promise<T> {
   return withChangeAttribution({ source: 'mcp', actorUserId: 'owner', apiKeyId: 'agent-key' }, () =>
-    openChangeContext.run({ projectId: PROJECT, finished: false }, fn))
+    heldChangeLock.run({ projectId: PROJECT, client: {} as never, released: false }, async () =>
+      (await withSqlCapture(async () => openChangeContext.run({ projectId: PROJECT, finished: false }, fn))).result))
 }
 
 async function until(check: () => boolean, byMs = 5_000): Promise<void> {
@@ -63,6 +78,8 @@ describe('the async context of a change', () => {
   it('is carried into a plain timer started inside it, which is the hazard', async () => {
     const inTimer = await insideAgentsChange(() => new Promise<ReturnType<typeof where>>((r) => setTimeout(() => r(where()), 10)))
     expect(inTimer.change).toMatchObject({ projectId: PROJECT })
+    expect(inTimer.lock).toMatchObject({ projectId: PROJECT })
+    expect(inTimer.capturing).toBe(true)
     expect(inTimer.attribution).toMatchObject({ source: 'mcp', apiKeyId: 'agent-key' })
   })
 
@@ -71,10 +88,18 @@ describe('the async context of a change', () => {
       outsideAnyChange(() => new Promise<ReturnType<typeof where>>((r) => setTimeout(() => r(where()), 10))))
     expect(inTimer).toEqual(NOWHERE)
     // Leaving is for the work inside only: the change around it is untouched.
-    insideAgentsChange(() => {
+    await insideAgentsChange(() => {
       outsideAnyChange(() => undefined)
-      expect(where().change).toMatchObject({ projectId: PROJECT })
+      expect(where()).toMatchObject({ change: { projectId: PROJECT }, lock: { projectId: PROJECT }, capturing: true })
     })
+  })
+
+  it('a capture is never joined or written to once it has closed', async () => {
+    let late: Promise<boolean> | undefined
+    await withSqlCapture(async () => {
+      late = new Promise((r) => setTimeout(() => r(isCapturing()), 10))
+    })
+    expect(await late).toBe(false)
   })
 
   it('is never joined once its work is over', async () => {
@@ -92,7 +117,7 @@ describe('the async context of a change', () => {
 describe('work scheduled from inside an agent\'s change runs as its own actor', () => {
   it('the repair loop the kick starts', async () => {
     // Twice: the second goes through the debounce's re-armed timer.
-    insideAgentsChange(() => {
+    await insideAgentsChange(() => {
       kickReconciler(PROJECT, 'add_column')
       kickReconciler(PROJECT, 'add_column')
     })
@@ -109,13 +134,13 @@ describe('work scheduled from inside an agent\'s change runs as its own actor', 
   })
 
   it('the observer pass a schema.changed event starts', async () => {
-    insideAgentsChange(() => emit('schema.changed', PROJECT, { tables: ['notes'] }))
+    await insideAgentsChange(() => emit('schema.changed', PROJECT, { tables: ['notes'] }))
     await until(() => seen.observer.length > 0)
     expect(seen.observer).toEqual([NOWHERE])
   })
 
   it('the post-build passes, the repair loop\'s health scan among them', async () => {
-    insideAgentsChange(() => triggerPostBuildOrchestration(PROJECT, 'owner', { built: [{}] } as any))
+    await insideAgentsChange(() => triggerPostBuildOrchestration(PROJECT, 'owner', { built: [{}] } as any))
     await until(() => seen.healthScan.length > 0)
     expect(seen.healthScan).toEqual([NOWHERE])
   })

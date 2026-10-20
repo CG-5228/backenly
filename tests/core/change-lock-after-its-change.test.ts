@@ -1,0 +1,94 @@
+/**
+ * The project change lock is re-entered only by the work of the change holding
+ * it (lib/changes/lock.ts): never once it has been given back, and never from a
+ * change whose own work is over.
+ *
+ * Work a change leaves running (a timer, an unawaited promise) carries its
+ * async context. It used to re-enter the lock on the change's connection after
+ * that connection had been unlocked and returned to the pool, so it ran holding
+ * no lock: nothing serialised it against the next change on the project, and
+ * the pool could hand the same session to another change at the same time.
+ *
+ * Real PostgreSQL: the lock is a session advisory lock, read from pg_locks.
+ */
+import crypto from 'crypto'
+import type { PoolClient } from 'pg'
+import { prisma } from '@/lib/db/prisma'
+import { createProvisionedProject } from '@/lib/projects/provision'
+import { closeChangeLockPool, withChangeLock } from '@/lib/changes/lock'
+import { openChangeContext } from '@/lib/changes/context'
+
+let ownerId: string
+let projectId: string
+let schema: string
+
+/** Whether the session on `client` holds an advisory lock right now. */
+async function holdsAdvisoryLock(client: PoolClient): Promise<boolean> {
+  const r = await client.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
+  return r.rows[0].n > 0
+}
+
+beforeAll(async () => {
+  ownerId = (await prisma.user.create({
+    data: { email: `change-lock-${crypto.randomUUID()}@example.test`, password: 'test-only-hash', name: 'change lock after its change' },
+  })).id
+  const project = await createProvisionedProject({ name: 'change-lock-after-its-change', userId: ownerId })
+  projectId = project.id
+  schema = project.postgresSchema
+}, 120_000)
+
+afterAll(async () => {
+  await closeChangeLockPool()
+  if (schema) await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
+  if (ownerId) {
+    await prisma.project.deleteMany({ where: { userId: ownerId } })
+    await prisma.user.delete({ where: { id: ownerId } })
+  }
+}, 60_000)
+
+describe('the change lock, after the change that held it', () => {
+  it("is re-entered by the holder's own work, on its connection", async () => {
+    await withChangeLock(projectId, async (outer) => {
+      await withChangeLock(projectId, async (inner) => {
+        expect(inner).toBe(outer)
+        expect(await holdsAdvisoryLock(inner)).toBe(true)
+      })
+    })
+  })
+
+  it('is never re-entered once given back: leftover work takes the lock itself', async () => {
+    let outer: PoolClient | undefined
+    let late: Promise<{ client: PoolClient; holds: boolean }> | undefined
+    await withChangeLock(projectId, async (client) => {
+      outer = client
+      // A plain timer: it carries the holder's async context past its release.
+      late = new Promise((resolve, reject) => setTimeout(() => {
+        withChangeLock(projectId, async (c) => resolve({ client: c, holds: await holdsAdvisoryLock(c) })).catch(reject)
+      }, 50))
+    })
+    const got = await late!
+    expect(got.client).not.toBe(outer)
+    expect(got.holds).toBe(true)
+  })
+
+  it('leftover work of a finished change waits for the lock instead of joining it', async () => {
+    const order: string[] = []
+    let late: Promise<void> | undefined
+    await withChangeLock(projectId, async () => {
+      const change = { projectId, finished: false }
+      openChangeContext.run(change, () => {
+        late = new Promise((resolve, reject) => setTimeout(() => {
+          withChangeLock(projectId, async () => { order.push('leftover work') }).then(() => resolve(), reject)
+        }, 10))
+      })
+      // As the ledger marks it when the change's own work returns, while it still
+      // holds the lock to read the catalog after it (lib/changes/ledger.ts).
+      change.finished = true
+      await new Promise((r) => setTimeout(r, 300))
+      order.push('the holder is done')
+    })
+    await late
+    expect(order).toEqual(['the holder is done', 'leftover work'])
+  })
+})
