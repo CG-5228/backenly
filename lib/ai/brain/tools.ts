@@ -205,9 +205,10 @@ const DESTRUCTIVE_TOOLS = new Set<ToolName>([
   'delete_bucket',
   'delete_file',
   // NOTE: run_data_migration is NOT here — dry-runs must flow freely, and the
-  // executor's RUN_DATA_MIGRATION handler has its own confirmation gate that
-  // shows affected-row counts before a real run (destructiveConfirmed still
-  // forwards as params.confirmed so an explicit "confirm" applies it).
+  // executor's RUN_DATA_MIGRATION handler has its own gate that counts the
+  // rows a real run would change. The brain holds the call that gate stops
+  // for a person with those counts (lib/ai/brain/agent.ts), and approving it
+  // forwards destructiveConfirmed as params.confirmed, which applies it.
   // Breaks live SSE subscribers
   'disable_realtime',
   // Ships to / reverts production (engine also has its own "Type DEPLOY /
@@ -247,7 +248,8 @@ const DESTRUCTIVE_TOOLS = new Set<ToolName>([
 /**
  * Tools that do NOT mutate state. Used by the agent loop to decide whether the
  * turn needs a post-mutation verification pass. Everything not in this set OR
- * the control-tool list is treated as a mutation.
+ * the control-tool list is treated as a mutation, unless a call's arguments
+ * decide (READ_ONLY_WHEN below).
  */
 export const READ_ONLY_TOOLS = new Set<ToolName>([
   'read_backend_state',
@@ -265,6 +267,7 @@ export const READ_ONLY_TOOLS = new Set<ToolName>([
   'list_end_users',
   'list_permissions',
   'list_triggers',
+  'list_synced_columns',
   'list_ai_functions',
   'list_cron_jobs',
   'list_branches',
@@ -303,6 +306,26 @@ export function isReadOnlyTool(name: string): boolean {
   return READ_ONLY_TOOLS.has(name as ToolName)
 }
 
+/**
+ * Tools whose arguments decide whether a call changes anything. A rule answers
+ * for its tool in place of READ_ONLY_TOOLS, and it reads the params the tool's
+ * mapper (TOOL_TO_ACTION) sends the executor, so how the agent loop counts a
+ * call and what the call does cannot disagree.
+ */
+const READ_ONLY_WHEN: Partial<Record<ToolName, (args: Record<string, unknown>) => boolean>> = {
+  // A dry run reports the rows it would touch and changes nothing.
+  run_data_migration: (a) => TOOL_TO_ACTION.run_data_migration(a).params.dryRun === true,
+  // Readiness changes nothing unless fixing is asked for, and then it can
+  // install RLS policies, generate the JWT secret and switch functions off.
+  get_readiness: (a) => TOOL_TO_ACTION.get_readiness(a).params.autoFix !== true,
+}
+
+/** Whether one call changes nothing: by its tool's rule above, else by READ_ONLY_TOOLS. */
+export function isReadOnlyCall(name: string, args: Record<string, unknown>): boolean {
+  const rule = READ_ONLY_WHEN[name as ToolName]
+  return rule ? rule(args) : isReadOnlyTool(name)
+}
+
 export interface ToolDispatchContext {
   projectId: string
   /** Owner of the project — required for autonomy + audit-log writes. */
@@ -317,9 +340,9 @@ export interface ToolDispatchContext {
   /** Pre-formatted project understanding block (from memory.formatUnderstanding). */
   understandingBlock?: string
   /**
-   * True when the user's message in this turn explicitly authorised a destructive
-   * action ("yes drop it", "confirm revoke"). Forwarded to the executor as
-   * `params.confirmed=true` so its approval gate doesn't double-prompt.
+   * True only on the replay of a call a person approved (runApprovedCall in
+   * lib/mcp/approvals.ts); no message sets it. Forwarded to the executor as
+   * `params.confirmed=true` so its own gate does not stop the approved call.
    */
   destructiveConfirmed?: boolean
   /**
@@ -754,7 +777,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     '  • merge_columns — concatenate columns into one: {op:"merge_columns", table, sources:[…], target, separator}\n' +
     '  • cast_column — change a column\'s type converting live data: {op:"cast_column", table, column, toType:"integer|bigint|numeric|boolean|timestamptz|date|text|uuid|jsonb", onError:"fail"|"null"}\n' +
     '  • normalize_values — rewrite values via a mapping (unify "Active"/"ACTIVE"→"active"): {op:"normalize_values", table, column, mapping:{from:to}}\n' +
-    'ALWAYS call with dryRun:true first and show the user the affected-row counts before running it for real.',
+    'ALWAYS call with dryRun:true first and show the user the affected-row counts. A real run waits for a person: the call is queued, with its affected-row counts, for the project owner to approve in the dashboard, and the approved call runs exactly these operations. Nothing typed in chat approves it.',
     {
       operations: {
         type: 'array',
@@ -1475,7 +1498,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { question: { type: 'string' } },
     ['question']),
   fn('run_test',
-    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure.",
+    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure. get lists one row and fetches it by id, so it needs a row to exist; on an empty table use list.",
     {
       tableName: { type: 'string' },
       operation: { type: 'string', enum: ['list', 'create', 'get'] },
@@ -3728,7 +3751,7 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'rollback_deploy': return args.version ? `Rolling back to v${args.version}` : 'Rolling back deployment'
     case 'list_schema_changes': return 'Reading the change history'
     case 'revert_schema_change': return 'Restoring the state before a change'
-    case 'get_readiness': return 'Reading deploy readiness'
+    case 'get_readiness': return isReadOnlyCall(name, args) ? 'Reading deploy readiness' : 'Applying the safe readiness fixes'
     case 'set_env_var': return `Saving env var ${args.key ?? ''}`.trim()
     case 'list_env_vars': return 'Listing project env vars'
     case 'delete_env_var': return `Deleting env var ${args.key ?? ''}`.trim()
