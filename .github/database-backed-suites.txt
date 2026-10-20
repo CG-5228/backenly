@@ -1458,3 +1458,9 @@ tests/integration/sdk-filters-both-servers.spec.ts
 # where skipping it widened a service-role update or delete. What PostgreSQL
 # matches is the property, so it needs a real Postgres.
 tests/integration/mcp-filters-never-widen.spec.ts
+# The schema snapshot reads each kind of object once for the whole schema, so
+# the number of queries it sends does not grow with the project's tables (a
+# database in another region pays a round trip for each), and it reads what
+# the table-by-table reader read. What PostgreSQL's catalog returns is the
+# property, so it needs a real Postgres.
+tests/integration/workspace-schema-snapshot-reader.spec.ts
