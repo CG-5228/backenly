@@ -25,6 +25,8 @@
  * rungs needs, every time: a person's consent to the exact plan version, the
  * deployment's ENABLE_EVOLUTION_MUTATIONS, and — for unattended resumption —
  * the scheduler flag and an autonomy level that is not OFF. See ./policy.ts.
+ * Unattended resumption also waits out an incident, as every autonomous change
+ * does (lib/autonomy/change-freeze.ts).
  *
  * Agents read all of this over MCP and can approve none of it: every decision
  * here is reached only through routes that require a platform session.
@@ -40,6 +42,7 @@
 
 import { FLAGS } from '@/lib/config/flags'
 import { getProjectAutonomyLevel } from '@/lib/autonomy/autonomy-level'
+import { heldForIncident } from '@/lib/autonomy/change-freeze'
 import { canTransition, canUndoFrom, userFacingStatus, type LifecycleState } from './lifecycle'
 import {
   DEFAULT_POLICY,
@@ -1294,6 +1297,8 @@ export interface SweepResult {
   reason?: string
   observed: number
   advanced: number
+  /** An approved change was due to continue and the project is mid-incident. */
+  frozen?: boolean
   proposals?: ProposalPassResult
 }
 
@@ -1327,13 +1332,21 @@ export async function sweepArchitecture(input: { projectId: string; now?: Date; 
 
   const exec = executionEnabled()
   const resumable = decisions.filter(x => x.state && ADVANCEABLE.includes(x.state))
+  let frozen = false
   if (
     resumable.length > 0 &&
     mayResumeUnattended({ consented: true, mutationsEnabled: exec.enabled, schedulerEnabled: true, autonomyOff })
   ) {
-    // One change per pass: a change rewrites the catalog the next one reads.
-    await advance({ projectId, decisionId: resumable[0].decisionId, now, policy: input.policy })
-    advanced++
+    // Mid-incident, nothing autonomous changes the project: the change waits
+    // where it is, consistent at every step, for a pass after the incident. A
+    // backfill already queued finishes its batches, which never wait on a
+    // writer; a person's pause stops it at its cursor.
+    frozen = await heldForIncident(projectId, { loop: 'maintenance', via: 'architecture_evolution', wouldHaveApplied: 1 })
+    if (!frozen) {
+      // One change per pass: a change rewrites the catalog the next one reads.
+      await advance({ projectId, decisionId: resumable[0].decisionId, now, policy: input.policy })
+      advanced++
+    }
   }
 
   let proposals: ProposalPassResult | undefined
@@ -1341,7 +1354,7 @@ export async function sweepArchitecture(input: { projectId: string; now?: Date; 
   if (!lastPass || now.getTime() - lastPass.at.getTime() >= PROPOSAL_INTERVAL_MS) {
     proposals = await proposeChanges(projectId, { now })
   }
-  return { projectId, disposition: 'swept', observed, advanced, proposals }
+  return { projectId, disposition: 'swept', observed, advanced, ...(frozen ? { frozen } : {}), proposals }
 }
 
 // ── Views ────────────────────────────────────────────────────────────────────

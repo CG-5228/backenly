@@ -22,6 +22,8 @@
  *               again, and a problem found then stops the change for a person
  *               (the measurement step is replaced only to choose a verdict)
  *   decline     "not now" is remembered the same way
+ *   scheduler   resumes only what a person approved, and holds it where it is
+ *               while the project is mid-incident (lib/autonomy/change-freeze.ts)
  *
  * Every assertion about state reads it from architecture memory, the store the
  * engine itself reads, so the test sees what the next pass will see.
@@ -31,6 +33,8 @@ import { prisma } from '@/lib/db'
 import { closeMaintenanceLockPool } from '@/lib/autonomy/maintenance/single-flight'
 import { applyApproval } from '@/lib/ai/approval-manager'
 import { buildTrustReport } from '@/lib/autonomy/trust-report'
+import { REPAIR_HELD } from '@/lib/autonomy/change-freeze'
+import { explainHeldBack } from '@/lib/autonomy/because-copy'
 import {
   advance,
   approveRequest,
@@ -43,6 +47,7 @@ import {
   proposeChanges,
   recordDecline,
   resume,
+  sweepArchitecture,
   undo,
 } from '@/lib/evolution-engine/engine'
 import { decisionTrail, readMemory, summarizeDecisions, priorsFor } from '@/lib/evolution-engine/memory'
@@ -455,5 +460,83 @@ describe('a request waiting while the table changes', () => {
     expect(s.headline).toMatch(/withdrew its request/)
     // Never approved, so it is nobody's change to list.
     expect((await listChanges(f.projectId)).map(c => c.decisionId)).not.toContain(decisionId)
+  })
+})
+
+// ── The scheduler ────────────────────────────────────────────────────────────
+
+describe('the scheduler', () => {
+  let f: Fixture
+  let decisionId = ''
+  const originalScheduler = process.env.ENABLE_EVOLUTION_SCHEDULER
+
+  /**
+   * A normal day of end-user traffic, then an hour in which every request
+   * fails: an incident, as the autonomy health signal reads request logs
+   * (lib/autonomy/telemetry.ts).
+   */
+  async function incident() {
+    const now = Date.now()
+    const at = (ms: number, statusCode: number) => ({
+      projectId: f.projectId,
+      userId: f.ownerId,
+      method: 'GET',
+      path: '/db/orders',
+      statusCode,
+      duration: 4,
+      timestamp: new Date(now - ms),
+    })
+    await prisma.apiRequestLog.createMany({
+      data: [
+        ...Array.from({ length: 22 }, (_, h) => at((h + 2) * HOUR, 200)),
+        ...Array.from({ length: 10 }, (_, m) => at((m + 1) * 60_000, 503)),
+      ],
+    })
+  }
+
+  beforeAll(async () => {
+    delete process.env.ENABLE_EVOLUTION_MUTATIONS
+    delete process.env.ENABLE_EVOLUTION_SCHEDULER
+    f = await buildProject('scheduler')
+    await proposeChanges(f.projectId)
+    const [req] = await requestsOf(f.projectId)
+    decisionId = req.ev.decisionId
+    const r = await approveRequest({ projectId: f.projectId, findingId: req.id, planVersion: req.ev.planVersion, userId: f.ownerId })
+    expect(r.ok).toBe(true)
+  }, 120_000)
+  afterAll(async () => {
+    if (originalScheduler === undefined) delete process.env.ENABLE_EVOLUTION_SCHEDULER
+    else process.env.ENABLE_EVOLUTION_SCHEDULER = originalScheduler
+    await dropProject(f)
+  }, 60_000)
+
+  it('runs nothing while it is off', async () => {
+    process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
+    expect(await sweepArchitecture({ projectId: f.projectId })).toMatchObject({ disposition: 'disabled', advanced: 0 })
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
+  })
+
+  it('holds an approved change where it is while the project is mid-incident, and says so', async () => {
+    process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+    await incident()
+    expect(await sweepArchitecture({ projectId: f.projectId })).toMatchObject({ disposition: 'swept', advanced: 0, frozen: true })
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
+    expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
+
+    const held = await prisma.auditLog.findMany({ where: { projectId: f.projectId, action: REPAIR_HELD }, select: { details: true } })
+    const details = held.map(h => JSON.parse(String(h.details)))
+    expect(details).toEqual([expect.objectContaining({ loop: 'maintenance', via: 'architecture_evolution', wouldHaveApplied: 1 })])
+    expect(explainHeldBack(details[0]).full).toMatch(
+      /^Backenly held back the next step of an architecture change you approved because the project is mid-incident/,
+    )
+  })
+
+  it('carries the change on at the first pass after the incident', async () => {
+    await prisma.apiRequestLog.deleteMany({ where: { projectId: f.projectId, statusCode: 503 } })
+    const r = await sweepArchitecture({ projectId: f.projectId })
+    expect(r).toMatchObject({ disposition: 'swept', advanced: 1 })
+    expect(r).not.toHaveProperty('frozen')
+    expect((await stateOf(f.projectId, decisionId)).state).toBe('backfilling')
+    expect((await drain(f.projectId)).every(x => !x.refusal)).toBe(true)
   })
 })
