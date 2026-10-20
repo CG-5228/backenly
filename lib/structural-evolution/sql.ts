@@ -124,11 +124,15 @@
  * them is trusted to stand for an identity:
  *
  *   echo guard     honoured only inside a trigger (`pg_trigger_depth() > 1`)
- *                  AND as the satellite's owner — which a client's own
- *                  statement never is, and which only the SECURITY DEFINER
- *                  forward sync is when it writes the satellite. Set by hand,
- *                  it skips nothing: the write still reaches the parent's
- *                  update policy.
+ *                  AND as the role the forward sync runs as — its function's
+ *                  owner, the platform — which a client's own statement never
+ *                  is at that depth, and which the SECURITY DEFINER forward
+ *                  sync always is when it writes the satellite. It names the
+ *                  function's owner, not the table's: a project with read-write
+ *                  direct access has every table it holds handed to its own
+ *                  owner role (backenly_direct_sync_schema), which the platform
+ *                  is a member of but is not. Set by hand, the guard skips
+ *                  nothing: the write still reaches the parent's update policy.
  *   settle mark    makes the forward sync mirror one host row as stored. That
  *                  is the invariant itself; forged, it makes the two equal.
  *   ladder context admits the platform role to the satellite and to every host
@@ -146,6 +150,15 @@
  * may EXECUTE a trigger function may attach it to a TEMP table of its own), and
  * the forward sync refuses to run for any table but the one its satellite's
  * foreign key references.
+ *
+ * Every function the ladder installs runs as the platform — the forward sync
+ * always, the others whenever the platform writes, which is how the runtime
+ * serves end users — so none may resolve a name against the workspace schema:
+ * a project with read-write direct access may create functions and operators
+ * there, and one that matched better than a built-in would run as the
+ * platform. They run with `search_path` = `pg_catalog, pg_temp` (FUNCTION_PATH)
+ * and name every workspace object in full, and a host whose primary key does
+ * not compare with a built-in operator is not planned at all.
  *
  * ── Concurrency, case by case ──────────────────────────────────────────────
  *
@@ -483,6 +496,13 @@ function grantList(roles: string[]): string {
 }
 
 /**
+ * The search path of every function the ladder installs: built-ins, then the
+ * session's own temporary objects for relations only. Never the workspace
+ * schema, where a project role may create objects (see the header).
+ */
+const FUNCTION_PATH = 'pg_catalog, pg_temp'
+
+/**
  * Only the owner may EXECUTE a function the ladder installs. PostgreSQL grants
  * EXECUTE to PUBLIC on every new function, and a role that may EXECUTE a
  * trigger function may attach it to a table of its own — a TEMP table needs
@@ -559,7 +579,7 @@ export function createSatelliteSql(
       `CREATE OR REPLACE FUNCTION ${fq(target.schema, n.truncateGuard)}()`,
       `RETURNS trigger`,
       `LANGUAGE plpgsql`,
-      `SET search_path = ${qi(target.schema)}, pg_temp`,
+      `SET search_path = ${FUNCTION_PATH}`,
       `AS $bkn$`,
       `BEGIN`,
       `  IF current_setting('${n.truncating}', true) = statement_timestamp()::text THEN`,
@@ -596,7 +616,6 @@ export function createSatelliteSql(
 export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: RenderTarget): string[] {
   const x = parts(facts, spec, target)
   const n = x.names
-  const S = qi(target.schema)
   const fn = fq(target.schema, n.forward)
   const satRegclass = lit(`${qi(target.schema)}.${qi(spec.satellite)}`)
   const ladder = ladderOnly(n)
@@ -605,7 +624,7 @@ export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: 
     `RETURNS trigger`,
     `LANGUAGE plpgsql`,
     `SECURITY DEFINER`,
-    `SET search_path = ${S}, pg_temp`,
+    `SET search_path = ${FUNCTION_PATH}`,
     `AS $bkn$`,
     `DECLARE`,
     `  prior_access text;`,
@@ -667,7 +686,7 @@ export function forwardSyncSql(facts: TableFacts, spec: ExtractionSpec, target: 
     `CREATE OR REPLACE FUNCTION ${truncate}()`,
     `RETURNS trigger`,
     `LANGUAGE plpgsql`,
-    `SET search_path = ${S}, pg_temp`,
+    `SET search_path = ${FUNCTION_PATH}`,
     `AS $bkn$`,
     `BEGIN`,
     `  -- ${spec.host} is being truncated in this statement: its CASCADE may`,
@@ -809,26 +828,26 @@ export function openWritesSql(
 ): string[] {
   const x = parts(facts, spec, target)
   const n = x.names
-  const S = qi(target.schema)
   const fn = fq(target.schema, n.reverse)
   const body = [
     `CREATE OR REPLACE FUNCTION ${fn}()`,
     `RETURNS trigger`,
     `LANGUAGE plpgsql`,
-    `SET search_path = ${S}, pg_temp`,
+    `SET search_path = ${FUNCTION_PATH}`,
     `AS $bkn$`,
     `DECLARE`,
     `  n bigint;`,
-    `  k ${x.pkType};`,
+    `  k ${x.sat}.${x.fk}%TYPE;`,
     `  prior_settle text;`,
     `BEGIN`,
     `  -- The forward sync writing ${spec.satellite}: mirroring the host, or`,
     `  -- following a parent that was deleted or re-keyed. It alone is ALL of:`,
-    `  -- inside a trigger, running as the satellite's owner (SECURITY DEFINER),`,
-    `  -- with its guard set. A client's own write runs at depth 1 as the client;`,
+    `  -- inside a trigger, running as its own function's owner (SECURITY`,
+    `  -- DEFINER), with its guard set. A client's own write runs at depth 1;`,
     `  -- no setting a session can write makes it look like the sync.`,
     `  IF current_setting('${n.guc}', true) = '1' AND pg_trigger_depth() > 1`,
-    `     AND current_user = (SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = TG_RELID) THEN`,
+    `     AND current_user = (SELECT pg_get_userbyid(p.proowner) FROM pg_proc p`,
+    `                          WHERE p.oid = to_regprocedure(${lit(`${fq(target.schema, n.forward)}()`)})) THEN`,
     `    RETURN NULL;`,
     `  END IF;`,
     `  IF TG_OP = 'UPDATE' AND NEW.${x.fk} IS DISTINCT FROM OLD.${x.fk} THEN`,

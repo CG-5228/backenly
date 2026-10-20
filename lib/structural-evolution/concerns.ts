@@ -640,6 +640,14 @@ export function assessSeparability(
     expandBlockers.push(
       `${facts.table} has no single-column primary key for the new table to reference and for the backfill to page through`,
     )
+  } else {
+    const key = facts.columns.find(c => c.name === facts.primaryKey[0])
+    if (key && !key.builtinType) {
+      expandBlockers.push(
+        `${facts.table}'s primary key ${key.name} is of type ${key.type}, which is not built in: the sync compares keys ` +
+          'with built-in operators only, so that nothing a project role creates in this schema can stand in for one',
+      )
+    }
   }
   for (const c of facts.columns.filter(c => set.has(c.name))) {
     if (c.hasColumnAcl) {

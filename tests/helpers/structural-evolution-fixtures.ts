@@ -10,7 +10,7 @@ import type { ColumnFact, TableFacts } from '@/lib/structural-evolution/facts'
 
 export function col(name: string, type = 'text', over: Partial<ColumnFact> = {}): ColumnFact {
   const udt = type === 'timestamp with time zone' ? 'timestamptz' : type
-  return { name, attnum: 0, type, udt, notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false, ...over }
+  return { name, attnum: 0, type, udt, notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false, builtinType: true, ...over }
 }
 
 export function ordersFacts(over: Partial<TableFacts> = {}): TableFacts {

@@ -646,12 +646,15 @@ async function rehearseAccess(scope: AccessScope): Promise<AuthorizationRehearsa
   if (!facts.rowSecurity && nonOwner.length === 0) {
     return unavailable(`${spec.host} has no row-level security and no role other than its owner holds a privilege on it; there is no access to compare`)
   }
-  // The runtime serves end users as the platform role itself, claims set. When
-  // the host's row-level security binds its owner and the platform is that
-  // owner, the platform is one of the identities that must get from the new
-  // table exactly what it gets from the host, and it is rehearsed first.
-  const servesAsOwner = facts.forceRowSecurity && facts.owner === scope.platformRole
-  const allRoles = [...new Set([...(servesAsOwner ? [scope.platformRole] : []), ...scope.readers, ...scope.writers])].filter(
+  // The runtime serves end users as the platform role itself, claims set, so
+  // wherever row-level security decides what they see, the platform is one of
+  // the identities that must get from the new table exactly what it gets from
+  // the host, and it is rehearsed first. Whether it owns the host does not
+  // matter: with read-write direct access the host belongs to the project's own
+  // owner role, which the platform is a member of, and the forced policies
+  // bind it all the same.
+  const servesClients = facts.rowSecurity
+  const allRoles = [...new Set([...(servesClients ? [scope.platformRole] : []), ...scope.readers, ...scope.writers])].filter(
     r => r !== 'PUBLIC',
   )
   if (allRoles.length === 0) {

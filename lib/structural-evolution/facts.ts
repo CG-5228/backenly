@@ -51,6 +51,12 @@ export interface ColumnFact {
   type: string
   /** Base type name, for classification (`timestamptz`, `numeric`, `_text`). */
   udt: string
+  /**
+   * Its type (a domain's base type) is built in or an enum, so it compares with
+   * operators PostgreSQL finds in pg_catalog alone — all the ladder's functions
+   * may use (sql.ts FUNCTION_PATH).
+   */
+  builtinType: boolean
   notNull: boolean
   default: string | null
   generated: boolean
@@ -241,6 +247,8 @@ export async function readTableFacts(at: WorkspaceAt, table: string): Promise<Ta
       q<Row>(
         `SELECT a.attname::text AS name, a.attnum::int AS attnum,
                 format_type(a.atttypid, a.atttypmod) AS type, t.typname::text AS udt,
+                (SELECT b.typnamespace = 'pg_catalog'::regnamespace OR b.typtype = 'e'
+                   FROM pg_type b WHERE b.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END) AS builtin,
                 a.attnotnull AS not_null, pg_get_expr(d.adbin, d.adrelid) AS default_expr,
                 (a.attgenerated <> '') AS generated, (a.attidentity <> '') AS identity,
                 (a.attacl IS NOT NULL) AS has_acl
@@ -374,6 +382,7 @@ export async function readTableFacts(at: WorkspaceAt, table: string): Promise<Ta
     attnum: num(c.attnum),
     type: String(c.type),
     udt: String(c.udt),
+    builtinType: c.builtin === true,
     notNull: c.not_null === true,
     default: (c.default_expr as string | null) ?? null,
     generated: c.generated === true,

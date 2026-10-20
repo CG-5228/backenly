@@ -1162,6 +1162,15 @@ tests/integration/structural-evolution-semantics.spec.ts
 # there; each schema change's record at home keeps structure and digests only.
 tests/integration/structural-evolution-regional.spec.ts
 
+# Who runs each statement of an extraction, and what every other identity can
+# do with it: the ladder over a login as a NOSUPERUSER application role, and
+# PostgREST's roles, MCP / direct read-only, direct read-write (main's own
+# direct-access SQL, which hands the new table to the project's owner role
+# mid-ladder) and backup, each reading and writing exactly what the parent
+# allows; ladder functions resolve names in pg_catalog only, cannot be called,
+# moved or replaced; a write reaches the host exactly once.
+tests/integration/structural-evolution-identities.spec.ts
+
 # Whether a user's coding agent is connected: an MCP key or OAuth connection
 # their agent authenticated with (authenticateMcp's stamp), unexpired, for this
 # user and this project only, and the console status route built on it: owner

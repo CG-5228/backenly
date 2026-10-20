@@ -135,13 +135,17 @@ describe('the extraction ladder', () => {
     expect(plan({ spec: { ...SPEC, satellite: 'bad name' } }).validity).toBe('invalid')
     expect(plan({ spec: { ...SPEC, members: ['refund_amount', 'total'] } }).blockedReasons.join()).toMatch(/total is NOT NULL/)
     expect(plan({ facts: ordersFacts({ relkind: 'p' }) }).blockedReasons.join()).toMatch(/partitioned/)
+    // A key the sync could only compare with an operator from outside pg_catalog.
+    const extensionKey = ordersFacts()
+    extensionKey.columns = extensionKey.columns.map(c => (c.name === 'id' ? { ...c, type: 'public.citext', udt: 'citext', builtinType: false } : c))
+    expect(plan({ facts: extensionKey }).blockedReasons.join()).toMatch(/primary key id is of type public\.citext, which is not built in/)
   })
 
   it('plans numbered copies of a field and says honestly that it cannot run them yet', () => {
     const facts = ordersFacts()
     facts.columns.push(
-      { name: 'coupon_1', attnum: 20, type: 'text', udt: 'text', notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false },
-      { name: 'coupon_2', attnum: 21, type: 'text', udt: 'text', notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false },
+      { name: 'coupon_1', attnum: 20, type: 'text', udt: 'text', notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false, builtinType: true },
+      { name: 'coupon_2', attnum: 21, type: 'text', udt: 'text', notNull: false, default: null, generated: false, identity: false, hasColumnAcl: false, builtinType: true },
     )
     const p = plan({ facts, spec: { host: 'orders', members: ['coupon_1', 'coupon_2'], satellite: 'order_coupons', label: 'coupon' } })
     expect(p.validity).toBe('blocked_by_capability')

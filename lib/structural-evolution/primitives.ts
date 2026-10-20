@@ -31,6 +31,7 @@ import { prisma } from '@/lib/db'
 import { createHash } from 'node:crypto'
 import { readTableFacts, relationExists, type TableFacts } from './facts'
 import { workspaceAt, type WorkspaceAt } from './workspace'
+import { dbWords } from './residency'
 import { fq, hostLadderObjects, ladderNames, policiesWiderThanParent, type ExtractionSpec } from './sql'
 import { reconcileExtraction } from './reconcile'
 import { rehearseExtraction } from './rehearse'
@@ -159,7 +160,7 @@ export async function reloadDataPlane(at: WorkspaceAt): Promise<string> {
       await at.db.$executeRawUnsafe(`NOTIFY pgrst, 'reload schema'`)
       return 'schema cache reload requested'
     } catch (err) {
-      return `schema cache not reloaded: ${err instanceof Error ? err.message : String(err)}`
+      return `schema cache not reloaded: ${dbWords(err, at.quote)}`
     }
   }
 }
