@@ -33,6 +33,8 @@
  * Measured this way, two things a superuser install hides were found and are
  * now part of the procedure (sql/roles.sql): the definers need the privileges of
  * the application role, and must be able to become the roles they create for it.
+ * A third is in the definers themselves: dropping a login needs its privileges,
+ * which its creator does not hold (see the block on logins below).
  *
  * What only a throwaway RDS instance can add is RDS's own role patches; that
  * rehearsal needs AWS and is not this suite.
@@ -54,7 +56,7 @@ import { prisma } from '@/lib/db/prisma'
 import { driftCaptureHealth, driftEventBacklog } from '@/lib/autonomy/drift-event-upkeep'
 import { hasCapability, resetCapabilityCache } from '@/lib/autonomy/platform-capabilities'
 import { createProvisionedProject } from '@/lib/projects/provision'
-import { directAccessRoleNames, syncDirectAccessGrants } from '@/lib/services/direct-access'
+import { directAccessRoleNames, revokeDirectAccess, syncDirectAccessGrants } from '@/lib/services/direct-access'
 import { generatePassword, scramSha256Verifier } from '@/tools/managed-db/regional/scram'
 
 jest.setTimeout(300_000)
@@ -638,6 +640,124 @@ describe('a project without direct access, which the application makes in the re
     const result = bootstrap({ DATABASE_URL: adminUrl(), BOOTSTRAP_MODE: 'check', EXPECT_DATABASE: DB })
     expect(result.output).toContain('Check only: nothing was written. Every step is recorded, and the database verifies.')
     expect(result.status).toBe(0)
+  })
+})
+
+describe('a project’s logins, held by the definer as Amazon RDS holds them', () => {
+  // Deleting a project drops its bkn_ro_ / bkn_rw_ / bkn_fn_ logins, and
+  // revoking direct access drops one. Both failed on RDS with 42501
+  // ("permission denied to reassign objects"; for bkn_fn_, which a deletion
+  // dropped as the application, "permission denied to drop objects"): REASSIGN
+  // OWNED and DROP OWNED need the login's privileges, and on RDS the master that
+  // owns the definers administers every login they make without being a member
+  // of any, and createrole_self_grant has no effect (measured on staging).
+  // Stock PostgreSQL 16 grants a login back to its creator when that setting
+  // asks for it, as this database's sessions of backenly_app do (sql/roles.sql),
+  // so the logins here are made in sessions with it unset. The definer then
+  // holds ADMIN on each and none of its privileges, as on RDS.
+  const REGION = 'us-east-1'
+  const saved = { edition: process.env.BACKENLY_EDITION }
+  let ownerId = ''
+
+  /** As the application, in a session where createrole_self_grant is unset. */
+  async function asAppWithoutSelfGrant<T = Record<string, unknown>>(sql: string, params: unknown[]): Promise<T[]> {
+    const client = new Client({ connectionString: loginUrl('backenly_app') })
+    client.on('error', () => {})
+    await client.connect()
+    try {
+      await client.query(`SET createrole_self_grant = ''`)
+      return (await client.query(sql, params)).rows as T[]
+    } finally {
+      await client.end().catch(() => {})
+    }
+  }
+
+  /** A project in the region with every login it can have: read-only, read-write and its functions'. */
+  async function projectWithLogins() {
+    const project = await createProvisionedProject({ name: `regional logins ${randomUUID()}`, userId: ownerId, region: REGION })
+    const schema = project.postgresSchema
+    const { ro, rw, owner } = directAccessRoleNames(project.id)
+    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_ONLY')`, [ro, generatePassword(), schema])
+    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_WRITE')`, [rw, generatePassword(), schema])
+    const [{ fn }] = await asAppWithoutSelfGrant<{ fn: string }>(`SELECT public.backenly_fn_role_sync($1, $2) AS fn`, [schema, generatePassword()])
+    // The grants and the owner role, as provisioning syncs them.
+    await rows(loginUrl('backenly_app'), `SELECT public.backenly_direct_sync_schema($1, $2, $3, $4)`, [schema, ro, rw, owner])
+    for (const [mode, roleName] of [['READ_ONLY', ro], ['READ_WRITE', rw]] as const) {
+      await prisma.databaseCredential.create({
+        data: { projectId: project.id, mode, roleName, passwordCipher: 'x', passwordIv: 'x', passwordTag: 'x' },
+      })
+    }
+    const logins = [ro, rw, fn].sort()
+    const held = await rows(
+      superUrl(),
+      `SELECT rolname, pg_has_role($1, oid, 'USAGE') AS privileges, pg_has_role($1, oid, 'MEMBER WITH ADMIN OPTION') AS admin
+         FROM pg_roles WHERE rolname = ANY($2) ORDER BY rolname`,
+      [ADMIN, logins],
+    )
+    expect(held).toEqual(logins.map((rolname) => ({ rolname, privileges: false, admin: true })))
+    return { projectId: project.id, schema, rw, logins }
+  }
+
+  beforeAll(async () => {
+    process.env.DATABASE_URL_US_EAST_1 = loginUrl('backenly_app')
+    process.env.BACKENLY_EDITION = 'cloud'
+    ownerId = (
+      await prisma.user.create({
+        data: { email: `regional-logins-${randomUUID()}@example.test`, name: 'regional logins fixture' },
+        select: { id: true },
+      })
+    ).id
+  })
+
+  afterAll(async () => {
+    if (saved.edition === undefined) delete process.env.BACKENLY_EDITION
+    else process.env.BACKENLY_EDITION = saved.edition
+    if (ownerId) {
+      const projects = (await prisma.project.findMany({ where: { userId: ownerId }, select: { id: true } })).map((p) => p.id)
+      await prisma.databaseCredential.deleteMany({ where: { projectId: { in: projects } } }).catch(() => {})
+      await prisma.project.deleteMany({ where: { userId: ownerId } }).catch(() => {})
+      await prisma.user.deleteMany({ where: { id: ownerId } }).catch(() => {})
+    }
+  })
+
+  it('are all dropped with their project, and nothing of them is left', async () => {
+    const { deleteProjectCompletely } = await import('@/lib/projects/delete')
+    const { projectId, schema, logins } = await projectWithLogins()
+    const oids = (await rows<{ oid: string }>(superUrl(), `SELECT oid::text AS oid FROM pg_roles WHERE rolname = ANY($1)`, [logins])).map((r) => r.oid)
+    expect(oids).toHaveLength(3)
+    const others = `SELECT roleid::regrole::text AS role, admin_option, inherit_option, set_option
+                      FROM pg_auth_members WHERE member = $1::regrole AND NOT roleid = ANY($2::oid[]) ORDER BY 1`
+    const adminElsewhere = await rows(superUrl(), others, [ADMIN, oids])
+
+    const result = await deleteProjectCompletely(projectId)
+
+    expect(result.schemasDropped).toContain(schema)
+    expect(await rows(superUrl(), `SELECT 1 FROM pg_namespace WHERE nspname = $1`, [schema])).toEqual([])
+    expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = ANY($1)`, [logins])).toEqual([])
+    expect(
+      await rows(superUrl(), `SELECT 1 FROM pg_auth_members WHERE roleid = ANY($1::oid[]) OR member = ANY($1::oid[])`, [oids]),
+    ).toEqual([])
+    // The privileges the definer took for each drop went with the login.
+    expect(await rows(superUrl(), others, [ADMIN, oids])).toEqual(adminElsewhere)
+    expect(await prisma.project.findUnique({ where: { id: projectId } })).toBeNull()
+    expect(await prisma.databaseCredential.count({ where: { projectId } })).toBe(0)
+  })
+
+  it('are revoked one at a time, and a table the read-write login owns passes to the application', async () => {
+    const { projectId, schema, rw } = await projectWithLogins()
+    // Owned by the login, as a table made over direct access is. Made by the
+    // administrator and handed over, so that only the revocation is under test
+    // here, not the DDL that runs when a developer creates a table.
+    await rows(adminUrl(), `CREATE TABLE "${schema}".made_directly (id int)`)
+    await rows(superUrl(), `ALTER TABLE "${schema}".made_directly OWNER TO "${rw}"`)
+
+    await revokeDirectAccess(projectId, 'READ_WRITE')
+
+    expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = $1`, [rw])).toEqual([])
+    expect(
+      await rows(superUrl(), `SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE oid = to_regclass($1)`, [`"${schema}".made_directly`]),
+    ).toEqual([{ owner: 'backenly_app' }])
+    expect(await prisma.databaseCredential.findMany({ where: { projectId }, select: { mode: true } })).toEqual([{ mode: 'READ_ONLY' }])
   })
 })
 

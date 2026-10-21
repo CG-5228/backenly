@@ -257,30 +257,32 @@ function projectRoleNames(credentialRoles: string[], schemas: string[]): string[
 /**
  * Drop these login roles in the cluster `tx` is connected to.
  *
- * Uses public.backenly_direct_drop_role (terminates sessions, strips
- * policies, reassigns, drops) where the installer created it; otherwise a
- * guarded manual drop. Existence is CHECKED rather than caught: an error
- * inside the transaction would abort the whole deletion.
+ * Through the definer helpers where the installer created them:
+ * public.backenly_direct_drop_role for bkn_ro_/bkn_rw_ (terminates sessions,
+ * strips policies, reassigns, drops) and public.backenly_fn_role_drop for
+ * bkn_fn_. Otherwise a guarded manual drop, which only a login that may drop
+ * the role can run: the app role on a managed database is NOCREATEROLE and
+ * holds none of these roles' privileges, so there it fails with 42501.
+ * Existence is CHECKED rather than caught: an error inside the transaction
+ * would abort the whole deletion.
  */
 async function dropRoles(tx: Tx, candidates: string[]): Promise<void> {
   if (candidates.length === 0) return
 
-  const helper = await tx.$queryRaw<{ n: number }[]>`
-    SELECT count(*)::int AS n FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = 'public' AND p.proname = 'backenly_direct_drop_role'`
-  const hasHelper = Number(helper[0]?.n ?? 0) > 0
+  const [helpers] = await tx.$queryRaw<{ direct: boolean; fn: boolean }[]>`
+    SELECT to_regprocedure('public.backenly_direct_drop_role(text)') IS NOT NULL AS direct,
+           to_regprocedure('public.backenly_fn_role_drop(text)') IS NOT NULL AS fn`
 
   for (const role of candidates) {
     const exists = await tx.$queryRaw<{ n: number }[]>`
       SELECT count(*)::int AS n FROM pg_roles WHERE rolname = ${role}`
     if (Number(exists[0]?.n ?? 0) === 0) continue
 
-    // The installer's helper validates its argument against the direct-access
-    // role shapes (bkn_ro_/bkn_rw_) and refuses bkn_fn_ — those take the
-    // manual path even where the helper exists.
-    if (hasHelper && /^bkn_(ro|rw)_/.test(role)) {
+    // Each helper validates its argument against its own role shape.
+    if (helpers?.direct && /^bkn_(ro|rw)_/.test(role)) {
       await tx.$queryRaw`SELECT public.backenly_direct_drop_role(${role})`
+    } else if (helpers?.fn && /^bkn_fn_/.test(role)) {
+      await tx.$queryRaw`SELECT public.backenly_fn_role_drop(${role})`
     } else {
       // The schemas are already dropped in this transaction, so the role's
       // grants on them are gone; DROP OWNED clears anything else it holds.
