@@ -20,8 +20,9 @@
 --                                     (hardened: connection limit, timeouts,
 --                                     search_path pinned to the one schema).
 --   3. backenly_direct_set_password — rotate.
---   4. backenly_direct_drop_role    — terminate sessions, strip policies,
---                                     reassign owned objects, drop.
+--   4. backenly_direct_drop_role    — take the role's privileges, terminate
+--                                     sessions, strip policies, reassign owned
+--                                     objects, drop.
 --   5. backenly_direct_sync_schema  — idempotent grants/ownership/RLS-policy
 --                                     sync for a workspace schema, including the
 --                                     backup role's read, which every workspace
@@ -173,6 +174,19 @@ $fn$;
 
 REVOKE ALL ON FUNCTION public.backenly_direct_set_password(text, text) FROM PUBLIC;
 -- ── 4. Drop a role cleanly ────────────────────────────────────────────────────
+--
+-- The definer needs the PRIVILEGES of the role it drops, not only ADMIN over
+-- it: REASSIGN OWNED and DROP OWNED require them, and so does terminating the
+-- role's sessions without pg_signal_backend. PostgreSQL 16 gives a CREATEROLE
+-- role that is not a superuser ADMIN on a role it creates and nothing more. On
+-- Amazon RDS the master is not made a member at all (pg_has_role still reports
+-- its ADMIN), and createrole_self_grant has no effect; both measured on
+-- staging. So on a managed database, where this definer is the master, every
+-- login it created failed here with "permission denied to reassign objects",
+-- and so did deleting any project that had one. ADMIN is what lets the definer
+-- grant the role to itself first. That is done only when the privileges are
+-- missing (a superuser has them all), and the grant goes with the role in the
+-- DROP ROLE below.
 CREATE OR REPLACE FUNCTION public.backenly_direct_drop_role(
   p_role text
 ) RETURNS boolean
@@ -186,6 +200,14 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_role) THEN
     RETURN true; -- already gone — idempotent
+  END IF;
+
+  -- Before anything that needs them (see above). WITH INHERIT exists from
+  -- PostgreSQL 16; before it a membership is inherited by an INHERIT member.
+  IF NOT pg_has_role(current_user, p_role, 'USAGE') THEN
+    EXECUTE format(CASE WHEN current_setting('server_version_num')::int >= 160000
+                        THEN 'GRANT %I TO %I WITH INHERIT TRUE, SET FALSE'
+                        ELSE 'GRANT %I TO %I' END, p_role, current_user);
   END IF;
 
   PERFORM pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = p_role;
