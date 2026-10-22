@@ -103,6 +103,25 @@ describe('the Overview’s agent panel', () => {
     expect(await screen.findByRole('heading', { name: 'Waiting on your review' }, { timeout: 3000 })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Your agent is waiting on you' })).toBeNull()
   })
+
+  it('is not rendered when nothing waits and every check could see', async () => {
+    renderOverview()
+    await settle()
+    expect(await screen.findByRole('heading', { name: 'Self-healing loop' }, { timeout: 3000 })).toBeInTheDocument()
+    expect(screen.queryByText('Autonomy mode')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /No issues detected|Built and standing by/ })).toBeNull()
+  })
+
+  it('still says so when a check could not run', async () => {
+    const now = new Date().toISOString()
+    health = healthWith({
+      sensors: { at: now, total: 3, ran: 2, errored: [{ id: 'fk', title: 'Foreign keys indexed', error: 'x' }], disabled: [] },
+    })
+    renderOverview()
+    await settle()
+    expect(await screen.findByRole('heading', { name: '1 check could not run' }, { timeout: 3000 })).toBeInTheDocument()
+    expect(screen.getByText('Autonomy mode')).toBeInTheDocument()
+  })
 })
 
 describe('the top bar’s review inbox', () => {
