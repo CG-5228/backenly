@@ -120,11 +120,13 @@ REVOKE ALL ON FUNCTION public.backenly_fn_role_sync(text, text) FROM PUBLIC;
 -- grant goes with the role. The schema need not exist any more: a deletion
 -- drops it first, so the name is checked against the shape the sync gives it.
 --
--- DROP OWNED reaches only the current database. When another database on the
--- cluster still names the login, DROP ROLE fails with 2BP01 and the deletion
--- with it, so the login is retired instead, NOLOGIN with no password, and the
--- result is false; public.backenly_direct_drop_role explains why the other
--- database is left untouched. True means the login is gone.
+-- DROP OWNED reaches only the current database. When anything outside it still
+-- names the login (another database's grant, or a database-level privilege or
+-- object this definer cannot clear), DROP ROLE fails with 2BP01 and the
+-- deletion with it, so the login is retired instead, NOLOGIN with no password,
+-- and the result is false. public.backenly_direct_drop_role explains why
+-- nothing outside is touched and why the caller calls again after its commit.
+-- True means the login is gone.
 CREATE OR REPLACE FUNCTION public.backenly_fn_role_drop(p_role text)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -154,7 +156,7 @@ BEGIN
     SELECT 1 FROM pg_shdepend s
      WHERE s.refclassid = 'pg_authid'::regclass
        AND s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = p_role)
-       AND s.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+       AND s.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database())
   ) THEN
     EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', p_role);
     IF granted THEN

@@ -191,16 +191,20 @@ REVOKE ALL ON FUNCTION public.backenly_direct_set_password(text, text) FROM PUBL
 -- DROP ROLE below.
 --
 -- A role is cluster-wide, but REASSIGN OWNED and DROP OWNED reach only the
--- current database. When another database on the cluster still names the role
--- (a grant, a default privilege, an object it owns there), DROP ROLE fails with
+-- current database, and a definer that is not a superuser cannot revoke a
+-- database-level privilege another role granted. When anything outside this
+-- database still names the role (a grant, a default privilege or an object in
+-- another database, or such a database-level privilege), DROP ROLE fails with
 -- 2BP01, and so did every deletion of a project whose login it was. A database
--- restored beside this one from a dump that carried the grants is enough, and
--- so is anything an operator granted there. This function does not touch
--- another database, which may hold anyone's data. It retires the login
--- instead: NOLOGIN with no password, so it cannot authenticate by any means
--- (its sessions were ended above), and it returns false. With nothing left
--- naming the role, a later call drops it. The privileges taken above are given
--- back, because the grant no longer goes with the role.
+-- restored beside this one from a dump that carried the grants is enough. This
+-- function touches nothing outside this database, which may hold anyone's
+-- data. It retires the login instead: NOLOGIN with no password, so it cannot
+-- authenticate by any means, and it returns false. A session that logged in
+-- after the termination above outlives it until this transaction commits, so
+-- the caller calls again after its commit to end it. The privileges taken
+-- above are given back, because the grant no longer goes with the role. The
+-- login stays retired until an operator removes what names it elsewhere; the
+-- next call then drops it.
 --
 -- Returns true when the role is gone (dropped now, or never existed), false
 -- when it was retired.
@@ -245,12 +249,12 @@ BEGIN
   EXECUTE format('REASSIGN OWNED BY %I TO %I', p_role, public.backenly_app_role());
   EXECUTE format('DROP OWNED BY %I', p_role); -- strips remaining grants
 
-  -- What still names the role is in another database (see above): retire it.
+  -- Whatever still names the role is outside this database (see above): retire it.
   IF EXISTS (
     SELECT 1 FROM pg_shdepend s
      WHERE s.refclassid = 'pg_authid'::regclass
        AND s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = p_role)
-       AND s.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+       AND s.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database())
   ) THEN
     EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', p_role);
     IF granted THEN

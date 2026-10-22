@@ -658,6 +658,8 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
   const REGION = 'us-east-1'
   const saved = { edition: process.env.BACKENLY_EDITION }
   let ownerId = ''
+  /** Every project made here, for the audit rows a retirement leaves outside its cascade. */
+  const created: string[] = []
 
   /** As the application, in a session where createrole_self_grant is unset. */
   async function asAppWithoutSelfGrant<T = Record<string, unknown>>(sql: string, params: unknown[]): Promise<T[]> {
@@ -675,6 +677,7 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
   /** A project in the region with every login it can have: read-only, read-write and its functions'. */
   async function projectWithLogins() {
     const project = await createProvisionedProject({ name: `regional logins ${randomUUID()}`, userId: ownerId, region: REGION })
+    created.push(project.id)
     const schema = project.postgresSchema
     const { ro, rw, owner } = directAccessRoleNames(project.id)
     const passwords: Record<string, string> = { [ro]: generatePassword(), [rw]: generatePassword() }
@@ -746,6 +749,11 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       await prisma.databaseCredential.deleteMany({ where: { projectId: { in: projects } } }).catch(() => {})
       await prisma.project.deleteMany({ where: { userId: ownerId } }).catch(() => {})
       await prisma.user.deleteMany({ where: { id: ownerId } }).catch(() => {})
+    }
+    if (created.length) {
+      await prisma.auditLog
+        .deleteMany({ where: { action: 'DATABASE_LOGIN_RETIRED', OR: created.map((id) => ({ details: { contains: id } })) } })
+        .catch(() => {})
     }
   })
 
@@ -825,6 +833,14 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       expect(await rows(superUrl(other), kept, [`"${schema}".kept`])).toEqual(keptBefore)
       // The privileges the definer took to retire them were given back.
       expect(await rows(superUrl(), memberships, [ADMIN])).toEqual(membershipsBefore)
+      // The retirement outlives the project's cascade in the audit trail.
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'DATABASE_LOGIN_RETIRED', details: { contains: projectId } },
+        select: { projectId: true, details: true },
+      })
+      expect(audit?.projectId).toBeNull()
+      expect(JSON.parse(String(audit?.details))).toMatchObject({ projectId, region: REGION, via: 'project deletion' })
+      expect([...JSON.parse(String(audit?.details)).logins].sort()).toEqual(logins)
 
       // Once nothing else names them, the next drop removes them.
       await rows(superUrl(), `DROP DATABASE ${other} WITH (FORCE)`)
@@ -855,7 +871,9 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       })
       expect(JSON.parse(String(audit?.details))).toEqual({ mode: 'READ_ONLY', roleName: ro, login: 'retired' })
 
-      // The same name, logging in again with the new password only.
+      // The same name, logging in again with the new password only. It comes
+      // back with whatever the other database still grants it, as it had
+      // before the revocation: retiring changes nothing outside this database.
       const fresh = generatePassword()
       await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_ONLY')`, [ro, fresh, schema])
       expect(await refusal(url(ro, fresh), 'SELECT 1')).toBeNull()
@@ -863,6 +881,49 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
     } finally {
       await rows(superUrl(), `DROP DATABASE IF EXISTS ${other} WITH (FORCE)`)
     }
+  })
+
+  it('a login retired by revocation is dropped with its project, once what named it is gone', async () => {
+    // The revocation deleted its credential row, so only the name derived from
+    // the project leads the deletion back to it.
+    const { deleteProjectCompletely } = await import('@/lib/projects/delete')
+    const { projectId, schema, logins } = await projectWithLogins()
+    const ro = logins.find((login) => login.startsWith('bkn_ro_'))!
+    const other = await anotherDatabaseNaming(schema, [ro])
+    try {
+      await revokeDirectAccess(projectId, 'READ_ONLY')
+      expect(await loginStates([ro])).toEqual([{ rolname: ro, login: false, no_password: true }])
+      expect(await prisma.databaseCredential.count({ where: { projectId, roleName: ro } })).toBe(0)
+    } finally {
+      await rows(superUrl(), `DROP DATABASE IF EXISTS ${other} WITH (FORCE)`)
+    }
+
+    const result = await deleteProjectCompletely(projectId)
+
+    expect(result.retiredLogins).toEqual([])
+    expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = ANY($1)`, [logins])).toEqual([])
+  })
+
+  it('that only a database-level privilege the definer cannot revoke still names are retired, not left to fail the deletion', async () => {
+    // A database privilege granted by another role survives the definer's DROP
+    // OWNED: a definer that is not a superuser revokes only what it can, and
+    // the grant is recorded server-wide, in no one database. Granted here on a
+    // database the superuser owns, so the grant is the superuser's.
+    const { deleteProjectCompletely } = await import('@/lib/projects/delete')
+    const { projectId, logins, passwords } = await projectWithLogins()
+    const ro = logins.find((login) => login.startsWith('bkn_ro_'))!
+    await rows(superUrl(), `GRANT TEMPORARY ON DATABASE postgres TO "${ro}"`)
+    try {
+      const result = await deleteProjectCompletely(projectId)
+
+      expect(result.retiredLogins).toEqual([ro])
+      expect(await loginStates(logins)).toEqual([{ rolname: ro, login: false, no_password: true }])
+      expect(await refusal(url(ro, passwords[ro]), 'SELECT 1')).toMatch(REFUSED)
+    } finally {
+      await rows(superUrl(), `REVOKE TEMPORARY ON DATABASE postgres FROM "${ro}"`).catch(() => {})
+    }
+    expect(await rows(loginUrl('backenly_app'), `SELECT public.backenly_direct_drop_role($1) AS gone`, [ro])).toEqual([{ gone: true }])
+    expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = $1`, [ro])).toEqual([])
   })
 })
 

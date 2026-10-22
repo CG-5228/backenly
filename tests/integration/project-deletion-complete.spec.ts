@@ -296,19 +296,26 @@ describe('a login another database on the cluster still names', () => {
     await prisma.databaseCredential.deleteMany({ where: { projectId: project } }).catch(() => {})
     await prisma.project.deleteMany({ where: { id: project } }).catch(() => {})
     await prisma.user.deleteMany({ where: { id: owner } }).catch(() => {})
+    await prisma.auditLog
+      .deleteMany({ where: { action: 'DATABASE_LOGIN_RETIRED', details: { contains: project } } })
+      .catch(() => {})
   })
 
   it('rolls a deletion that fails after the login was retired back whole, the login included', async () => {
     // Fails the deletion at its last step, after the schema drop and the
-    // login's retirement in the same transaction.
+    // login's retirement in the same transaction, and says what the login was
+    // at that moment, so the test shows the retirement did happen and was undone.
     await prisma.$executeRawUnsafe(
-      `CREATE FUNCTION public."${refuse}"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused for the test'; END $$`,
+      `CREATE FUNCTION public."${refuse}"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+         RAISE EXCEPTION 'refused for the test: the login was %',
+           (SELECT CASE WHEN rolcanlogin THEN 'able to log in' ELSE 'retired' END FROM pg_roles WHERE rolname = '${login}');
+       END $$`,
     )
     await prisma.$executeRawUnsafe(
       `CREATE TRIGGER "${refuse}" BEFORE DELETE ON public.projects FOR EACH ROW WHEN (OLD.id = '${project}') EXECUTE FUNCTION public."${refuse}"()`,
     )
     try {
-      await expect(deleteProjectCompletely(project)).rejects.toThrow(/refused for the test/)
+      await expect(deleteProjectCompletely(project)).rejects.toThrow(/refused for the test: the login was retired/)
     } finally {
       await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${refuse}" ON public.projects`)
       await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public."${refuse}"()`)
@@ -340,5 +347,12 @@ describe('a login another database on the cluster still names', () => {
     // The other database is exactly as it was.
     expect(await otherAcl()).toEqual(before)
     expect(await run(urlFor(other), `SELECT count(*)::int AS n FROM "${workspace}".kept`)).toEqual([{ n: 2 }])
+    // And the retirement is on record outside the project's cascade.
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'DATABASE_LOGIN_RETIRED', details: { contains: project } },
+      select: { projectId: true, details: true },
+    })
+    expect(audit?.projectId).toBeNull()
+    expect(JSON.parse(String(audit?.details))).toEqual({ projectId: project, region: 'ap-south-1', logins: [login], via: 'project deletion' })
   }, 120_000)
 })
