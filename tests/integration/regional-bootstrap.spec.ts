@@ -677,9 +677,12 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
     const project = await createProvisionedProject({ name: `regional logins ${randomUUID()}`, userId: ownerId, region: REGION })
     const schema = project.postgresSchema
     const { ro, rw, owner } = directAccessRoleNames(project.id)
-    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_ONLY')`, [ro, generatePassword(), schema])
-    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_WRITE')`, [rw, generatePassword(), schema])
-    const [{ fn }] = await asAppWithoutSelfGrant<{ fn: string }>(`SELECT public.backenly_fn_role_sync($1, $2) AS fn`, [schema, generatePassword()])
+    const passwords: Record<string, string> = { [ro]: generatePassword(), [rw]: generatePassword() }
+    const fnPassword = generatePassword()
+    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_ONLY')`, [ro, passwords[ro], schema])
+    await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_WRITE')`, [rw, passwords[rw], schema])
+    const [{ fn }] = await asAppWithoutSelfGrant<{ fn: string }>(`SELECT public.backenly_fn_role_sync($1, $2) AS fn`, [schema, fnPassword])
+    passwords[fn] = fnPassword
     // The grants and the owner role, as provisioning syncs them.
     await rows(loginUrl('backenly_app'), `SELECT public.backenly_direct_sync_schema($1, $2, $3, $4)`, [schema, ro, rw, owner])
     for (const [mode, roleName] of [['READ_ONLY', ro], ['READ_WRITE', rw]] as const) {
@@ -695,8 +698,34 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       [ADMIN, logins],
     )
     expect(held).toEqual(logins.map((rolname) => ({ rolname, privileges: false, admin: true })))
-    return { projectId: project.id, schema, rw, logins }
+    return { projectId: project.id, schema, rw, logins, passwords }
   }
+
+  /**
+   * A second database on the cluster that still names these logins, as a copy
+   * restored there from an older dump does: the project's schema again, with a
+   * table granted to each.
+   */
+  async function anotherDatabaseNaming(schema: string, logins: string[]): Promise<string> {
+    const other = `regional_elsewhere_${randomUUID().replace(/-/g, '').slice(0, 8)}`
+    await rows(superUrl(), `CREATE DATABASE ${other}`)
+    await rows(superUrl(other), `CREATE SCHEMA "${schema}"`)
+    await rows(superUrl(other), `CREATE TABLE "${schema}".kept (id int)`)
+    await rows(superUrl(other), `INSERT INTO "${schema}".kept VALUES (1), (2)`)
+    for (const login of logins) {
+      await rows(superUrl(other), `GRANT USAGE ON SCHEMA "${schema}" TO "${login}"`)
+      await rows(superUrl(other), `GRANT SELECT ON "${schema}".kept TO "${login}"`)
+    }
+    return other
+  }
+
+  const loginStates = (logins: string[]) =>
+    rows(
+      superUrl(),
+      `SELECT rolname, rolcanlogin AS login, rolpassword IS NULL AS no_password FROM pg_authid WHERE rolname = ANY($1) ORDER BY 1`,
+      [logins],
+    )
+  const REFUSED = /password authentication failed|not permitted to log in/
 
   beforeAll(async () => {
     process.env.DATABASE_URL_US_EAST_1 = loginUrl('backenly_app')
@@ -758,6 +787,82 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       await rows(superUrl(), `SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE oid = to_regclass($1)`, [`"${schema}".made_directly`]),
     ).toEqual([{ owner: 'backenly_app' }])
     expect(await prisma.databaseCredential.findMany({ where: { projectId }, select: { mode: true } })).toEqual([{ mode: 'READ_ONLY' }])
+  })
+
+  // DROP OWNED and REASSIGN OWNED reach only the current database, so a login
+  // that another database on the cluster still names failed DROP ROLE with
+  // 2BP01, and the deletion of its project with it. Such a login is now retired
+  // (NOLOGIN, no password) and the other database is left untouched.
+  it('that another database still names are retired with their project, unable to log in, and that database is left as it was', async () => {
+    const { deleteProjectCompletely } = await import('@/lib/projects/delete')
+    const { projectId, schema, logins, passwords } = await projectWithLogins()
+    const other = await anotherDatabaseNaming(schema, logins)
+    const oids = (await rows<{ oid: string }>(superUrl(), `SELECT oid::text AS oid FROM pg_roles WHERE rolname = ANY($1)`, [logins])).map((r) => r.oid)
+    const memberships = `SELECT roleid::regrole::text AS role, admin_option, inherit_option, set_option, grantor::regrole::text AS grantor
+                           FROM pg_auth_members WHERE member = $1::regrole ORDER BY 1, 5`
+    const membershipsBefore = await rows(superUrl(), memberships, [ADMIN])
+    const kept = `SELECT relacl::text AS acl, (SELECT count(*)::int FROM "${schema}".kept) AS n FROM pg_class WHERE oid = to_regclass($1)`
+    const keptBefore = await rows(superUrl(other), kept, [`"${schema}".kept`])
+    for (const login of logins) expect(await refusal(url(login, passwords[login]), 'SELECT 1')).toBeNull()
+
+    try {
+      const result = await deleteProjectCompletely(projectId)
+
+      expect([...result.retiredLogins].sort()).toEqual(logins)
+      expect(await rows(superUrl(), `SELECT 1 FROM pg_namespace WHERE nspname = $1`, [schema])).toEqual([])
+      expect(await prisma.project.findUnique({ where: { id: projectId } })).toBeNull()
+      expect(await prisma.databaseCredential.count({ where: { projectId } })).toBe(0)
+      expect(await loginStates(logins)).toEqual(logins.map((rolname) => ({ rolname, login: false, no_password: true })))
+      for (const login of logins) expect(await refusal(url(login, passwords[login]), 'SELECT 1')).toMatch(REFUSED)
+      // Nothing of them is left in this database, and the other is as it was.
+      expect(
+        await rows(
+          superUrl(),
+          `SELECT count(*)::int AS n FROM pg_shdepend s JOIN pg_database d ON d.oid = s.dbid WHERE d.datname = $1 AND s.refobjid = ANY($2::oid[])`,
+          [DB, oids],
+        ),
+      ).toEqual([{ n: 0 }])
+      expect(await rows(superUrl(other), kept, [`"${schema}".kept`])).toEqual(keptBefore)
+      // The privileges the definer took to retire them were given back.
+      expect(await rows(superUrl(), memberships, [ADMIN])).toEqual(membershipsBefore)
+
+      // Once nothing else names them, the next drop removes them.
+      await rows(superUrl(), `DROP DATABASE ${other} WITH (FORCE)`)
+      for (const login of logins) {
+        const helper = login.startsWith('bkn_fn_') ? 'backenly_fn_role_drop' : 'backenly_direct_drop_role'
+        expect(await rows(loginUrl('backenly_app'), `SELECT public.${helper}($1) AS gone`, [login])).toEqual([{ gone: true }])
+      }
+      expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = ANY($1)`, [logins])).toEqual([])
+    } finally {
+      await rows(superUrl(), `DROP DATABASE IF EXISTS ${other} WITH (FORCE)`)
+    }
+  })
+
+  it('a revoked login another database still names is retired, and provisioning the mode again gives it back', async () => {
+    const { projectId, schema, logins, passwords } = await projectWithLogins()
+    const ro = logins.find((login) => login.startsWith('bkn_ro_'))!
+    const other = await anotherDatabaseNaming(schema, [ro])
+    try {
+      await revokeDirectAccess(projectId, 'READ_ONLY')
+
+      expect(await loginStates([ro])).toEqual([{ rolname: ro, login: false, no_password: true }])
+      expect(await refusal(url(ro, passwords[ro]), 'SELECT 1')).toMatch(REFUSED)
+      expect(await prisma.databaseCredential.findMany({ where: { projectId }, select: { mode: true } })).toEqual([{ mode: 'READ_WRITE' }])
+      const audit = await prisma.auditLog.findFirst({
+        where: { projectId, action: 'DIRECT_ACCESS_REVOKED' },
+        orderBy: { timestamp: 'desc' },
+        select: { details: true },
+      })
+      expect(JSON.parse(String(audit?.details))).toEqual({ mode: 'READ_ONLY', roleName: ro, login: 'retired' })
+
+      // The same name, logging in again with the new password only.
+      const fresh = generatePassword()
+      await asAppWithoutSelfGrant(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_ONLY')`, [ro, fresh, schema])
+      expect(await refusal(url(ro, fresh), 'SELECT 1')).toBeNull()
+      expect(await refusal(url(ro, passwords[ro]), 'SELECT 1')).toMatch(REFUSED)
+    } finally {
+      await rows(superUrl(), `DROP DATABASE IF EXISTS ${other} WITH (FORCE)`)
+    }
   })
 })
 

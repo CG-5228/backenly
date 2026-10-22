@@ -22,7 +22,9 @@
 --   3. backenly_direct_set_password — rotate.
 --   4. backenly_direct_drop_role    — take the role's privileges, terminate
 --                                     sessions, strip policies, reassign owned
---                                     objects, drop.
+--                                     objects, drop; or, when another database
+--                                     on the cluster still names the role,
+--                                     retire it (NOLOGIN, no password).
 --   5. backenly_direct_sync_schema  — idempotent grants/ownership/RLS-policy
 --                                     sync for a workspace schema, including the
 --                                     backup role's read, which every workspace
@@ -187,13 +189,29 @@ REVOKE ALL ON FUNCTION public.backenly_direct_set_password(text, text) FROM PUBL
 -- grant the role to itself first. That is done only when the privileges are
 -- missing (a superuser has them all), and the grant goes with the role in the
 -- DROP ROLE below.
+--
+-- A role is cluster-wide, but REASSIGN OWNED and DROP OWNED reach only the
+-- current database. When another database on the cluster still names the role
+-- (a grant, a default privilege, an object it owns there), DROP ROLE fails with
+-- 2BP01, and so did every deletion of a project whose login it was. A database
+-- restored beside this one from a dump that carried the grants is enough, and
+-- so is anything an operator granted there. This function does not touch
+-- another database, which may hold anyone's data. It retires the login
+-- instead: NOLOGIN with no password, so it cannot authenticate by any means
+-- (its sessions were ended above), and it returns false. With nothing left
+-- naming the role, a later call drops it. The privileges taken above are given
+-- back, because the grant no longer goes with the role.
+--
+-- Returns true when the role is gone (dropped now, or never existed), false
+-- when it was retired.
 CREATE OR REPLACE FUNCTION public.backenly_direct_drop_role(
   p_role text
 ) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
 AS $fn$
 DECLARE
-  pol record;
+  pol     record;
+  granted boolean := false;
 BEGIN
   IF p_role !~ '^bkn_(ro|rw)_[0-9a-f]{12}$' THEN
     RAISE EXCEPTION 'backenly_direct_drop_role: invalid role name %', p_role;
@@ -208,6 +226,7 @@ BEGIN
     EXECUTE format(CASE WHEN current_setting('server_version_num')::int >= 160000
                         THEN 'GRANT %I TO %I WITH INHERIT TRUE, SET FALSE'
                         ELSE 'GRANT %I TO %I' END, p_role, current_user);
+    granted := true;
   END IF;
 
   PERFORM pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = p_role;
@@ -225,6 +244,21 @@ BEGIN
   -- role so the backend they describe keeps working after revocation.
   EXECUTE format('REASSIGN OWNED BY %I TO %I', p_role, public.backenly_app_role());
   EXECUTE format('DROP OWNED BY %I', p_role); -- strips remaining grants
+
+  -- What still names the role is in another database (see above): retire it.
+  IF EXISTS (
+    SELECT 1 FROM pg_shdepend s
+     WHERE s.refclassid = 'pg_authid'::regclass
+       AND s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = p_role)
+       AND s.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+  ) THEN
+    EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', p_role);
+    IF granted THEN
+      EXECUTE format('REVOKE %I FROM %I', p_role, current_user);
+    END IF;
+    RETURN false;
+  END IF;
+
   EXECUTE format('DROP ROLE %I', p_role);
   RETURN true;
 END

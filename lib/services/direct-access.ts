@@ -275,9 +275,12 @@ export async function revokeDirectAccess(projectId: string, mode: DirectAccessMo
 
   // Terminates live sessions, drops policies naming the role, reassigns any
   // tables it created to the platform role, then drops it. On the project's
-  // database, in its region, where the role is.
+  // database, in its region, where the role is. A login another database on
+  // the cluster still names is retired instead (NOLOGIN, no password) and the
+  // helper answers false: revoked either way, since it can no longer log in.
   const db = await workspaceRawClient(projectId)
-  await db.$queryRaw`SELECT public.backenly_direct_drop_role(${existing.roleName})`
+  const [{ gone }] = await db.$queryRaw<{ gone: boolean }[]>`
+    SELECT public.backenly_direct_drop_role(${existing.roleName}) AS gone`
   await prisma.databaseCredential.delete({ where: { id: existing.id } })
 
   await prisma.auditLog.create({
@@ -285,7 +288,7 @@ export async function revokeDirectAccess(projectId: string, mode: DirectAccessMo
       projectId,
       action: 'DIRECT_ACCESS_REVOKED',
       type: 'security',
-      details: JSON.stringify({ mode, roleName: existing.roleName }),
+      details: JSON.stringify({ mode, roleName: existing.roleName, login: gone ? 'dropped' : 'retired' }),
       timestamp: new Date(),
     },
   }).catch(() => {})
