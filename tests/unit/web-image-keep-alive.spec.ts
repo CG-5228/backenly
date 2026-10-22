@@ -71,18 +71,41 @@ function request(socket: Socket): Promise<'200' | 'closed'> {
   })
 }
 
-/** What a load balancer does: one request, an idle connection held open, then the next request on the same one. */
-async function reuseAfterIdle(server: Server, idleMs: number): Promise<'200' | 'closed'> {
+async function openKeepAlive(server: Server): Promise<Socket> {
   const { port } = server.address() as { port: number }
   const socket = connect(port, '127.0.0.1')
   await new Promise<void>(resolve => socket.once('connect', () => resolve()))
+  return socket
+}
+
+async function shutDown(server: Server, socket: Socket): Promise<void> {
+  socket.destroy()
+  await new Promise<void>(resolve => server.close(() => resolve()))
+}
+
+/** What a load balancer does: one request, an idle connection held open, then the next request on the same one. */
+async function reuseAfterIdle(server: Server, idleMs: number): Promise<'200' | 'closed'> {
+  const socket = await openKeepAlive(server)
   try {
     expect(await request(socket)).toBe('200')
     await new Promise(resolve => setTimeout(resolve, idleMs))
     return await request(socket)
   } finally {
-    socket.destroy()
-    await new Promise<void>(resolve => server.close(() => resolve()))
+    await shutDown(server, socket)
+  }
+}
+
+/** How long after answering a request the server itself closes the idle connection (null: not within capMs). */
+async function idleCloseAfter(server: Server, capMs: number): Promise<number | null> {
+  const socket = await openKeepAlive(server)
+  try {
+    const closed = new Promise<number>(resolve => socket.once('close', () => resolve(Date.now())))
+    expect(await request(socket)).toBe('200')
+    const answeredAt = Date.now()
+    const at = await Promise.race([closed, new Promise<null>(resolve => setTimeout(() => resolve(null), capMs))])
+    return at === null ? null : at - answeredAt
+  } finally {
+    await shutDown(server, socket)
   }
 }
 
@@ -105,18 +128,18 @@ describe('web.Dockerfile KEEP_ALIVE_TIMEOUT', () => {
 })
 
 describe('an idle keep-alive connection on a real Node server', () => {
-  const IDLE_MS = 6_500 // past the ~6 s at which Node's default closes it
-
-  it("with the image's value, is still usable after Node's default would have closed it", async () => {
-    const server = await listen({}, { keepAliveTimeout: imageKeepAliveMs() })
-    expect(await reuseAfterIdle(server, IDLE_MS)).toBe('200')
-  }, 20_000)
-
-  it("with Node's default, is closed by then: the reuse a load balancer makes fails", async () => {
+  it("with Node's default, is closed by the server within seconds: long before a load balancer stops reusing it", async () => {
     const server = await listen({}, {})
-    expect(server.keepAliveTimeout).toBeLessThan(LOAD_BALANCER_IDLE_MS)
-    expect(await reuseAfterIdle(server, IDLE_MS)).toBe('closed')
-  }, 20_000)
+    const after = await idleCloseAfter(server, 15_000)
+    expect(after).not.toBeNull()
+    expect(after!).toBeLessThan(LOAD_BALANCER_IDLE_MS)
+  }, 25_000)
+
+  it("with the image's value, is still usable after the point where Node's default has closed it", async () => {
+    // Node's default closes about 6 s after the response; 7.5 s idle is past that with room to spare.
+    const server = await listen({}, { keepAliveTimeout: imageKeepAliveMs() })
+    expect(await reuseAfterIdle(server, 7_500)).toBe('200')
+  }, 25_000)
 
   it('is governed by keepAliveTimeout, not headersTimeout, so 65 s above the 60 s headersTimeout is safe', async () => {
     // Scaled down: headersTimeout far below keepAliveTimeout, checked often.
