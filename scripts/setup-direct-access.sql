@@ -203,8 +203,8 @@ REVOKE ALL ON FUNCTION public.backenly_direct_set_password(text, text) FROM PUBL
 -- after the termination above outlives it until this transaction commits, so
 -- the caller calls again after its commit to end it. The privileges taken
 -- above are given back, because the grant no longer goes with the role. The
--- login stays retired until an operator removes what names it elsewhere; the
--- next call then drops it.
+-- login stays retired, since nothing calls this again on its own: an operator
+-- removes what names it elsewhere, then calls this function to drop it.
 --
 -- Returns true when the role is gone (dropped now, or never existed), false
 -- when it was retired.

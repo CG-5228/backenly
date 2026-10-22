@@ -119,8 +119,9 @@ export interface DeletionResult {
   /**
    * Logins kept as NOLOGIN with no password instead of dropped, because
    * something outside the project's database still names them (see dropRoles).
-   * They cannot authenticate. Each is logged as [LoginRetired] and audited as
-   * DATABASE_LOGIN_RETIRED, and stays until an operator removes what names it.
+   * They cannot authenticate. Each is audited as DATABASE_LOGIN_RETIRED with the
+   * deletion and logged as [LoginRetired], and stays until an operator removes
+   * what names it and drops it.
    */
   retiredLogins: string[]
   /**
@@ -286,8 +287,9 @@ function projectRoleNames(projectId: string, credentialRoles: string[], schemas:
  * 2BP01 and abort the deletion, and what lies outside is not this module's to
  * change. Retired is NOLOGIN with no password, so the login authenticates by no
  * means. The helpers do the same; see public.backenly_direct_drop_role. It
- * stays retired until an operator removes what names it elsewhere, and is then
- * dropped by the next call (settleRetiredLogins records each one).
+ * stays retired: nothing drops it later on its own. An operator removes what
+ * names it elsewhere and then calls the helper, using the record that
+ * recordRetiredLogins keeps of each one.
  *
  * Returns the logins retired rather than dropped.
  */
@@ -353,17 +355,35 @@ interface RetiredLogins {
 }
 
 /**
- * After the deletion has committed: end any session that outlived the retirement, report what is still retired,
- * and leave a record of it.
+ * Record each retirement inside the deletion's own transaction, as the purge outbox is recorded, so a retired login
+ * is never left without a record: it commits with the deletion or not at all. A retirement means something outside
+ * the project's database, typically a copy of its data, still names the login, and nothing drops it later on its
+ * own, so the row is what an operator works from. projectId is unset so the project's cascade does not take it.
+ */
+async function recordRetiredLogins(tx: Tx, groups: RetiredLogins[], via: string): Promise<void> {
+  for (const { projectId, region, logins } of groups) {
+    if (logins.length === 0) continue
+    await tx.auditLog.create({
+      data: {
+        action: 'DATABASE_LOGIN_RETIRED',
+        type: 'security',
+        details: JSON.stringify({ projectId, region, logins, via }),
+        timestamp: new Date(),
+      },
+    })
+  }
+}
+
+/**
+ * After the deletion has committed: end any session that outlived the retirement, and say what is still retired.
  *
  * A session that logged in between a helper ending the login's sessions and the commit outlived them, because the
  * login was LOGIN until the commit; it is NOLOGIN now, so ending its sessions once more leaves none. The helpers are
  * idempotent, and the second answer is the one reported: a login the platform step dropped after its region retired
- * it (one cluster serving both) is not reported as retired.
+ * it (one cluster serving both) is not reported as retired. Bounded like the deletion's own transactions, so a lock
+ * cannot hold the response of a deletion that has already committed.
  *
- * A retirement means something outside the project's database, typically a copy of its data, still names the login,
- * and the deletion has already been reported to the user as done. So each one is a warning with a stable tag for
- * alarms, and an audit row kept apart from the project (projectId unset) so the project's cascade does not take it.
+ * Each retirement is a warning with a stable tag for alarms; recordRetiredLogins already wrote its audit row.
  *
  * Never throws: the deletion is committed. A failure here leaves the pre-commit list as the answer.
  */
@@ -374,10 +394,14 @@ async function settleRetiredLogins(groups: RetiredLogins[], via: string): Promis
     let still = logins
     try {
       const db = region === HOME_REGION ? prisma : regionRawClient(region, projectId)
-      still = await db.$transaction((tx) => dropRoles(tx as Tx, logins), {
-        timeout: TRANSACTION_TIMEOUT_MS,
-        maxWait: TRANSACTION_MAX_WAIT_MS,
-      })
+      still = await db.$transaction(
+        async (tx) => {
+          await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`)
+          await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT}'`)
+          return dropRoles(tx as Tx, logins)
+        },
+        { timeout: TRANSACTION_TIMEOUT_MS, maxWait: TRANSACTION_MAX_WAIT_MS },
+      )
     } catch (err: any) {
       console.warn(`[LoginRetired] project=${projectId} second pass failed reason=${err?.name || 'Error'}`)
     }
@@ -385,18 +409,9 @@ async function settleRetiredLogins(groups: RetiredLogins[], via: string): Promis
     retired.push(...still)
     console.warn(
       `[LoginRetired] project=${projectId} region=${region} logins=${still.join(',')} via=${via}: ` +
-        'something outside the project database still names them; they cannot log in, and are dropped once that is removed',
+        'something outside the project database still names them; they cannot log in, and stay until an operator ' +
+        'removes what names them and drops them (audit DATABASE_LOGIN_RETIRED)',
     )
-    await prisma.auditLog
-      .create({
-        data: {
-          action: 'DATABASE_LOGIN_RETIRED',
-          type: 'security',
-          details: JSON.stringify({ projectId, region, logins: still, via }),
-          timestamp: new Date(),
-        },
-      })
-      .catch(() => {})
   }
   return [...new Set(retired)]
 }
@@ -595,6 +610,14 @@ export async function deleteProjectCompletely(projectId: string): Promise<Deleti
 
       const result = await purgeProjectInTransaction(tx, projectId, region)
       result.schemas.unshift(...regional.schemas)
+      await recordRetiredLogins(
+        tx,
+        [
+          { projectId, region, logins: regional.retiredLogins },
+          { projectId, region: HOME_REGION, logins: result.retiredLogins },
+        ],
+        'project deletion',
+      )
 
       // Cascades every dependent Prisma table, including WorkspaceBranch and
       // WorkspaceBackup — so a constraint failure rolls back the drops.
@@ -705,6 +728,7 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
         allJobIds.push(result.jobId)
         homeRetired.push({ projectId: project.id, region: HOME_REGION, logins: result.retiredLogins })
       }
+      await recordRetiredLogins(tx, [...retiredGroups, ...homeRetired], 'account deletion')
 
       // The account's own AI usage and credit balances, which do not cascade.
       await purgeAccountState(tx, userId)

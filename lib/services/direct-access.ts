@@ -279,16 +279,27 @@ export async function revokeDirectAccess(projectId: string, mode: DirectAccessMo
   // that database still names is retired instead (NOLOGIN, no password) and the
   // helper answers false: revoked either way, since it can no longer log in.
   const db = await workspaceRawClient(projectId)
-  const [{ gone }] = await db.$queryRaw<{ gone: boolean }[]>`
+  let [{ gone }] = await db.$queryRaw<{ gone: boolean }[]>`
     SELECT public.backenly_direct_drop_role(${existing.roleName}) AS gone`
   if (!gone) {
     // NOLOGIN only from the call's own commit, so a session that logged in
-    // during it is ended by a second call (see public.backenly_direct_drop_role).
-    // Deleting the project later reaches the login again by its derived name.
-    await db.$queryRaw`SELECT public.backenly_direct_drop_role(${existing.roleName})`
+    // during it is ended by a second call (see public.backenly_direct_drop_role),
+    // whose answer is the one recorded. The login is already retired, so a
+    // failure here does not hold the revocation back. Deleting the project
+    // later reaches the login again by its derived name.
+    try {
+      const [again] = await db.$queryRaw<{ gone: boolean }[]>`
+        SELECT public.backenly_direct_drop_role(${existing.roleName}) AS gone`
+      gone = Boolean(again?.gone)
+    } catch (err: any) {
+      console.warn(`[LoginRetired] project=${projectId} second call failed reason=${err?.name || 'Error'}`)
+    }
+  }
+  if (!gone) {
     console.warn(
       `[LoginRetired] project=${projectId} logins=${existing.roleName} via=credential revocation: ` +
-        'something outside the project database still names it; it cannot log in, and is dropped once that is removed',
+        'something outside the project database still names it; it cannot log in, and stays until an operator ' +
+        'removes what names it and drops it, or the project is deleted after that',
     )
   }
   await prisma.databaseCredential.delete({ where: { id: existing.id } })
