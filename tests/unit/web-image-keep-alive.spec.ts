@@ -25,7 +25,7 @@ import { connect, type Socket } from 'node:net'
 import { join } from 'node:path'
 
 const DOCKERFILE = join(__dirname, '..', '..', 'docker', 'web.Dockerfile')
-/** An AWS ALB's default idle timeout, which Backenly Cloud's load balancers keep. */
+/** An AWS ALB's default idle timeout. */
 const LOAD_BALANCER_IDLE_MS = 60_000
 
 /** KEY=VALUE pairs of every ENV instruction in the final stage, continuation lines joined. */
