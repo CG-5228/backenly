@@ -754,6 +754,13 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
       await prisma.auditLog
         .deleteMany({ where: { action: 'DATABASE_LOGIN_RETIRED', OR: created.map((id) => ({ details: { contains: id } })) } })
         .catch(() => {})
+      // The deletions here leave their projects' purge jobs waiting for the
+      // region's scheduler, which this process is not. Left in the shared test
+      // database, they fill the scheduler's batch for the next suite that runs
+      // it (project-region.spec.ts), so they go with the projects.
+      await prisma.backgroundJob
+        .deleteMany({ where: { type: 'purge_project', OR: created.map((id) => ({ payload: { path: ['projectId'], equals: id } })) } })
+        .catch(() => {})
     }
   })
 
@@ -902,6 +909,49 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
 
     expect(result.retiredLogins).toEqual([])
     expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = ANY($1)`, [logins])).toEqual([])
+  })
+
+  it('a function login a failed deletion retired in the region is found and recorded by the retry', async () => {
+    // The region's step commits before the platform's (dropRegionalProjectData).
+    // When the platform step then fails, the region's schema is already gone, so
+    // the retry cannot derive the function login from it: the name comes from
+    // the project instead, and the retry records the retirement.
+    const { deleteProjectCompletely } = await import('@/lib/projects/delete')
+    const { projectId, schema, logins } = await projectWithLogins()
+    const fn = logins.find((login) => login.startsWith('bkn_fn_'))!
+    const other = await anotherDatabaseNaming(schema, [fn])
+    const refuse = `refuse_regional_${randomUUID().replace(/-/g, '').slice(0, 8)}`
+    await prisma.$executeRawUnsafe(
+      `CREATE FUNCTION public."${refuse}"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused for the test'; END $$`,
+    )
+    await prisma.$executeRawUnsafe(
+      `CREATE TRIGGER "${refuse}" BEFORE DELETE ON public.projects FOR EACH ROW WHEN (OLD.id = '${projectId}') EXECUTE FUNCTION public."${refuse}"()`,
+    )
+    try {
+      await expect(deleteProjectCompletely(projectId)).rejects.toThrow(/refused for the test/)
+    } finally {
+      await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${refuse}" ON public.projects`)
+      await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public."${refuse}"()`)
+    }
+    try {
+      // The region's step stands: its schema is gone and the login retired.
+      // The platform's rolled back: the project is still there.
+      expect(await rows(superUrl(), `SELECT 1 FROM pg_namespace WHERE nspname = $1`, [schema])).toEqual([])
+      expect(await loginStates([fn])).toEqual([{ rolname: fn, login: false, no_password: true }])
+      expect(await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } })).toEqual({ id: projectId })
+
+      const result = await deleteProjectCompletely(projectId)
+
+      expect(result.retiredLogins).toEqual([fn])
+      const audit = await prisma.auditLog.findFirst({
+        where: { action: 'DATABASE_LOGIN_RETIRED', details: { contains: projectId } },
+        select: { details: true },
+      })
+      expect(JSON.parse(String(audit?.details))).toMatchObject({ projectId, region: REGION, logins: [fn] })
+    } finally {
+      await rows(superUrl(), `DROP DATABASE IF EXISTS ${other} WITH (FORCE)`)
+    }
+    expect(await rows(loginUrl('backenly_app'), `SELECT public.backenly_fn_role_drop($1) AS gone`, [fn])).toEqual([{ gone: true }])
   })
 
   it('that only a database-level privilege the definer cannot revoke still names are retired, not left to fail the deletion', async () => {

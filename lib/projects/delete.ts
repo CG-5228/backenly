@@ -258,15 +258,17 @@ async function credentialRoleNames(db: Pick<Tx, 'databaseCredential'>, projectId
 }
 
 /**
- * Every login the project may own: its credentials' roles, its direct-access
- * names by derivation, and one function role per schema. The derived names
- * reach a login whose credential row is already gone, such as one retired when
- * its credential was revoked (revokeDirectAccess). dropRoles skips any that
- * does not exist.
+ * Every login the project may own: its credentials' roles, the names derived
+ * from the project (direct access, and the function login of its own schema),
+ * and one function login per schema still found. The derived names reach a
+ * login nothing else leads to any more: one retired when its credential was
+ * revoked (revokeDirectAccess), or a function login a region retired in a
+ * deletion whose platform step then failed, which dropped the schema its name
+ * was derived from. dropRoles skips any that does not exist.
  */
 function projectRoleNames(projectId: string, credentialRoles: string[], schemas: string[]): string[] {
   const { ro, rw } = directAccessRoleNames(projectId)
-  const fnRoles = schemas.map((schema) => functionRoleName(schema))
+  const fnRoles = [workspaceSchemaName(projectId), ...schemas].map((schema) => functionRoleName(schema))
   return [...new Set([...credentialRoles, ro, rw, ...fnRoles])].filter((name) => /^bkn_(ro|rw|fn)_[0-9a-f]{12}$/.test(name))
 }
 
