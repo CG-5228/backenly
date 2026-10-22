@@ -119,12 +119,22 @@ REVOKE ALL ON FUNCTION public.backenly_fn_role_sync(text, text) FROM PUBLIC;
 -- public.backenly_direct_drop_role in scripts/setup-direct-access.sql, and the
 -- grant goes with the role. The schema need not exist any more: a deletion
 -- drops it first, so the name is checked against the shape the sync gives it.
+--
+-- DROP OWNED reaches only the current database. When anything outside it still
+-- names the login (another database's grant, or a database-level privilege or
+-- object this definer cannot clear), DROP ROLE fails with 2BP01 and the
+-- deletion with it, so the login is retired instead, NOLOGIN with no password,
+-- and the result is false. public.backenly_direct_drop_role explains why
+-- nothing outside is touched and why the caller calls again after its commit.
+-- True means the login is gone.
 CREATE OR REPLACE FUNCTION public.backenly_fn_role_drop(p_role text)
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
+DECLARE
+  granted boolean := false;
 BEGIN
   IF p_role IS NULL OR p_role !~ '^bkn_fn_[0-9a-f]{12}$' THEN
     RAISE EXCEPTION 'not a function role: %', p_role USING ERRCODE = '22023';
@@ -137,9 +147,24 @@ BEGIN
     EXECUTE format(CASE WHEN current_setting('server_version_num')::int >= 160000
                         THEN 'GRANT %I TO %I WITH INHERIT TRUE, SET FALSE'
                         ELSE 'GRANT %I TO %I' END, p_role, current_user);
+    granted := true;
   END IF;
   PERFORM pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = p_role;
   EXECUTE format('DROP OWNED BY %I', p_role);
+
+  IF EXISTS (
+    SELECT 1 FROM pg_shdepend s
+     WHERE s.refclassid = 'pg_authid'::regclass
+       AND s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = p_role)
+       AND s.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database())
+  ) THEN
+    EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', p_role);
+    IF granted THEN
+      EXECUTE format('REVOKE %I FROM %I', p_role, current_user);
+    END IF;
+    RETURN false;
+  END IF;
+
   EXECUTE format('DROP ROLE %I', p_role);
   RETURN true;
 END;
