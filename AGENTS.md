@@ -53,7 +53,7 @@ design is `docs/CHANGE_RECOVERY.md`.
 - Anything that destroys data in a schema change (drop a table or column, a lossy retype, a data rewrite) goes through `lib/changes/preserve.ts`, so the data moves into the change's vault instead.
 - Verification is Backenly's (`lib/changes/verify.ts`), never the caller's: nothing an agent passes can skip or weaken it.
 - A restore never silently removes or overwrites data written since the change. If it would, it waits for a person, who approves exactly the measured effect.
-- Agents can request a restore (`deploy { action: "revert_change" }`); only a person approves one.
+- Agents can request a restore, of one change (`deploy { action: "revert_change" }`) or of the backend to a published version (`deploy { action: "rollback" }`); only a person approves one, and what runs is the list Backenly measured when it was asked for.
 
 ### 4. Feature Placement Rule (Do Not Violate)
 

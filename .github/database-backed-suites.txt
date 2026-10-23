@@ -1406,6 +1406,14 @@ tests/integration/change-history-everything.spec.ts
 # catalog.
 tests/integration/change-restore-to.spec.ts
 
+# An agent's rollback is a request to restore the backend to a published
+# version: parked with Backenly's list of the changes it would undo, whichever
+# door asked; a project admin's approval undoes exactly that list, by the
+# approver, and records the version as current; a history that moved since the
+# approval runs nothing; a version never published, or with nothing since, is
+# refused with nothing queued. Real catalog.
+tests/integration/agent-version-restore.spec.ts
+
 # Each region's scheduler settles its own projects' interrupted changes and drops
 # their vaults past the window, and leaves another region's projects to that
 # region; a region it cannot reach is skipped and the skip recorded.

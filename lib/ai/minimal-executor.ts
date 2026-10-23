@@ -1523,7 +1523,7 @@ CONNECT FRONTEND:
 
 DEPLOY:
 - TRIGGER_DEPLOY - Deploy backend to cloud
-- ROLLBACK_DEPLOY - Rollback to previous deployment
+- ROLLBACK_DEPLOY - Ask a person to restore the backend to a published version (never runs here)
 - GET_DEPLOY_STATUS - Get deployment status
 - SET_ENV_VAR - Set environment variable
 
@@ -9851,48 +9851,22 @@ export function normalizeConstraintDef(def: string): string {
 // ============================================================================
 
 /**
- * DEPLOY: Rollback Deploy — not yet supported, returns honest error
+ * ROLLBACK_DEPLOY: never runs here. Restoring the backend to a published
+ * version undoes every change made since, so it is a person's decision: an
+ * agent's deploy { action: "rollback" } is parked with Backenly's list of what
+ * it would undo (lib/mcp/approvals.ts), and approving it runs the brain tool,
+ * not this action (lib/ai/brain/tools.ts). A person can also run it from
+ * History or Deploy. This used to move the version label alone, which looked
+ * like a rollback and undid nothing.
  */
-async function executeRollbackDeploy(params: any, projectId: string): Promise<ExecutionResult> {
-  try {
-    const { prisma } = await import('@/lib/db')
-    const project = await prisma.project.findUnique({
-      where: { id: projectId },
-      select: { userId: true },
-    })
-    if (!project?.userId) return { success: false, message: 'Project not found', error: 'Project not found' }
-
-    const { rollbackDeploy } = await import('@/lib/deployment/rollback')
-    const force = !!(params?.force || params?.confirmed)
-    const { actorUserId, actorVia } = deployActor(params, project.userId)
-    const result = await rollbackDeploy({
-      projectId,
-      userId: actorUserId,
-      deploymentId: params?.deploymentId,
-      version: typeof params?.version === 'number' ? params.version : undefined,
-      confirmedBy: actorVia,
-      force,
-    })
-
-    if (result.kind === 'error') {
-      return { success: false, message: result.error, error: result.error, data: { code: result.code } }
-    }
-
-    if (result.kind === 'confirmation') {
-      return {
-        success: true,
-        message: result.message,
-        data: { requiresConfirmation: true, fromVersion: result.fromVersion, toVersion: result.toVersion },
-      }
-    }
-
-    return {
-      success: true,
-      message: result.message,
-      data: { fromVersion: result.fromVersion, toVersion: result.toVersion },
-    }
-  } catch (error: any) {
-    return { success: false, message: `Rollback failed: ${error.message}`, error: error.message }
+async function executeRollbackDeploy(_params: any, _projectId: string): Promise<ExecutionResult> {
+  return {
+    success: false,
+    error: 'RESTORE_NEEDS_A_PERSON',
+    message:
+      'Not run: restoring the backend to a published version shows the changes it would undo before anyone ' +
+      'approves it. Use Restore on the version in History or Deploy, or ask for it with ' +
+      'deploy { action: "rollback", version }, which waits for approval with that list. Nothing was changed.',
   }
 }
 

@@ -277,8 +277,16 @@ changed since.
 A published version marks History at the time it was published, and **Restore**
 on a version (History or Deploy) is restore to that point: the last change
 before it was published. Reached in full, the version is also recorded as the
-current one. Deploy's old rollback moved that record and nothing else; the
-agent's `deploy { action: "rollback" }` still does only that, and says so.
+current one. Deploy's old rollback moved that record and nothing else.
+
+An agent asks for the same thing with `deploy { action: "rollback", version }`.
+Backenly measures it as the console would (`describeVersionRestore`): a version
+that does not exist, or that nothing has changed since, is answered at once;
+otherwise the request is parked with Backenly's list of the changes it would
+undo, never the agent's own words. A project admin approves it in the Review
+Queue, and approving runs exactly that list (`restoreToVersion`), by the
+approver, or nothing if the history changed since. The executor's own
+`ROLLBACK_DEPLOY` runs nothing and says how to ask.
 
 ## Concurrency and idempotency
 

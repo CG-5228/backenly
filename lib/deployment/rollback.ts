@@ -245,3 +245,44 @@ export async function rollbackDeploy(
     toVersion,
   }
 }
+
+/**
+ * Record a published version as current once the backend has been restored to
+ * it (lib/changes/range.ts restoreToVersion). The restore already happened and
+ * was authorized, by the person who ran it or approved it, so this has no plan
+ * gate and no confirmation: it only says what is now true. A version already
+ * current is reported as current.
+ */
+export async function markVersionCurrent(
+  projectId: string,
+  version: number,
+  userId: string,
+  via: 'UI' | 'APPROVAL',
+): Promise<boolean> {
+  const target = await prisma.deployment.findFirst({
+    where: { projectId, environment: 'live', status: 'live', version },
+    select: { id: true, graphSnapshotId: true },
+  })
+  if (!target?.graphSnapshotId) return false
+  const graph = await prisma.backendGraph.findFirst({ where: { id: target.graphSnapshotId, projectId }, select: { id: true } })
+  if (!graph) return false
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { activeGraphId: true } })
+  if (!project) return false
+  if (project.activeGraphId === target.graphSnapshotId) return true
+  await prisma.$transaction([
+    prisma.project.update({ where: { id: projectId }, data: { activeGraphId: target.graphSnapshotId } }),
+    prisma.deployment.update({ where: { id: target.id }, data: { rolledBackTo: project.activeGraphId } }),
+    prisma.auditLog.create({
+      data: {
+        projectId,
+        userId,
+        action: 'VERSION_RESTORED',
+        type: 'deployment',
+        details: JSON.stringify({ version, deploymentId: target.id, previousGraphId: project.activeGraphId, newGraphId: target.graphSnapshotId, triggerSource: via }),
+        timestamp: new Date(),
+      },
+    }),
+  ])
+  emit('deploy.complete', projectId, { type: 'restore', version, deploymentId: target.id })
+  return true
+}
