@@ -436,9 +436,18 @@ export function WorkspaceHome({
       body: 'Part of the build is waiting on a credential. Add it in Integrations and Backenly picks up exactly where it stopped.',
       cta: { label: "See what's blocked", onClick: () => router.push(`/app/projects/${projectId}/autonomy`) },
     }
+    // Counted, and true for a live backend too: this read "A few things to
+    // clear before launch" on projects that had launched weeks earlier, and
+    // offered to "auto-fix them here" from a panel whose only action leaves.
     : hasOpenWork ? {
-      headline: 'A few things to clear before launch',
-      body: 'Backenly flagged some issues while checking the runtime. Auto-fix them here, or hand them to your coding agent.',
+      headline:
+        actionableFindings != null && actionableFindings > 0
+          ? `${actionableFindings} ${actionableFindings === 1 ? 'issue' : 'issues'} to look at`
+          : 'Something needs a look',
+      body:
+        (actionableFindings ?? 0) > 1
+          ? 'Backenly found these while checking your backend. Fix them from Autonomy, or hand them to your coding agent.'
+          : 'Backenly found this while checking your backend. Fix it from Autonomy, or hand it to your coding agent.',
       cta: { label: 'Review in Autonomy', onClick: () => router.push(`/app/projects/${projectId}/autonomy`) },
     }
     : quietState.caveat ? quietState
@@ -600,7 +609,7 @@ function BlockHeading({ children, id, hint }: { children: React.ReactNode; id: s
       <h2 id={id} className="text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-zinc-100">
         {children}
       </h2>
-      {hint && <p className="text-[13px] leading-[20px] text-zinc-500">{hint}</p>}
+      {hint && <p className="text-[13px] leading-[20px] text-faint">{hint}</p>}
     </div>
   )
 }
@@ -739,8 +748,8 @@ function AgentPanel({
             className={`group/mode flex-1 px-5 py-5 text-left transition-colors hover:bg-white/[0.02] sm:px-6 ${FOCUS_INSET}`}
           >
             <span className="flex items-center justify-between">
-              <span className="text-[12px] font-medium text-zinc-500">Autonomy mode</span>
-              <ChevronRight className="h-4 w-4 text-zinc-600 transition-all group-hover/mode:translate-x-0.5 group-hover/mode:text-zinc-300" />
+              <span className="text-[12px] font-medium text-faint">Autonomy mode</span>
+              <ChevronRight className="h-4 w-4 text-zinc-600 transition-[color,transform] duration-150 group-hover/mode:translate-x-0.5 group-hover/mode:text-zinc-300" />
             </span>
             <span className="mt-2 flex items-center gap-2.5">
               <span className={`text-[16px] font-semibold tracking-[-0.014em] ${autonomyOff ? 'text-zinc-400' : 'text-zinc-50'}`}>
@@ -754,7 +763,7 @@ function AgentPanel({
           </button>
           <div className={`flex items-start gap-2.5 border-t ${HAIRLINE} px-5 py-3.5 sm:px-6`}>
             <ShieldCheck className="mt-[2px] h-4 w-4 flex-shrink-0 text-zinc-500" strokeWidth={1.75} />
-            <p className="text-[12.5px] leading-[19px] text-zinc-500">
+            <p className="text-[12.5px] leading-[19px] text-faint">
               Auth, destructive and irreversible changes always need your approval, in every mode.
             </p>
           </div>
@@ -814,7 +823,7 @@ function LoopPanel({
             pulse={!autonomyOff}
           />
         </div>
-        <span className="text-[12px] tabular-nums text-zinc-500">
+        <span className="text-[12px] tabular-nums text-faint">
           {autonomyOff
             ? 'Records and suggests only'
             : lastReconciledIso ? `Checked ${formatRelative(lastReconciledIso)}` : 'First check running…'}
@@ -850,7 +859,7 @@ function LoopPanel({
             <span className="text-[12.5px] font-medium text-zinc-400 transition-colors group-hover/all:text-zinc-100">
               Full guardrail log, repairs and approvals
             </span>
-            <ChevronRight className="h-4 w-4 text-zinc-600 transition-all group-hover/all:translate-x-0.5 group-hover/all:text-zinc-300" />
+            <ChevronRight className="h-4 w-4 text-zinc-600 transition-[color,transform] duration-150 group-hover/all:translate-x-0.5 group-hover/all:text-zinc-300" />
           </button>
         </div>
       )}
@@ -878,10 +887,10 @@ function ReceiptRow({ item }: { item: AutonomyLastAction }) {
       <span className="line-clamp-2 min-w-0 flex-1 text-[13px] leading-[20px] text-zinc-300">
         {item.summary}
         {(item.repeat ?? 1) > 1 && (
-          <span className="ml-1.5 text-[12px] tabular-nums text-zinc-500">×{item.repeat}</span>
+          <span className="ml-1.5 text-[12px] tabular-nums text-faint">×{item.repeat}</span>
         )}
       </span>
-      <span className="flex-shrink-0 pt-px text-[12px] tabular-nums text-zinc-500">{formatRelative(item.at)}</span>
+      <span className="flex-shrink-0 pt-px text-[12px] tabular-nums text-faint">{formatRelative(item.at)}</span>
     </li>
   )
 }
@@ -1027,12 +1036,12 @@ function SelfHealingLoop({
               const clickable = s.key === 'propose' && (stats.pending ?? 0) > 0
               const IconComponent = STAGE_ICONS[s.key]
               const valueClass = `text-[28px] font-semibold leading-none tabular-nums tracking-[-0.03em] ${
-                r.accent ? 'text-violet-200' : off ? 'text-zinc-600' : active ? 'text-zinc-50' : 'text-zinc-300'
+                r.accent ? 'text-violet-200' : off ? 'text-faint' : active ? 'text-zinc-50' : 'text-zinc-300'
               }`
               const node = (
                 <>
                   <span
-                    className={`relative flex h-[46px] w-[46px] items-center justify-center rounded-xl border transition-all duration-300 select-none ${
+                    className={`relative flex h-[46px] w-[46px] items-center justify-center rounded-xl border transition-[border-color,background-color,box-shadow] duration-300 select-none ${
                       active
                         ? 'border-violet-300/70 bg-[#12131a] shadow-[0_0_24px_rgba(167,139,250,0.35)]'
                         : off ? 'border-white/[0.06] bg-[#101014]' : 'border-[#2D2D35] bg-[#101014]'
@@ -1106,7 +1115,7 @@ function SelfHealingLoop({
                     )}
                   </span>
 
-                  <span className="mt-1.5 max-w-[140px] px-1 text-center text-[12px] leading-[16px] text-zinc-500">
+                  <span className="mt-1.5 max-w-[140px] px-1 text-center text-[12px] leading-[16px] text-faint">
                     {r.unit}
                   </span>
 
@@ -1159,7 +1168,7 @@ function SelfHealingLoop({
             ) : (
               <>
                 Verify feeds the next Observe
-                <span className="hidden lg:inline">. No human at the top of the loop</span>
+                <span className="hidden lg:inline">. The loop runs every minute</span>
               </>
             )
           }
@@ -1174,7 +1183,7 @@ function AxisSpan({ label, className = '' }: { label: string; className?: string
   return (
     <div className={`flex items-center gap-2.5 ${className}`}>
       <span className="h-px flex-1 bg-gradient-to-r from-white/[0.02] to-white/[0.09]" />
-      <span className="whitespace-nowrap text-[12px] text-zinc-500">{label}</span>
+      <span className="whitespace-nowrap text-[12px] text-faint">{label}</span>
       <span className="h-px flex-1 bg-gradient-to-l from-white/[0.02] to-white/[0.09]" />
     </div>
   )
@@ -1258,7 +1267,7 @@ function ReturnCircuit({ off, live, label }: { off: boolean; live: boolean; labe
 
       {/* Why the arc exists, said once — set ON the return run like a callout
           on a circuit diagram. */}
-      <span className={`pointer-events-none absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-1/2 whitespace-nowrap ${NODE_GROUND} px-3 text-[12px] leading-[16px] text-zinc-500`}>
+      <span className={`pointer-events-none absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-1/2 whitespace-nowrap ${NODE_GROUND} px-3 text-[12px] leading-[16px] text-faint`}>
         {label}
       </span>
     </div>
@@ -1302,12 +1311,12 @@ function ResourceCards({ items }: { items: ResourceCard[] }) {
           </span>
 
           <span className="flex items-baseline gap-2">
-            <span className={`text-[28px] font-semibold leading-none tracking-[-0.03em] tabular-nums ${m.muted ? 'text-zinc-500' : 'text-zinc-50'}`}>
+            <span className={`text-[28px] font-semibold leading-none tracking-[-0.03em] tabular-nums ${m.muted ? 'text-faint' : 'text-zinc-50'}`}>
               {m.value}
             </span>
-            {m.unit && <span className="text-[13px] leading-none text-zinc-500">{m.unit}</span>}
+            {m.unit && <span className="text-[13px] leading-none text-faint">{m.unit}</span>}
             {m.meta && (
-              <span className="ml-auto whitespace-nowrap text-[12.5px] leading-none text-zinc-500 tabular-nums">{m.meta}</span>
+              <span className="ml-auto whitespace-nowrap text-[12.5px] leading-none text-faint tabular-nums">{m.meta}</span>
             )}
           </span>
         </button>
