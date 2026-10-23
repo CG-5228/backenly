@@ -33,9 +33,11 @@
  * when an entry gets stale rather than failing the build.
  *
  * Backenly claims here stay inside the audited boundary. In particular: the
- * automatic repairs are a short, fixed list, snapshots cover the
- * schema-touching repair classes rather than every change, and rollback is
- * plan-gated. None of those may be widened in copy.
+ * automatic repairs are a short, fixed list, and rollback is plan-gated.
+ * Since #545 every change is one entry in History and can be restored, alone
+ * or back to a point, but data the app wrote is never rewound and a credential
+ * never comes back (docs/CHANGE_RECOVERY.md). None of those may be widened in
+ * copy.
  *
  * Two phrases are tied to code by the unit test and must stay: the advertised
  * MCP tool count ("twenty-three advertised", lib/mcp/catalog.ts) and the
@@ -118,7 +120,7 @@ const LIST: ComparisonData[] = [
     category: 'Open-source Postgres platform',
     metaTitle: 'Backenly vs Supabase: same Postgres, different workflow',
     metaDescription:
-      'Both serve PostgreSQL through PostgREST, so queries look the same. The difference: who writes schema changes and access rules, and who looks after the backend.',
+      'Same Postgres and query API. Supabase leaves migrations, restores and fixes to you. Backenly checks each change, can undo a single one and fixes safe problems.',
     positioning:
       'The same Postgres and query API. The difference is who handles schema changes, access rules and upkeep.',
     headline: 'Backenly vs. Supabase',
@@ -156,7 +158,7 @@ const LIST: ComparisonData[] = [
       {
         aspect: 'Schema changes',
         competitor: 'Migrations you write and run',
-        backenly: 'Each change recorded on one path, with a restore point before schema changes',
+        backenly: 'Every change recorded in one History, restorable on its own or back to a point',
         practical: 'Supabase leaves every decision to you. Backenly keeps a record and a way back.',
       },
       {
@@ -166,6 +168,12 @@ const LIST: ComparisonData[] = [
         practical: 'Both can drop a table. Only Backenly asks a person first.',
       },
       {
+        aspect: 'Undoing a bad change',
+        competitor: 'Restore a daily backup, or a point in time with the PITR add-on; the project is offline while it restores',
+        backenly: 'Restore that one change from History, checked first; anything that would touch later data waits for you',
+        practical: 'A backup takes the whole project back. Backenly undoes one change and leaves the rest as it is.',
+      },
+      {
         aspect: 'Row-level security',
         competitor: 'You write the policies; its guide calls for a pgTAP test suite',
         backenly: 'Your policy SQL is installed as written and read back; known mistakes are checked',
@@ -173,9 +181,9 @@ const LIST: ComparisonData[] = [
       },
       {
         aspect: 'After launch',
-        competitor: 'Logs and metrics; you respond',
+        competitor: 'Advisors flag security and performance issues; you run the fix',
         backenly: 'Self-healing fixes a short list of safe problems; risky ones wait for a person',
-        practical: 'Anything it cannot fix safely is reported, like any monitor.',
+        practical: 'Both find problems. Backenly applies a short list of safe fixes itself and reports the rest.',
       },
       {
         aspect: 'Preview environments',
@@ -233,7 +241,7 @@ const LIST: ComparisonData[] = [
     backenlyStrengths: [
       {
         title: 'One recorded path for every change',
-        body: 'Schema changes from the dashboard, an agent or self-healing all take the same path, which is what makes the history, restore points and approvals possible.',
+        body: 'Changes from the dashboard, an agent or self-healing, to the schema, auth, storage, functions or keys, all take the same path into one History, which is what makes restores and approvals possible.',
       },
       {
         title: 'Policies installed as written',
@@ -321,6 +329,18 @@ const LIST: ComparisonData[] = [
         source: 'https://github.com/supabase/supabase',
         verifiedOn: '2026-09-02',
       },
+      {
+        claim:
+          'Supabase backs up Pro, Team and Enterprise projects daily. Point-in-Time Recovery is an add-on on those plans, and the project is inaccessible while a restore runs.',
+        source: 'https://supabase.com/docs/guides/platform/backups',
+        verifiedOn: '2026-10-24',
+      },
+      {
+        claim:
+          "Supabase's Security and Performance Advisors flag health, security and performance issues. The documented fixes are SQL or settings changes the user runs.",
+        source: 'https://supabase.com/docs/guides/database/database-advisors',
+        verifiedOn: '2026-10-24',
+      },
     ],
   },
 
@@ -331,7 +351,7 @@ const LIST: ComparisonData[] = [
     category: 'Google mobile and app platform',
     metaTitle: 'Backenly vs Firebase: Postgres or a document database',
     metaDescription:
-      'Firebase is a document database with mature mobile SDKs. Backenly is relational PostgreSQL with every structural change recorded. Choose the data model first.',
+      'Firebase: documents and mature mobile SDKs. Backenly: relational Postgres that checks each schema change and repairs itself. The data model decides most of it.',
     positioning: 'Documents and strong mobile SDKs, or relational Postgres. The data model decides most of it.',
     headline: 'Backenly vs. Firebase',
     intro:
@@ -388,6 +408,12 @@ const LIST: ComparisonData[] = [
         competitor: 'Realtime Database and Firestore listeners, a core strength',
         backenly: 'Database changes, sent live over server-sent events',
         practical: 'Both send live updates. Only Firebase pairs them with offline support.',
+      },
+      {
+        aspect: 'Undoing a bad change',
+        competitor: 'Point-in-time recovery keeps 7 days: read past versions and write them back, or clone the database',
+        backenly: 'Restore that one change from History, checked first; anything that would touch later data waits for you',
+        practical: 'Firestore recovers documents. Backenly undoes one schema change and never drops later data without asking.',
       },
       {
         aspect: 'Monitoring and fixes',
@@ -514,6 +540,12 @@ const LIST: ComparisonData[] = [
           'Cloud Firestore offline persistence is supported on Android, Apple platforms, and web, and is enabled by default on Android and Apple platforms. On web it is off by default and must be enabled explicitly.',
         source: 'https://firebase.google.com/docs/firestore/manage-data/enable-offline',
         verifiedOn: '2026-09-02',
+      },
+      {
+        claim:
+          'Firestore point-in-time recovery keeps 7 days. Recovery is a read of documents at a past timestamp written back to the live database, or a clone or export of the database at that timestamp.',
+        source: 'https://firebase.google.com/docs/firestore/pitr',
+        verifiedOn: '2026-10-24',
       },
     ],
   },
@@ -719,7 +751,7 @@ const LIST: ComparisonData[] = [
       {
         aspect: 'Schema changes',
         competitor: 'Migrations you write, review and run',
-        backenly: 'Each change recorded on one path, with a restore point before schema changes',
+        backenly: 'Every change recorded in one History, restorable on its own or back to a point',
         practical: 'Both work. One puts the review in your pull request, the other in the platform.',
       },
       {
