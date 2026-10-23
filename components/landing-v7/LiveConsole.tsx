@@ -142,9 +142,10 @@ const BEATS: Array<{ chapter: number; hold: number; set: Partial<View> }> = [
   { chapter: 1, hold: 800, set: { phase: 2 } },
   { chapter: 1, hold: 1000, set: { phase: 3, apply: 1, detect: 1 } },
   { chapter: 1, hold: 1700, set: { phase: 4, verify: '100%', receipts: ['index'] } },
-  // ── Approve ──
+  // ── Approve: once it is pressed nothing waits, so the Overview's panel
+  //    closes here, behind this page, not under the cut back to it ──
   { chapter: 2, hold: 2300, set: { page: 'autonomy' } },
-  { chapter: 2, hold: 1100, set: { pressed: true } },
+  { chapter: 2, hold: 1100, set: { pressed: true, propose: 0 } },
   // ── Watch ──
   {
     chapter: 3,
@@ -590,16 +591,14 @@ function OverviewPage({ view, quiet }: { view: View; quiet: boolean }) {
     <div className="absolute inset-x-0 top-0 text-[13px]">
       <div className="px-[37px] pb-[16px] pt-[26px] text-[22px] font-semibold tracking-[-0.02em] text-zinc-50">UrbanCart</div>
 
-      {/* Agent panel, only while a change waits on you. It opens the way a
-          receipt does below and closes at once: it closes only as the Watch
-          chapter cuts back to this page, where a closing panel would move
-          the loop under the cut. */}
+      {/* Agent panel, only while a change waits on you. It opens and closes
+          the way a receipt does below (176 = its 164 plus the 12 below it). */}
       <div
         className="overflow-hidden"
         style={{
           maxHeight: holding ? 176 : 0,
           opacity: holding ? 1 : 0,
-          transition: quiet || !holding ? 'none' : `max-height 500ms ${EASE}, opacity 400ms ${EASE}`,
+          transition: quiet ? 'none' : `max-height 500ms ${EASE}, opacity 400ms ${EASE}`,
         }}
       >
         <div className="mx-[37px] mb-[12px] flex h-[164px] rounded-[10px] border border-white/[0.08] bg-white/[0.015]">
@@ -649,7 +648,7 @@ function OverviewPage({ view, quiet }: { view: View; quiet: boolean }) {
           {LOOP.map((node, i) => {
             const lit = i === view.phase
             const NodeIcon = node.icon
-            const accent = i === 2 && view.propose > 0
+            const accent = i === 2 && holding
             return (
               <div key={node.label} className="relative flex flex-col items-center text-center">
                 <span
