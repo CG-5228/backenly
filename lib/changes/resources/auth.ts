@@ -14,7 +14,7 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
-import { changedSecrets, secretDigest, type Irreversible, type ResourceAdapter, type ResourceItem, type ResourceOp, type Tx } from './core'
+import { changedSecrets, encryptedVersion, secretDigest, type Irreversible, type ResourceAdapter, type ResourceItem, type ResourceOp, type Tx } from './core'
 
 export const authAdapter: ResourceAdapter = {
   id: 'auth',
@@ -54,7 +54,7 @@ export const authAdapter: ResourceAdapter = {
       out['smtp'] = {
         label: 'email sender (SMTP)',
         fields: { enabled: smtp.enabled, host: smtp.host, port: smtp.port, username: smtp.username, fromAddress: smtp.fromAddress, fromName: smtp.fromName },
-        secrets: { password: secretDigest(smtp.passwordCipher, smtp.passwordIv, smtp.passwordTag) },
+        secrets: { password: encryptedVersion(smtp.passwordIv) },
       }
     }
     for (const t of templates) {

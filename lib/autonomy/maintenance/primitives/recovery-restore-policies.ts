@@ -43,6 +43,8 @@ import { queryWorkspace, resolveWorkspaceSchema, withWorkspaceTransaction } from
 
 /** These reach raw DDL. Both come from the ledger, and both are checked anyway. */
 const IDENT = /^[a-zA-Z_][a-zA-Z0-9_]*$/
+/** The commands CREATE POLICY takes (pg_policies.cmd). */
+const POLICY_COMMANDS: ReadonlySet<string> = new Set(['ALL', 'SELECT', 'INSERT', 'UPDATE', 'DELETE'])
 
 /** One policy, in the detail needed to recreate it exactly. */
 export interface CapturedPolicy {
@@ -211,19 +213,32 @@ export async function recoveryRestorePolicies(
   }
   for (const p of observedPreState.policies) {
     if (!IDENT.test(p.name)) return { status: 'failed', message: `Refusing to recreate policy "${p.name}"` }
+    // Only what CREATE POLICY accepts. Anything else is refused, never read as
+    // ALL: a policy re-created for more commands than it had widens access.
+    if (p.cmd && !POLICY_COMMANDS.has(p.cmd.toUpperCase())) {
+      return { status: 'failed', message: `Refusing to recreate policy "${p.name}" for command "${p.cmd}"` }
+    }
+    if (p.permissive && !['PERMISSIVE', 'RESTRICTIVE'].includes(p.permissive.toUpperCase())) {
+      return { status: 'failed', message: `Refusing to recreate policy "${p.name}" as "${p.permissive}"` }
+    }
   }
   try {
     await withWorkspaceTransaction(projectId, async (client) => {
+      // Every name is quoted by the driver, whatever it holds. The policy
+      // expressions are SQL by nature: they were read from pg_policies by
+      // capturePolicies, and PostgreSQL has no parameter for one.
+      const id = (name: string) => client.escapeIdentifier(name)
+      const on = `${id(schema)}.${id(table)}`
       for (const p of live.policies) {
-        await client.query(`DROP POLICY "${p.name}" ON "${schema}"."${table}"`)
+        await client.query(`DROP POLICY ${id(p.name)} ON ${on}`)
       }
 
       for (const p of observedPreState.policies) {
-        const parts = [`CREATE POLICY "${p.name}" ON "${schema}"."${table}"`]
+        const parts = [`CREATE POLICY ${id(p.name)} ON ${on}`]
         if (p.permissive?.toUpperCase() === 'RESTRICTIVE') parts.push('AS RESTRICTIVE')
         if (p.cmd && p.cmd.toUpperCase() !== 'ALL') parts.push(`FOR ${p.cmd.toUpperCase()}`)
         if (p.roles.length > 0 && !(p.roles.length === 1 && p.roles[0] === 'public')) {
-          parts.push(`TO ${p.roles.map(r => `"${r}"`).join(', ')}`)
+          parts.push(`TO ${p.roles.map((r) => (r === 'public' ? 'PUBLIC' : id(r))).join(', ')}`)
         }
         if (p.qual) parts.push(`USING (${p.qual})`)
         if (p.withCheck) parts.push(`WITH CHECK (${p.withCheck})`)
@@ -234,10 +249,10 @@ export async function recoveryRestorePolicies(
       // leaving the table unprotected would restore the rules and not the
       // protection.
       if (observedPreState.rlsEnabled !== live.rlsEnabled) {
-        await client.query(`ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsEnabled ? 'ENABLE' : 'DISABLE'} ROW LEVEL SECURITY`)
+        await client.query(`ALTER TABLE ${on} ${observedPreState.rlsEnabled ? 'ENABLE' : 'DISABLE'} ROW LEVEL SECURITY`)
       }
       if (observedPreState.rlsForced !== live.rlsForced) {
-        await client.query(`ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsForced ? 'FORCE' : 'NO FORCE'} ROW LEVEL SECURITY`)
+        await client.query(`ALTER TABLE ${on} ${observedPreState.rlsForced ? 'FORCE' : 'NO FORCE'} ROW LEVEL SECURITY`)
       }
     })
   } catch (err: any) {

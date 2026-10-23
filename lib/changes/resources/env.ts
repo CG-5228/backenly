@@ -7,7 +7,7 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
-import { changedSecrets, secretDigest, type Irreversible, type ResourceAdapter, type ResourceItem, type ResourceOp, type Tx } from './core'
+import { changedSecrets, encryptedVersion, type Irreversible, type ResourceAdapter, type ResourceItem, type ResourceOp, type Tx } from './core'
 
 export const envAdapter: ResourceAdapter = {
   id: 'env',
@@ -19,7 +19,7 @@ export const envAdapter: ResourceAdapter = {
       out[`env:${v.key}`] = {
         label: `environment variable ${v.key}`,
         fields: { key: v.key, description: v.description },
-        secrets: { value: secretDigest(v.valueCipher, v.valueIv, v.valueTag) },
+        secrets: { value: encryptedVersion(v.valueIv) },
       }
     }
     return out

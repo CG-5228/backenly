@@ -95,6 +95,16 @@ export interface ResourceAdapter {
   afterCommit?(projectId: string, op: ResourceOp): Promise<void>
 }
 
+/**
+ * Which encryption of a secret is stored: the IV of one sealed by
+ * lib/security/projectEnvCrypto.ts. AES-GCM needs a fresh one for every
+ * encryption and it is not secret, so it tells a re-saved secret from the one
+ * before without hashing anything taken from the secret.
+ */
+export function encryptedVersion(iv: string | null | undefined): string {
+  return `iv:${iv ?? ''}`
+}
+
 /** A digest of a stored secret: its ciphertext or hash, never its value. */
 export function secretDigest(...stored: Array<string | null | undefined>): string {
   return `sha256:${createHash('sha256').update(stored.map((s) => s ?? '').join('\u0000')).digest('hex').slice(0, 32)}`

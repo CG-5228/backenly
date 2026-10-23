@@ -44,8 +44,9 @@ is recorded by `lib/changes/resources`, one adapter each:
 | integrations | stored keys, which integrations are switched on | switches; a key the change stored is removed | a stored key; a switch turned off with its key stays off with it |
 
 A credential never comes back, whoever asks (Cloudflare's rule for its own
-tokens): what is kept of one is a digest, so a restore can tell that it
-changed and cannot put it back. A restore that would leave one as the change
+tokens): what is kept of one is a digest of its hash or ciphertext, or the IV
+that identifies its encryption, so a restore can tell that it changed and
+cannot put it back. A restore that would leave one as the change
 made it says so and needs a person who approves exactly that; a change that only
 did what cannot be undone (revoking a key) offers no restore at all.
 
@@ -116,7 +117,8 @@ Taken under the project's change lock before the first statement
 The checkpoint is resource-typed: `checkpoint.database` holds the catalog,
 `checkpoint.resources` every item of the rest of the backend the change touched,
 as it was (`resultState.resources`, as the change left it). A secret is kept as a
-digest of its ciphertext or hash, never its value. The record's `resources`
+digest of its hash or ciphertext, or as the IV of its encryption, never its
+value. The record's `resources`
 column says which parts it touched, for History's filters.
 
 Integrity: the restore point, result state and footprint are hashed when the
