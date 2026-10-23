@@ -39,7 +39,7 @@
  * one of them has not restored anything.
  */
 
-import { executeWorkspace, queryWorkspace, resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
+import { queryWorkspace, resolveWorkspaceSchema, withWorkspaceTransaction } from '@/lib/services/workspace-pool'
 
 /** These reach raw DDL. Both come from the ledger, and both are checked anyway. */
 const IDENT = /^[a-zA-Z_][a-zA-Z0-9_]*$/
@@ -199,51 +199,51 @@ export async function recoveryRestorePolicies(
     }
   }
 
-  // ── The inverse ──────────────────────────────────────────────────────────
+  // ── The inverse, all of it or none of it ─────────────────────────────────
+  //
+  // One transaction. Run a statement at a time, a failure part-way (a bad
+  // expression, a lock timeout, a dropped connection) left the table with some
+  // of its policies gone and the rest not back: fewer permissive policies hide
+  // rows, a missing restrictive one opens them, and either was reported only as
+  // "failed". Rolled back, the table keeps exactly what it had.
+  for (const p of live.policies) {
+    if (!IDENT.test(p.name)) return { status: 'failed', message: `Refusing to drop policy "${p.name}"` }
+  }
+  for (const p of observedPreState.policies) {
+    if (!IDENT.test(p.name)) return { status: 'failed', message: `Refusing to recreate policy "${p.name}"` }
+  }
   try {
-    for (const p of live.policies) {
-      if (!IDENT.test(p.name)) {
-        return { status: 'failed', message: `Refusing to drop policy "${p.name}"` }
+    await withWorkspaceTransaction(projectId, async (client) => {
+      for (const p of live.policies) {
+        await client.query(`DROP POLICY "${p.name}" ON "${schema}"."${table}"`)
       }
-      await executeWorkspace(projectId, `DROP POLICY "${p.name}" ON "${schema}"."${table}"`, [])
-    }
 
-    for (const p of observedPreState.policies) {
-      if (!IDENT.test(p.name)) {
-        return { status: 'failed', message: `Refusing to recreate policy "${p.name}"` }
+      for (const p of observedPreState.policies) {
+        const parts = [`CREATE POLICY "${p.name}" ON "${schema}"."${table}"`]
+        if (p.permissive?.toUpperCase() === 'RESTRICTIVE') parts.push('AS RESTRICTIVE')
+        if (p.cmd && p.cmd.toUpperCase() !== 'ALL') parts.push(`FOR ${p.cmd.toUpperCase()}`)
+        if (p.roles.length > 0 && !(p.roles.length === 1 && p.roles[0] === 'public')) {
+          parts.push(`TO ${p.roles.map(r => `"${r}"`).join(', ')}`)
+        }
+        if (p.qual) parts.push(`USING (${p.qual})`)
+        if (p.withCheck) parts.push(`WITH CHECK (${p.withCheck})`)
+        await client.query(parts.join(' '))
       }
-      const parts = [`CREATE POLICY "${p.name}" ON "${schema}"."${table}"`]
-      if (p.permissive?.toUpperCase() === 'RESTRICTIVE') parts.push('AS RESTRICTIVE')
-      if (p.cmd && p.cmd.toUpperCase() !== 'ALL') parts.push(`FOR ${p.cmd.toUpperCase()}`)
-      if (p.roles.length > 0 && !(p.roles.length === 1 && p.roles[0] === 'public')) {
-        parts.push(`TO ${p.roles.map(r => `"${r}"`).join(', ')}`)
-      }
-      if (p.qual) parts.push(`USING (${p.qual})`)
-      if (p.withCheck) parts.push(`WITH CHECK (${p.withCheck})`)
-      await executeWorkspace(projectId, parts.join(' '), [])
-    }
 
-    // RLS flags travel with the policies: restoring the policy set while
-    // leaving the table unprotected would restore the rules and not the
-    // protection.
-    if (observedPreState.rlsEnabled !== live.rlsEnabled) {
-      await executeWorkspace(
-        projectId,
-        `ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsEnabled ? 'ENABLE' : 'DISABLE'} ROW LEVEL SECURITY`,
-        [],
-      )
-    }
-    if (observedPreState.rlsForced !== live.rlsForced) {
-      await executeWorkspace(
-        projectId,
-        `ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsForced ? 'FORCE' : 'NO FORCE'} ROW LEVEL SECURITY`,
-        [],
-      )
-    }
+      // RLS flags travel with the policies: restoring the policy set while
+      // leaving the table unprotected would restore the rules and not the
+      // protection.
+      if (observedPreState.rlsEnabled !== live.rlsEnabled) {
+        await client.query(`ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsEnabled ? 'ENABLE' : 'DISABLE'} ROW LEVEL SECURITY`)
+      }
+      if (observedPreState.rlsForced !== live.rlsForced) {
+        await client.query(`ALTER TABLE "${schema}"."${table}" ${observedPreState.rlsForced ? 'FORCE' : 'NO FORCE'} ROW LEVEL SECURITY`)
+      }
+    })
   } catch (err: any) {
     return {
       status: 'failed',
-      message: `Restoring policies on "${table}" failed: ${err?.message ?? err}`,
+      message: `Restoring policies on "${table}" failed and was rolled back, so they are as they were: ${err?.message ?? err}`,
     }
   }
 

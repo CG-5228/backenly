@@ -49,7 +49,7 @@ every step is an append-only `backend_change_events` row. Recovery plans,
 impact measurement and the restore itself are `lib/changes/recovery.ts`; the
 design is `docs/CHANGE_RECOVERY.md`.
 
-- An executor action that runs DDL belongs in `SCHEMA_CHANGE_ACTIONS` in `lib/ai/minimal-executor.ts`.
+- An executor action that runs DDL, or changes the rest of the backend (auth, storage, functions, webhooks, env vars, API keys, integrations), belongs in `GOVERNED_ACTIONS` in `lib/ai/minimal-executor.ts`; a service that changes one of those runs its write through `governedChange` (`lib/changes/ledger.ts`). One change, one history entry, one restore, whatever it touched (`lib/changes/resources/`). `scripts/assert-history-writes.ts` fails CI on a write to a recorded model that is neither governed nor explained by a `// history:` comment.
 - Anything that destroys data in a schema change (drop a table or column, a lossy retype, a data rewrite) goes through `lib/changes/preserve.ts`, so the data moves into the change's vault instead.
 - Verification is Backenly's (`lib/changes/verify.ts`), never the caller's: nothing an agent passes can skip or weaken it.
 - A restore never silently removes or overwrites data written since the change. If it would, it waits for a person, who approves exactly the measured effect.

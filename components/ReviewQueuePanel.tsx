@@ -255,7 +255,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
   const approveOne = async (
     findingId: string,
     retriesLeft = 3,
-  ): Promise<{ ok: boolean; alreadyApplied?: boolean; error?: string }> => {
+  ): Promise<{ ok: boolean; alreadyApplied?: boolean; error?: string; message?: string }> => {
     try {
       const res = await fetch(`/api/projects/${projectId}/health/approve`, {
         method: 'POST',
@@ -265,7 +265,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
       })
       const j = await res.json().catch(() => ({} as any))
 
-      if (res.ok && j?.success) return { ok: true, alreadyApplied: !!j?.alreadyApplied }
+      if (res.ok && j?.success) return { ok: true, alreadyApplied: !!j?.alreadyApplied, message: typeof j?.message === 'string' ? j.message : undefined }
 
       // 409 = lock contention (a scan/auto-fix holds the project lock). The
       // server already waits ~30s per attempt, so each retry here rides a
@@ -301,9 +301,10 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
     setRow(g.key, { phase: 'applying' })
     let applied = 0
     let firstError: string | undefined
+    let lastMessage: string | undefined
     for (const m of targets) {
       const r = await approveOne(m.id)
-      if (r.ok) applied += 1
+      if (r.ok) { applied += 1; lastMessage = r.message }
       else if (!firstError) firstError = r.error
     }
 
@@ -320,8 +321,10 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
       applied === targets.length
         ? `Fix applied${targets.length > 1 ? ` to ${applied} tables` : ''}`
         : `Applied to ${applied} of ${targets.length}`,
+      // What the server said the fix did, when there is one fix to speak for:
+      // not every fix is verified, and not every fix keeps a restore point.
       applied === targets.length
-        ? 'schema verified · rollback snapshot captured'
+        ? (targets.length === 1 && lastMessage ? lastMessage.slice(0, 160) : undefined)
         : `${targets.length - applied} left in the queue: ${firstError ?? 'see details'}`,
     )
     const t = setTimeout(async () => {
@@ -410,9 +413,12 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
         return
       }
 
+      // A call that ran and failed answers with what happened (resultSummary):
+      // a restore refused because the data moved since, or one applied and not
+      // yet confirmed. Shown as it is; "try again" is not true of either.
       setRow(approvalId, {
         phase: 'error',
-        message: j?.error || (decision === 'approve'
+        message: j?.error || j?.resultSummary || (decision === 'approve'
           ? 'The operation could not be executed. Try again in a moment.'
           : 'Could not reject. Try again.'),
       })
@@ -724,7 +730,7 @@ function AgentRequestRow({
             <span className="tabular-nums">{timeAgo(a.createdAt)}</span>
             {restore && a.changeId && (
               <a
-                href={`/app/projects/${projectId}/database?view=changes&change=${encodeURIComponent(a.changeId)}`}
+                href={`/app/projects/${projectId}/changes?change=${encodeURIComponent(a.changeId)}`}
                 className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200"
               >
                 View details
@@ -845,10 +851,9 @@ function ApprovalRow({
         <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-emerald-400" />
         <div className="min-w-0 flex-1">
           <p className="text-[12.5px] font-medium text-zinc-200">{g.title}</p>
+          {/* Only what is true of every fix: not every fix is verified, nor keeps a restore point. */}
           <MetaRow className="!mt-1">
             <span>Fixed{many ? ` on ${g.members.length} tables` : ''}</span>
-            <span>Schema verified</span>
-            <span>Rollback snapshot captured</span>
           </MetaRow>
         </div>
       </li>

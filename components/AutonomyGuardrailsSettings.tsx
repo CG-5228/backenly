@@ -7,7 +7,7 @@
  * (ReviewQueuePanel, folded in from the deleted /review-queue page), the mode,
  * what is always gated, a trust scoreboard, the changes Backenly made with
  * their way back and the recent-activity feed. Restoring the state before any
- * change is Database → Changes.
+ * change is History.
  *
  * Rebuilt 2026-10-02 on the console kit: a document page with the standard
  * header, the mode as two radio cards, the scoreboard as one stat strip and
@@ -453,12 +453,12 @@ export function AutonomyGuardrailsSettings({ projectId }: { projectId: string })
         {/* There is no "Restore points" panel here any more: it moved the active
             version and re-created what that version named, and removed nothing.
             Restoring is one thing now, the state before a governed change, from
-            Database → Changes. The footer says what is actually reversible: a
+            History. The footer says what is actually reversible: a
             repair's own changes, while their restore point is still usable. */}
         <p className="flex items-start gap-2 text-[12.5px] leading-[18px] text-faint">
           <Lock className="mt-[2px] h-3.5 w-3.5 flex-shrink-0 text-zinc-600" />
           Every autonomous action is written to the audit log. Its repairs are recorded as changes with a restore point:
-          while one can still be restored, it can be undone above or from Database → Changes.
+          while one can still be restored, it can be undone above or from History.
         </p>
       </div>
     </Shell>

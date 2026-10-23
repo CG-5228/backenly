@@ -158,7 +158,7 @@ export async function rollbackDeploy(
         `• To:   v${toVersion} — ${target.changeSummary || 'Published'}\n\n` +
         `This moves the version history's pointer. It does NOT change the live schema, ` +
         `data, RLS or functions — the API keeps serving exactly what is there now. ` +
-        `To restore structure, use Database → Changes or restore a Snapshot.\n\n` +
+        `To restore the backend itself to v${toVersion}, a person uses Restore on that version (History or Deploy).\n\n` +
         `Type ROLLBACK to confirm.`,
     }
   }
@@ -217,7 +217,8 @@ export async function rollbackDeploy(
   await recordRollbackMemory({
     projectId,
     actorId: userId,
-    summary: `Rolled back deployment from v${fromVersion} to v${toVersion}.`,
+    title: 'Recorded an older version as current',
+    summary: `Recorded v${toVersion} as the current version, in place of v${fromVersion}. The live schema and data are unchanged.`,
     reason: `Rollback requested from ${confirmedBy}.`,
     beforeState: {
       version: fromVersion,
@@ -239,7 +240,7 @@ export async function rollbackDeploy(
     message:
       `Recorded v${toVersion} as the current version. The live schema, data, RLS ` +
       `and functions are unchanged — this is version bookkeeping, not a restore. ` +
-      `To restore structure, use Database → Changes or a Snapshot.`,
+      `To restore the backend itself to v${toVersion}, a person uses Restore on that version (History or Deploy).`,
     fromVersion,
     toVersion,
   }

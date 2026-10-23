@@ -2,13 +2,14 @@
 
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
-import { useParams } from 'next/navigation'
+import { useParams, useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   AlertCircle, Cable, Check, CheckCircle2, Code2, Database, ExternalLink, Globe, HardDrive, Info, Layers, Loader2,
-  Lock, Rocket, RotateCcw, Shield, ShieldCheck, Globe2,
+  Lock, Rocket, Shield, ShieldCheck, Undo2, Globe2,
 } from 'lucide-react'
 import { EnvVarsPanel } from '@/components/inspector/EnvVarsPanel'
+import { RestoreToDialog, type RestorePoint } from '@/components/changes/RestoreToDialog'
 import { useConnectionHealth } from '@/lib/hooks/useConnectionHealth'
 import { AgentEmptyState } from '@/components/inspector/AgentEmptyState'
 import {
@@ -99,7 +100,9 @@ export default function PublishPage() {
   // Rollback and loading fail here too; the note named every failure a publish.
   const [errorTitle, setErrorTitle] = useState('The publish did not complete')
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
-  const [rollingBackId, setRollingBackId] = useState<string | null>(null)
+  // Restoring to a version is History's restore to a point (components/changes/RestoreToDialog.tsx).
+  const [restoreTo, setRestoreTo] = useState<RestorePoint | null>(null)
+  const router = useRouter()
   const [applyingFixes, setApplyingFixes] = useState(false)
   const [fixNote, setFixNote] = useState<string | null>(null)
 
@@ -232,36 +235,6 @@ export default function PublishPage() {
       await fetchAll()
     } finally {
       setPublishing(false)
-    }
-  }
-
-  const handleRollback = async (deploymentId: string, version: number) => {
-    if (rollingBackId) return
-    setRollingBackId(deploymentId)
-    setError(null)
-    setSuccessMsg(null)
-    try {
-      const response = await fetch(`/api/projects/${projectId}/rollback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ deploymentId }),
-      })
-      const data = await response.json()
-      if (!response.ok || !data.success) {
-        if (data.code === 'PLAN_LIMIT_EXCEEDED') {
-          throw new Error('Rollback is included in Pro and higher. Compare plans on the Billing page.')
-        }
-        throw new Error(data.error || 'Rollback failed')
-      }
-      setSuccessMsg(`Rolled back to Published v${version}`)
-      setTimeout(() => setSuccessMsg(null), 4000)
-      await fetchAll()
-    } catch (err: any) {
-      setErrorTitle('The rollback did not complete')
-      setError(err.message || 'Rollback failed')
-    } finally {
-      setRollingBackId(null)
     }
   }
 
@@ -541,8 +514,8 @@ export default function PublishPage() {
                       {!publishedVersions.some(v => v.isActive) && (
                         <div className="px-4 pt-3">
                           <KitNote tone="info" icon={Info}>
-                            The live backend has changed since v{publishedVersions[0]?.version} was published. Publish an
-                            update to save the current state as a version you can roll back to.
+                            The live backend has changed since v{publishedVersions[0]?.version} was published. Publish to save
+                            the current state as a new version, or restore v{publishedVersions[0]?.version} to undo the changes since.
                           </KitNote>
                         </div>
                       )}
@@ -560,7 +533,6 @@ export default function PublishPage() {
                           </thead>
                           <tbody>
                             {publishedVersions.map(version => {
-                              const isRollingBack = rollingBackId === version.id
                               return (
                                 <tr key={version.id} className={`transition-colors ${KIT.rowHoverOn}`}>
                                   <td className="border-b border-white/[0.04] px-4 py-2.5">
@@ -575,20 +547,21 @@ export default function PublishPage() {
                                   </td>
                                   <td className="whitespace-nowrap border-b border-white/[0.04] px-4 py-2 text-right">
                                     {version.isActive ? (
-                                      <StatusDot tone="operational" label="Live" />
-                                    ) : version.canRollback ? (
+                                      <StatusDot tone="operational" label="Current" />
+                                    ) : (
+                                      // The backend as it was when this was published: every change since undone, each checked.
                                       <KitButton
                                         variant="ghost"
                                         size="sm"
-                                        icon={RotateCcw}
-                                        loading={isRollingBack}
-                                        onClick={() => handleRollback(version.id, version.version)}
-                                        disabled={!!rollingBackId && !isRollingBack}
+                                        icon={Undo2}
+                                        onClick={() => setRestoreTo({
+                                          version: version.version,
+                                          label: `v${version.version}`,
+                                          detail: `Published ${formatTimeAgo(version.publishedAt)} · ${version.changeSummary}`,
+                                        })}
                                       >
-                                        {isRollingBack ? 'Rolling back…' : 'Roll back'}
+                                        Restore
                                       </KitButton>
-                                    ) : (
-                                      <span className="text-[12px] text-faint">Archived</span>
                                     )}
                                   </td>
                                 </tr>
@@ -601,6 +574,17 @@ export default function PublishPage() {
                   )}
 
                   <EnvVarsPanel projectId={projectId} />
+
+                  {restoreTo && (
+                    <RestoreToDialog
+                      projectId={projectId}
+                      point={restoreTo}
+                      onClose={() => setRestoreTo(null)}
+                      onDone={() => void fetchAll()}
+                      // The step that stopped it opens where every change is: History.
+                      onOpenChange={(id) => router.push(`/app/projects/${projectId}/changes?change=${encodeURIComponent(id)}`)}
+                    />
+                  )}
                 </>
               }
               side={
