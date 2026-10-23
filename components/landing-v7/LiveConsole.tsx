@@ -67,10 +67,10 @@ import {
    string is the product's own:
      chrome      components/shell/ProjectSidebar.tsx (icons and labels),
                  the Cloud top bar from the round-16 renders
-     Overview    components/workspace/WorkspaceHome.tsx (agent panel, loop
-                 readings and units: '—' until a fix exists, Propose
-                 accented while something waits) and health-state.ts
-                 (the quiet headline)
+     Overview    components/workspace/WorkspaceHome.tsx (agent panel, shown
+                 only while a change waits on you, as in the product since
+                 #528; loop readings and units: '—' until a fix exists,
+                 Propose accented while something waits)
      Autonomy    the Waiting-on-you and Changes cards of the r4 render
      terminal    the r3 Claude Code session; set_rls, auth, integrations
                  and realtime are advertised tools (lib/mcp/catalog.ts)
@@ -564,32 +564,20 @@ const RECEIPT_TEXT: Record<Receipt, string> = {
 }
 
 /**
- * The agent panel's two states the story passes through (WorkspaceHome.tsx):
- * the held change takes precedence over the quiet headline, as in the product.
+ * The agent panel's one state the story passes through (WorkspaceHome.tsx): the
+ * held change. With nothing waiting the product renders no panel, so neither
+ * does this copy of it.
  */
-function AgentPanelCopy({ holding, quiet }: { holding: boolean; quiet: boolean }) {
-  const fade = (on: boolean) => ({
-    opacity: on ? 1 : 0,
-    transition: quiet ? 'none' : `opacity 420ms ${EASE}`,
-  })
+function AgentPanelCopy() {
   return (
-    <div className="relative flex-1">
-      <div className="absolute inset-0 px-[23px] pt-[40px]" style={fade(!holding)} aria-hidden={holding}>
-        <div className="text-[17px] font-semibold tracking-[-0.015em] text-zinc-50">No issues detected. Self-healing on watch</div>
-        <p className="mt-[10px] max-w-[470px] text-[13px] leading-[1.45] text-zinc-400">
-          No issues found by the 26 checks of schema, APIs, auth and storage on the last pass. Backenly keeps re-checking and repairs
-          safe issues on its own. Only auth or destructive changes wait for you.
-        </p>
-      </div>
-      <div className="absolute inset-0 px-[23px] pt-[34px]" style={fade(holding)} aria-hidden={!holding}>
-        <div className="text-[17px] font-semibold tracking-[-0.015em] text-zinc-50">Waiting on your review</div>
-        <p className="mt-[10px] max-w-[470px] text-[13px] leading-[1.45] text-zinc-400">
-          Backenly prepared 1 change and is holding it. Destructive and auth-related changes never ship without your OK.
-        </p>
-        <span className="mt-[14px] inline-flex h-[28px] items-center rounded-[6px] bg-white px-[12px] text-[12.5px] font-semibold text-black">
-          Review the change
-        </span>
-      </div>
+    <div className="flex-1 px-[23px] pt-[34px]">
+      <div className="text-[17px] font-semibold tracking-[-0.015em] text-zinc-50">Waiting on your review</div>
+      <p className="mt-[10px] max-w-[470px] text-[13px] leading-[1.45] text-zinc-400">
+        Backenly prepared 1 change and is holding it. Destructive and auth-related changes never ship without your OK.
+      </p>
+      <span className="mt-[14px] inline-flex h-[28px] items-center rounded-[6px] bg-white px-[12px] text-[12.5px] font-semibold text-black">
+        Review the change
+      </span>
     </div>
   )
 }
@@ -597,35 +585,48 @@ function AgentPanelCopy({ holding, quiet }: { holding: boolean; quiet: boolean }
 function OverviewPage({ view, quiet }: { view: View; quiet: boolean }) {
   const values = [String(26), String(view.detect), String(view.propose), String(view.apply), view.verify]
   const receiptAge = (r: Receipt) => (r === 'fk' || view.receipts.length === 1 ? 'just now' : '1m ago')
+  const holding = view.propose > 0
   return (
     <div className="absolute inset-x-0 top-0 text-[13px]">
-      <div className="px-[37px] pt-[26px] text-[22px] font-semibold tracking-[-0.02em] text-zinc-50">UrbanCart</div>
+      <div className="px-[37px] pb-[16px] pt-[26px] text-[22px] font-semibold tracking-[-0.02em] text-zinc-50">UrbanCart</div>
 
-      {/* Agent panel: health-state.ts quiet headline, or the held change */}
-      <div className="mx-[37px] mt-[16px] flex h-[164px] rounded-[10px] border border-white/[0.08] bg-white/[0.015]">
-        <AgentPanelCopy holding={view.propose > 0} quiet={quiet} />
-        <div className="flex w-[267px] flex-col border-l border-white/[0.07]">
-          <div className="flex-1 px-[20px] pt-[20px]">
-            <div className="flex items-center justify-between text-[11px] text-zinc-500">
-              Autonomy mode <ChevronRight className="h-[12px] w-[12px]" />
+      {/* Agent panel, only while a change waits on you. It opens the way a
+          receipt does below and closes at once: it closes only as the Watch
+          chapter cuts back to this page, where a closing panel would move
+          the loop under the cut. */}
+      <div
+        className="overflow-hidden"
+        style={{
+          maxHeight: holding ? 176 : 0,
+          opacity: holding ? 1 : 0,
+          transition: quiet || !holding ? 'none' : `max-height 500ms ${EASE}, opacity 400ms ${EASE}`,
+        }}
+      >
+        <div className="mx-[37px] mb-[12px] flex h-[164px] rounded-[10px] border border-white/[0.08] bg-white/[0.015]">
+          <AgentPanelCopy />
+          <div className="flex w-[267px] flex-col border-l border-white/[0.07]">
+            <div className="flex-1 px-[20px] pt-[20px]">
+              <div className="flex items-center justify-between text-[11px] text-zinc-500">
+                Autonomy mode <ChevronRight className="h-[12px] w-[12px]" />
+              </div>
+              <div className="mt-[10px] flex items-center gap-[8px]">
+                <span className="text-[14px] font-semibold text-zinc-50">Autopilot</span>
+                <span className="inline-flex items-center gap-[5px] text-[11px] text-zinc-300">
+                  <Dot /> Live
+                </span>
+              </div>
+              <p className="mt-[8px] text-[12px] leading-[1.45] text-zinc-400">Safe fixes ship on their own. Everything risky waits for you.</p>
             </div>
-            <div className="mt-[10px] flex items-center gap-[8px]">
-              <span className="text-[14px] font-semibold text-zinc-50">Autopilot</span>
-              <span className="inline-flex items-center gap-[5px] text-[11px] text-zinc-300">
-                <Dot /> Live
-              </span>
+            <div className="flex gap-[8px] border-t border-white/[0.07] px-[20px] py-[10px] text-[11px] leading-[1.45] text-zinc-500">
+              <Shield className="mt-[2px] h-[12px] w-[12px] shrink-0" />
+              Auth, destructive and irreversible changes always need your approval, in every mode.
             </div>
-            <p className="mt-[8px] text-[12px] leading-[1.45] text-zinc-400">Safe fixes ship on their own. Everything risky waits for you.</p>
-          </div>
-          <div className="flex gap-[8px] border-t border-white/[0.07] px-[20px] py-[10px] text-[11px] leading-[1.45] text-zinc-500">
-            <Shield className="mt-[2px] h-[12px] w-[12px] shrink-0" />
-            Auth, destructive and irreversible changes always need your approval, in every mode.
           </div>
         </div>
       </div>
 
       {/* Self-healing loop: WorkspaceHome.tsx readings */}
-      <div className="mx-[37px] mt-[12px] rounded-[10px] border border-white/[0.08] bg-white/[0.015]">
+      <div className="mx-[37px] rounded-[10px] border border-white/[0.08] bg-white/[0.015]">
         <div className="flex h-[37px] items-center border-b border-white/[0.07] px-[19px]">
           <span className="text-[13px] font-semibold text-zinc-100">Self-healing loop</span>
           <span className="ml-[10px] inline-flex items-center gap-[6px] text-[11px] text-zinc-300">
