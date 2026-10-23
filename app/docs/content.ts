@@ -466,7 +466,7 @@ await backend.auth.signIn({ email, password })
       'A foreign key with no index starts slowing a page down. Autonomy adds the index and records what it did.',
       'A new table holds user data without row-level security. Autonomy flags it and shows you why.',
       'Your agent asks to drop a table. The request waits in the review queue until you approve or reject it.',
-      'A change went wrong, and you restore the state before it from Database → Changes.',
+      'A change went wrong, and you restore the state before it from History.',
     ],
     how: [
       {
@@ -483,7 +483,7 @@ await backend.auth.signIn({ email, password })
       },
       {
         title: 'Everything leaves a record',
-        body: 'Each fix shows what was found, what changed and how it was checked. Its schema changes keep a restore point, so the state before them can be put back from Database → Changes.',
+        body: 'Each fix shows what was found, what changed and how it was checked. Its schema changes keep a restore point, so the state before them can be put back from History.',
       },
       {
         title: 'Restructuring waits for your consent',
@@ -618,11 +618,11 @@ await backend.auth.signIn({ email, password })
       },
       {
         title: 'Versions are kept',
-        body: 'The Deploy page lists every published version, which one is current, and which ones you can roll back to.',
+        body: 'The Deploy page lists every published version and which one is current. History marks where each was published.',
       },
       {
-        title: 'Roll back if you need to',
-        body: 'Pick an earlier version to mark it current in the history. This is bookkeeping: the live schema and data are unchanged. To restore structure, use Database → Changes or a Snapshot.',
+        title: 'Restore an earlier version',
+        body: 'Restore on a version undoes every change made since it was published, newest first, each checked before it runs and verified after. If one needs your approval, it stops there and asks. A snapshot restores the whole database instead.',
       },
     ],
     prompts: ['Is my backend ready to publish? List anything that is blocking it.'],

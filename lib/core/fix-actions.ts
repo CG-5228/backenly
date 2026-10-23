@@ -81,7 +81,7 @@ export function isDataPlaneOutage(details: Record<string, unknown> | null | unde
  *
  * `executeAction` records an action as a governed change (lib/changes/ledger.ts:
  * a checkpoint before it, verification after it, a restore point) only when it
- * is in SCHEMA_CHANGE_ACTIONS in lib/ai/minimal-executor.ts. These four are
+ * is in GOVERNED_ACTIONS in lib/ai/minimal-executor.ts. These four are
  * not, and each changes more than the platform could put back:
  *
  *   FIX_API                regenerates a table's API layer

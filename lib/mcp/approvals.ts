@@ -42,6 +42,7 @@ import { prisma } from '@/lib/db/prisma'
 import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import type { RestoreRequest } from '@/lib/changes/recovery'
+import { restoreRequestChangeId } from '@/lib/changes/types'
 import {
   forgetApprovalRequests,
   keepApprovalRequest,
@@ -134,10 +135,15 @@ export async function createApprovalRequest(input: {
   // cannot happen throws RestoreRequestRefusedError, and nothing is queued.
   let danger = input.danger
   let toolArgs = input.toolArgs
+  let message = input.message
   if (danger.tool === 'revert_schema_change') {
     const restore = input.restore ?? (await measuredRestore(input.projectId, input.toolArgs))
     danger = { ...danger, target: restore.target, rowCount: restore.rowCount, reversible: true }
     toolArgs = { ...restore.toolArgs }
+    // A restore card shows its words as Backenly's, under Backenly's own
+    // measurement. Words a model wrote (a brain run's message) are quoted as the
+    // agent's, so "verified lossless" from an agent never reads as Backenly's.
+    if (!input.restore) message = `Requested by an agent: ${restore.target}\nThe agent wrote: “${input.message}”`
   }
 
   // The request's words, its target and its exact call are what the approver
@@ -149,7 +155,7 @@ export async function createApprovalRequest(input: {
   const id = randomUUID()
   const quote = await quotesKeptHere(input.projectId)
   const request = {
-    message: input.message.slice(0, 4000),
+    message: message.slice(0, 4000),
     target: danger.target.slice(0, 300),
     toolArgs,
   }
@@ -374,7 +380,7 @@ export async function listApprovals(projectId: string) {
       // its checks and could not be recovered without a person).
       requestedBy: r.apiKeyId ? ('agent' as const) : ('backenly' as const),
       // The change a restore request is about, so the inbox can link to it.
-      changeId: r.tool === 'revert_schema_change' ? ((r.toolArgs as { changeId?: string } | null)?.changeId ?? null) : null,
+      changeId: r.tool === 'revert_schema_change' ? restoreRequestChangeId(r.toolArgs) : null,
       rowCount: r.rowCount,
       reversible: r.reversible,
       message: r.message,
@@ -446,11 +452,14 @@ export async function decideApproval(input: {
       data: { status: 'rejected', decidedBy: input.approverUserId, decidedAt: new Date() },
     })
     await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_REJECTED')
-    // Declining to restore a change that failed its checks is a decision to
-    // keep it. A no-op for a change that was not waiting on one (an agent
-    // asking to restore a healthy change, say).
-    if (row.tool === 'revert_schema_change') {
-      const changeId = (row.toolArgs as { changeId?: string } | null)?.changeId
+    // Declining Backenly's own request to recover a change that failed its
+    // checks is a decision to keep it. Declining an agent's request is not: it
+    // answers that request only, and a recovery Backenly is waiting on keeps
+    // waiting for its own answer. Backenly's requests are the ones no agent key
+    // made (listApprovals' `requestedBy`); a project kept in another region
+    // keeps the call's shape on its row, the change's id in it.
+    if (row.tool === 'revert_schema_change' && !row.apiKeyId) {
+      const changeId = restoreRequestChangeId(row.toolArgs)
       if (changeId) {
         const { keepChange } = await import('@/lib/changes/recovery')
         await keepChange(input.projectId, changeId, input.approverUserId, { via: 'approval' }).catch(() => {})

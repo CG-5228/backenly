@@ -445,8 +445,8 @@ export function AccountMenu() {
 
 /**
  * The rail: the navigation list, then a footer pinned under it. The list is
- * the part that scrolls. Fifteen project items fit a 13-inch laptop's browser
- * (about 600px under the bar); below that the list scrolls, and its last
+ * the part that scrolls. Sixteen project items fit a 13-inch laptop's browser
+ * (about 600px under the bar), with Branches and History; below that the list scrolls, and its last
  * 20px fade out so an item cut by the footer reads as "more below" rather than
  * as the footer drawn over it, which is what a hard edge looked like.
  */
@@ -455,7 +455,7 @@ export function SidebarNav({ children, footer }: { children: ReactNode; footer?:
     <>
       <nav
         aria-label="Primary"
-        className="flex-1 overflow-y-auto overscroll-contain px-3 pb-4 pt-2 [mask-image:linear-gradient(to_bottom,black_calc(100%-20px),transparent)]"
+        className="flex-1 overflow-y-auto overscroll-contain px-3 pb-4 pt-1.5 [mask-image:linear-gradient(to_bottom,black_calc(100%-20px),transparent)]"
       >
         {children}
       </nav>
@@ -466,8 +466,8 @@ export function SidebarNav({ children, footer }: { children: ReactNode; footer?:
 
 export function NavGroup({ label, children, first = false }: { label?: string; children: ReactNode; first?: boolean }) {
   return (
-    <div className={first ? '' : label ? 'mt-4' : 'mt-3'}>
-      {label && <p className="mb-0.5 px-2.5 text-[12px] font-medium leading-[18px] text-faint">{label}</p>}
+    <div className={first ? '' : 'mt-3'}>
+      {label && <p className="px-2.5 text-[12px] font-medium leading-[18px] text-faint">{label}</p>}
       <ul className="space-y-px">{children}</ul>
     </div>
   )

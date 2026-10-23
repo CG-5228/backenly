@@ -1217,7 +1217,7 @@ async function describeDanger(
     case 'trigger_deploy':
       return { tool, target: 'a production deploy', rowCount: null, reversible: true, confirmPhrase: 'Confirm — deploy to production' }
     case 'rollback_deploy':
-      return { tool, target: 'a production rollback', rowCount: null, reversible: true, confirmPhrase: 'Confirm — roll back the deploy' }
+      return { tool, target: 'recording an older published version as current (the live backend is unchanged)', rowCount: null, reversible: true, confirmPhrase: 'Confirm — record the older version as current' }
     case 'revoke_api_key':
       return { tool, target: 'an API key (every client using it stops working immediately)', rowCount: null, reversible: false, confirmPhrase: 'Confirm — revoke the API key' }
     case 'rotate_api_key':

@@ -33,7 +33,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Cable, Camera, Check, ChevronLeft, ChevronRight, Columns,
-  Database as DatabaseIcon, Edit2, Filter, History, Key, Link2, Loader2, Maximize2, Minimize2, Network,
+  Database as DatabaseIcon, Edit2, Filter, Key, Link2, Loader2, Maximize2, Minimize2, Network,
   Plus, Puzzle, RefreshCw, Rows, Save, Search, Shapes, Table2, Terminal, Trash2, X,
   type LucideIcon,
 } from 'lucide-react'
@@ -80,7 +80,6 @@ import {
 } from '@/lib/api/database'
 import { isForeignKeyShaped, suggestForeignKeyColumn } from '@/lib/db/fk-shape'
 import { SqlWorkspace } from '@/components/database/SqlWorkspace'
-import { ChangeHistory } from '@/components/changes/ChangeHistory'
 import { EnumsPanel } from '@/components/database/EnumsPanel'
 import { ExtensionsPanel } from '@/components/database/ExtensionsPanel'
 import { DatabaseSnapshots } from '@/components/database/DatabaseSnapshots'
@@ -92,7 +91,7 @@ import { SchemaDiagram } from '@/components/database/SchemaDiagram'
 
 type ViewMode = 'data' | 'structure'
 type TableView = 'data' | 'structure'
-type DatabaseView = 'tables' | 'visualization' | 'sql' | 'history' | 'snapshots' | 'types' | 'extensions'
+type DatabaseView = 'tables' | 'visualization' | 'sql' | 'snapshots' | 'types' | 'extensions'
 
 // Rows fetched per page in the data browser. Kept in one place so the
 // pagination footer, the "step back a page after delete" math, and the query
@@ -201,11 +200,16 @@ export default function ProjectDatabasePage() {
   const [newRowData, setNewRowData] = useState<Record<string, any>>({})
   const [showQueryBuilder, setShowQueryBuilder] = useState(false)
   const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set())
-  // ?view=changes opens Changes directly: links from approvals and the
-  // Autonomy feed land on the change they are about (?change=<id>).
   const searchParams = useSearchParams()
-  const [showVisualization, setShowVisualization] = useState<DatabaseView>(() =>
-    searchParams?.get('view') === 'changes' ? 'history' : 'tables')
+  const [showVisualization, setShowVisualization] = useState<DatabaseView>('tables')
+  // Changes moved to History, one history for the whole backend. An old link
+  // (?view=changes, with ?change=<id> from approvals and the Autonomy feed)
+  // still lands on the change it is about.
+  useEffect(() => {
+    if (searchParams?.get('view') !== 'changes') return
+    const change = searchParams.get('change')
+    router.replace(`/app/projects/${urlProjectId}/changes${change ? `?change=${encodeURIComponent(change)}` : ''}`)
+  }, [searchParams, router, urlProjectId])
   const [isVisualizationExpanded, setIsVisualizationExpanded] = useState(false)
   
   // New table creation state
@@ -1256,10 +1260,11 @@ export default function ProjectDatabasePage() {
       </CommandBar>
 
       {/* ── Views ───────────────────────────────────────────────
-          Tables and Schema read the workspace schema; SQL, Changes, Types,
-          Extensions and Snapshots are project-wide and need no table. */}
+          Tables and Schema read the workspace schema; SQL, Types, Extensions
+          and Snapshots are project-wide and need no table. Changes are in
+          History, with the rest of the backend's. */}
       {selectedSchema && (
-        // contain:inline-size: seven tabs in one row are wider than a phone,
+        // contain:inline-size: six tabs in one row are wider than a phone,
         // and as min-content they widened the whole console column past the
         // screen. Contained, the row scrolls sideways as overflow-x-auto intends.
         <KitTabs className="flex-shrink-0 px-3 sm:px-4 [contain:inline-size]">
@@ -1429,11 +1434,7 @@ export default function ProjectDatabasePage() {
               showVisualization === 'tables' && !selectedTable && !noTables ? 'hidden md:flex' : 'flex'
             }`}
           >
-            {showVisualization === 'history' && resolvedProjectId ? (
-              // Every governed change to production, checked after it applied,
-              // with the way back in each row's menu.
-              <ChangeHistory projectId={resolvedProjectId} />
-            ) : showVisualization === 'types' && resolvedProjectId ? (
+            {showVisualization === 'types' && resolvedProjectId ? (
               // Project-scoped: types live in the workspace schema and need no
               // selected table.
               <EnumsPanel projectId={resolvedProjectId} />
@@ -2389,7 +2390,6 @@ const DATABASE_VIEWS: Array<{ id: DatabaseView; label: string; icon: LucideIcon 
   { id: 'tables', label: 'Tables', icon: Table2 },
   { id: 'visualization', label: 'Schema', icon: Network },
   { id: 'sql', label: 'SQL', icon: Terminal },
-  { id: 'history', label: 'Changes', icon: History },
   { id: 'types', label: 'Types', icon: Shapes },
   { id: 'extensions', label: 'Extensions', icon: Puzzle },
   { id: 'snapshots', label: 'Snapshots', icon: Camera },

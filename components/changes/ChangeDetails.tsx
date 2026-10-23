@@ -82,8 +82,30 @@ function Sql({ statements, quoted = true }: { statements: Array<{ sql: string }>
 
 function keptLine(e: PreservedEntry): string {
   if (e.kind === 'table') return `Table ${e.table}${e.rows !== null ? `, ${e.rows} row${e.rows === 1 ? '' : 's'}` : ''}`
-  const why = e.reason === 'dropped' ? 'dropped' : e.reason === 'retyped' ? 'retyped' : 'rewritten'
+  const why = e.reason === 'dropped' ? 'dropped' : e.reason === 'retyped' ? 'retyped' : e.reason === 'filled' ? 'filled in when added' : 'rewritten'
   return `Column ${e.table}.${e.column} (${why})${e.rows !== null ? `, ${e.rows} value${e.rows === 1 ? '' : 's'}` : ''}`
+}
+
+/**
+ * A restore attempt as it ended. Its summary is written before it runs, so an
+ * attempt that was rolled back, or later undone by a reapply, says so instead.
+ */
+function restoreLine(r: ChangeDetail['recoveries'][number]): string {
+  switch (r.status) {
+    case 'healthy':
+      return r.summary
+    case 'restored':
+      return `${r.summary}; undone when the change was reapplied`
+    case 'failed':
+      return 'Did not complete: rolled back, so nothing changed'
+    case 'verification_failed':
+      return 'Ran, but the result did not match the restore point'
+    case 'applying':
+    case 'verifying':
+      return 'In progress'
+    default:
+      return 'Applied, but not confirmed'
+  }
 }
 
 function outcomeNote(d: ChangeDetail): { tone: 'success' | 'warn' | 'danger' | 'info'; text: string } | null {
@@ -95,7 +117,7 @@ function outcomeNote(d: ChangeDetail): { tone: 'success' | 'warn' | 'danger' | '
     case 'restored':
       return { tone: 'info', text: `The state before this change was restored${by}${at}, and verified.` }
     case 'awaiting_approval':
-      return { tone: 'warn', text: `This change failed a check. Restoring the state before it would affect data written since, so it waits for a person.${d.outcome.note ? ` What failed: ${d.outcome.note}` : ''}` }
+      return { tone: 'warn', text: `This change failed a check, and Backenly cannot restore the state before it without a person's approval.${d.outcome.note ? ` What failed: ${d.outcome.note}` : ''}` }
     case 'kept':
       return { tone: 'warn', text: `This change failed a check and a person chose to keep it as it is. It can still be restored.${d.outcome.note ? ` What failed: ${d.outcome.note}` : ''}` }
     case 'needs_attention':
@@ -193,9 +215,10 @@ export function ChangeDetails({
           )}
 
           <Section title="What changed">
-            {d.footprint.length === 0 ? (
+            {d.footprint.length === 0 && d.resourceChanges.length === 0 && (
               <p className="text-[13px] text-faint">Nothing in the schema changed.</p>
-            ) : (
+            )}
+            {d.footprint.length > 0 && (
               <ul className="space-y-3">
                 {d.footprint.map((t, i) => (
                   <li key={i}>
@@ -214,6 +237,14 @@ export function ChangeDetails({
                       </ul>
                     )}
                   </li>
+                ))}
+              </ul>
+            )}
+            {/* The rest of the backend, in the order the summary names it: after the schema. */}
+            {d.resourceChanges.length > 0 && (
+              <ul className={`space-y-1 ${d.footprint.length > 0 ? 'mt-3' : ''}`}>
+                {d.resourceChanges.map((line, i) => (
+                  <li key={i} className="text-[13px] leading-[20px] text-zinc-200 [overflow-wrap:anywhere]">{line}</li>
                 ))}
               </ul>
             )}
@@ -267,7 +298,7 @@ export function ChangeDetails({
           {d.recoveries.map((r) => (
             <Section key={r.id} title={`Restore #${r.seq}`}>
               <p className="text-[12.5px] text-zinc-400">
-                {r.summary} · {r.actor.label} · {when(r.createdAt)}
+                {restoreLine(r)} · {r.actor.label} · {when(r.createdAt)}
               </p>
               {r.verification && (
                 <ul className="space-y-2">
