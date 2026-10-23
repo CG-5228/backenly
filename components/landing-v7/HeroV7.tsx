@@ -46,7 +46,7 @@ const CHAPTER_ALT = [
   'Claude Code builds the UrbanCart store backend through Backenly MCP tools while the Backenly Database page fills with the products, orders, order_items and users tables and the first orders arrive.',
   'The self-healing loop on the Backenly Overview page detects two broken guarantees, fixes one on its own by adding an index on orders.customer_id, proves it fixed, and holds the other for you.',
   'The Backenly Autonomy page: a missing foreign key on order_items waits for your approval with Approve and fix, next to the index Backenly added on its own, which keeps an Undo button.',
-  'Backenly Overview, all clear: no issues detected, self-healing on watch, with both changes listed as receipts.',
+  'Backenly Overview, all clear: the self-healing loop runs with nothing waiting on you, and both changes are listed as receipts.',
 ]
 
 /** Corner radii measured off the renders (export-windows.py), as shares of each side. */
