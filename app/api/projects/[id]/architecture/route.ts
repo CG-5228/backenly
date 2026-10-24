@@ -23,6 +23,11 @@
  *        assess   {}                            look for changes now (reads
  *                                               and rehearses only)
  *
+ * For a project kept in another region, what runs against its tables (the
+ * start of an approved change, a rehearsal again after its table moved, an
+ * undo, a look for changes) is queued for that region's worker, and the answer
+ * says so: from here, those statements outlast the request.
+ *
  * Every decision is the engine's (lib/evolution-engine/engine.ts); this route
  * authenticates, parses and answers. Auth is `withProjectValidation`, which
  * needs a platform SESSION: an MCP agent's API key cannot reach any POST here,
@@ -36,7 +41,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectValidation } from '@/lib/middleware/projectValidation'
 import {
-  advance,
   approveRequest,
   architectureSummary,
   decisionDetail,
@@ -45,9 +49,10 @@ import {
   isApprovalRefusal,
   liveStatements,
   pause,
-  proposeChanges,
+  proposeWhereTheTablesAre,
   resume,
-  undo,
+  startWhereTheTablesAre,
+  undoWhereTheTablesAre,
 } from '@/lib/evolution-engine/engine'
 import { allPrimitives } from '@/lib/evolution-engine/primitive'
 import { readMemory, priorsFor, summarizeDecisions } from '@/lib/evolution-engine/memory'
@@ -114,7 +119,9 @@ export async function POST(request: NextRequest, _props: { params: Promise<{ id:
       const decisionId = str(body.decisionId)
       if (!decisionId) return NextResponse.json({ error: `${action} needs decisionId` }, { status: 400 })
       if (action === 'advance') {
-        const r = await advance({ projectId, decisionId, actor: userId })
+        // Where the project's tables are: a project of another region is
+        // started by that region's worker, not run from this request.
+        const r = await startWhereTheTablesAre({ projectId, decisionId, actor: userId })
         return NextResponse.json({ ok: true, message: r.message, state: r.state })
       }
       const r =
@@ -122,14 +129,14 @@ export async function POST(request: NextRequest, _props: { params: Promise<{ id:
           ? await pause({ projectId, decisionId, userId })
           : action === 'resume'
             ? await resume({ projectId, decisionId, userId })
-            : await undo({ projectId, decisionId, userId })
+            : await undoWhereTheTablesAre({ projectId, decisionId, userId })
       return isActionRefusal(r)
         ? NextResponse.json({ error: r.error }, { status: r.status })
         : NextResponse.json({ ok: true, message: r.message, state: r.state })
     }
 
     if (action === 'assess') {
-      const r = await proposeChanges(projectId)
+      const r = await proposeWhereTheTablesAre(projectId)
       return NextResponse.json({ ok: true, ...r })
     }
 

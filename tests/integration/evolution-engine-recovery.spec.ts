@@ -186,6 +186,60 @@ describe('a table that changes after its change was approved', () => {
     expect(again.ok).toBe(true)
     expect(['backfilling', 'observing']).toContain((await stateOf(f.projectId, decisionId)).state)
   })
+
+  it('that already built part of itself is not asked about again over it: undo removes it', async () => {
+    // Asked again, it would wait for approval with its new table and syncs in place, where nothing undoes them.
+    const g = await buildProject('drift-built')
+    try {
+      mutations(true)
+      const req = await approved(g)
+      const decisionId = req.ev.decisionId
+      expect((await stateOf(g.projectId, decisionId)).state).toBe('backfilling')
+      await q(`CREATE INDEX orders_total_idx ON "${g.schema}"."orders" (total)`)
+      await drain(g.projectId)
+      expect((await advance({ projectId: g.projectId, decisionId })).state).toBe('blocked')
+      expect(await readTableFacts(workspaceOn(prisma, g.schema), 'order_refunds')).not.toBeNull()
+
+      const r = await resume({ projectId: g.projectId, decisionId, userId: g.ownerId })
+      expect(r).toMatchObject({ ok: false, status: 409, error: expect.stringMatching(/part of the change is already in place for the table as it was\. Undo removes it/) })
+      expect((await stateOf(g.projectId, decisionId)).state).toBe('blocked')
+      expect((await requestsOf(g.projectId))[0].ev.planVersion).toBe(req.ev.planVersion)
+
+      expect(await undo({ projectId: g.projectId, decisionId, userId: g.ownerId })).toMatchObject({ ok: true, state: 'rolled_back' })
+      expect(await readTableFacts(workspaceOn(prisma, g.schema), 'order_refunds')).toBeNull()
+    } finally {
+      await dropProject(g)
+    }
+  }, 180_000)
+
+  it('is judged part-built by the ladder\'s own record when its trail missed the rungs that ran', async () => {
+    // A run paused or killed mid-rung records its states only after the rung returns: the trail can end at
+    // `approved` with the new table already built. Here, the states that run reached are left out of the trail.
+    const g = await buildProject('drift-unrecorded')
+    try {
+      mutations(true)
+      const req = await approved(g)
+      const decisionId = req.ev.decisionId
+      expect(await readTableFacts(workspaceOn(prisma, g.schema), 'order_refunds')).not.toBeNull()
+      const d = (await stateOf(g.projectId, decisionId)) as { concernKey: string; proposalKey: string; planId: string; planVersion?: string; primitive: string; subject: string }
+      // Each a transition of its own (memory keeps one record per state and attempt).
+      const record = (state: 'approved' | 'blocked', attempt: number) => ({
+        v: 1 as const, decisionId, concernKey: d.concernKey, proposalKey: d.proposalKey, planId: d.planId, planVersion: d.planVersion,
+        primitive: d.primitive, subject: d.subject, event: 'transition' as const, state, attempt,
+      })
+      await remember({ projectId: g.projectId, record: record('approved', 2), milestone: false, sentence: 'The trail as a killed run leaves it (test).' })
+      await remember({ projectId: g.projectId, record: record('blocked', 1), milestone: false, sentence: 'Stopped (test).' })
+      const trail = await decisionTrail(g.projectId, decisionId)
+      expect(trail.filter(e => e.record.event === 'transition').map(e => e.record.state).slice(-2)).toEqual(['approved', 'blocked'])
+      await q(`CREATE INDEX orders_total_idx ON "${g.schema}"."orders" (total)`)
+
+      const r = await resume({ projectId: g.projectId, decisionId, userId: g.ownerId })
+      expect(r).toMatchObject({ ok: false, status: 409, error: expect.stringMatching(/part of the change is already in place/) })
+      expect((await requestsOf(g.projectId))[0].ev.planVersion).toBe(req.ev.planVersion)
+    } finally {
+      await dropProject(g)
+    }
+  }, 180_000)
 })
 
 // ── Pausing ──────────────────────────────────────────────────────────────────
