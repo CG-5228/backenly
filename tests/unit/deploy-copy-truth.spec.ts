@@ -24,9 +24,9 @@
  * (lib/changes/range.ts). Moving the version label alone is left only to
  * lib/deployment/rollback.ts, which still says it is bookkeeping.
  *
- * The pricing page follows: no restore asks for the plan, so every plan has
- * rollback, and what a plan sets is how long restore points are kept
- * (lib/changes/policy.ts).
+ * The pages that describe plans follow: no restore asks for the plan, so
+ * every plan has rollback, and what a plan sets is how long restore points
+ * are kept (lib/changes/policy.ts).
  */
 
 import { readFileSync } from 'fs'
@@ -121,6 +121,14 @@ describe('every surface states the true model', () => {
     // The plan's rollback flag is read only by the label-only rollback, which no console flow calls.
     for (const f of ['app/api/projects/[id]/changes/restore-to/route.ts', 'lib/changes/range.ts', 'lib/changes/recovery.ts', 'lib/mcp/approvals.ts', 'lib/ai/brain/tools.ts']) {
       expect([f, read(f).includes('allowDeploymentRollback')]).toEqual([f, false])
+    }
+  })
+
+  it('no page says rollback is limited to paid plans', () => {
+    const gated = /Pro and (higher|above)|plan-gated|not available on Free|Pro:[^'"\n]*roll ?back/i
+    for (const f of ['app/docs/content.ts', 'app/features/data.ts', 'app/use-cases/data.ts', 'app/comparisons/data.ts', 'app/pricing/page.tsx', 'app/terms/page.tsx']) {
+      const claims = read(f).split(/(?<=[.!?])\s+|\n/).filter((s) => /roll ?back/i.test(s) && gated.test(s))
+      expect([f, claims]).toEqual([f, []])
     }
   })
 })
