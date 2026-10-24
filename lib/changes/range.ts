@@ -27,7 +27,9 @@
  *   person                                     stops
  *
  * Who may run it is who may restore: a person, from History or from Deploy
- * (a published version's point is the last change before it was published).
+ * (a published version's point is the last change before it was published),
+ * or a person approving an agent's request to restore a version
+ * (describeVersionRestore, restoreToVersion).
  */
 
 import { prisma } from '@/lib/db/prisma'
@@ -150,7 +152,12 @@ function stopFor(step: RangeStep, preview: RecoveryPreview | null): RangeStop | 
  * first step that is not lossless. A change only a credential rule keeps is
  * left as it is and named, rather than stopping the rest.
  */
-export async function restoreTo(projectId: string, afterSeq: number, opts: { actorUserId: string }): Promise<RangeOutcome> {
+export async function restoreTo(
+  projectId: string,
+  afterSeq: number,
+  /** `approved`: run on a person's approval of an agent's request, and recorded so. */
+  opts: { actorUserId: string; mode?: 'manual' | 'approved' },
+): Promise<RangeOutcome> {
   const plan = await planRestoreTo(projectId, afterSeq)
   const out: RangeOutcome = { afterSeq, restored: [], kept: [...plan.kept], stoppedAt: null }
   for (const step of plan.steps) {
@@ -164,7 +171,7 @@ export async function restoreTo(projectId: string, afterSeq: number, opts: { act
       out.stoppedAt = stop
       return out
     }
-    const done = await recoverChange(projectId, step.recordId, { mode: 'manual', actorUserId: opts.actorUserId })
+    const done = await recoverChange(projectId, step.recordId, { mode: opts.mode ?? 'manual', actorUserId: opts.actorUserId })
     if (done.ok !== true) {
       const failed = done as Extract<RecoveryOutcome, { ok: false }>
       const busy = failed.code === 'IN_PROGRESS' || failed.code === 'CHANGE_IN_PROGRESS'
@@ -185,4 +192,114 @@ export async function pointOfPublish(projectId: string, publishedAt: Date): Prom
     select: { seq: true },
   })
   return last?.seq ?? 0
+}
+
+/** A published version, and the point it stands for: the last change made before it was published. */
+export interface PublishedPoint {
+  version: number
+  publishedAt: Date
+  after: number
+}
+
+/** The published version a call names, by `version` or by its deployment's id; null when none matches. */
+export async function publishedPoint(projectId: string, ref: { version?: unknown; deploymentId?: unknown }): Promise<PublishedPoint | null> {
+  const asked = ref.version === undefined || ref.version === null || ref.version === '' ? null : Number(ref.version)
+  const deploymentId = typeof ref.deploymentId === 'string' && ref.deploymentId ? ref.deploymentId : null
+  if (asked === null && !deploymentId) return null
+  if (asked !== null && (!Number.isInteger(asked) || asked < 1)) return null
+  const d = await prisma.deployment.findFirst({
+    where: {
+      projectId,
+      environment: 'live',
+      status: 'live',
+      version: asked ?? { not: null },
+      ...(deploymentId ? { id: deploymentId } : {}),
+    },
+    select: { version: true, completedAt: true, createdAt: true },
+  })
+  if (!d || d.version === null) return null
+  const publishedAt = d.completedAt ?? d.createdAt
+  return { version: d.version, publishedAt, after: await pointOfPublish(projectId, publishedAt) }
+}
+
+const plural = (n: number, one: string) => `${n} ${n === 1 ? one : `${one}s`}`
+
+/**
+ * An agent's request to restore the backend to a published version, as a
+ * person is asked to approve it: Backenly's own list of what it would undo,
+ * measured now. `steps` is that list by record, so approving runs exactly it.
+ */
+export interface VersionRestoreRequest {
+  /** One line: an approval card's title. */
+  target: string
+  /** The steps, newest first, and how it runs: the request's full text. */
+  detail: string
+  toolArgs: { version: number; steps: string[] }
+}
+
+export async function describeVersionRestore(
+  projectId: string,
+  ref: { version?: unknown; deploymentId?: unknown },
+): Promise<({ ok: true } & VersionRestoreRequest) | { ok: false; status: number; code: string; error: string }> {
+  const point = await publishedPoint(projectId, ref)
+  if (!point) {
+    return { ok: false, status: 404, code: 'VERSION_NOT_FOUND', error: 'No published version matches. deploy { action: "history" } lists them.' }
+  }
+  const v = point.version
+  const plan = await planRestoreTo(projectId, point.after)
+  if (plan.steps.length === 0) {
+    return plan.stop
+      ? { ok: false, status: 409, code: 'RESTORE_BLOCKED', error: `Restoring to v${v} would stop before undoing anything. ${plan.stop.reason}` }
+      : { ok: false, status: 409, code: 'NOTHING_TO_RESTORE', error: `Nothing has changed since v${v} was published: the backend is already as it was then.` }
+  }
+  const published = point.publishedAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+  const detail = [
+    `Undoes, newest first:`,
+    ...plan.steps.map((s) => `#${s.seq} ${s.summary}${s.action === 'reapply' ? ` (reapplied: it was in effect at v${v})` : ''}`),
+    ...(plan.stop ? [`Stops at #${plan.stop.seq}. ${plan.stop.reason}`] : []),
+    'Each one is checked before it runs. One that would set aside data written since, or that cannot run, stops it there, for you to review in History.',
+  ].join('\n')
+  return {
+    ok: true,
+    target: `Restore the backend to v${v}, published ${published}: undo the ${plural(plan.steps.length, 'change')} made since`,
+    detail,
+    toolArgs: { version: v, steps: plan.steps.map((s) => s.recordId) },
+  }
+}
+
+export type VersionRestoreOutcome =
+  | { ok: true; version: number; outcome: RangeOutcome; versionCurrent: boolean }
+  | { ok: false; code: 'VERSION_NOT_FOUND' | 'STALE'; error: string }
+
+/**
+ * Restore the backend to a published version: everything made since it was
+ * published undone, then the version recorded as current when the restore
+ * reached it in full. `approvedSteps`, from an approval, must still be what
+ * restoring would undo, or nothing runs: what runs is what the person read.
+ */
+export async function restoreToVersion(
+  projectId: string,
+  ref: { version?: unknown; deploymentId?: unknown },
+  opts: { actorUserId: string; approvedSteps?: unknown; via: 'UI' | 'APPROVAL' },
+): Promise<VersionRestoreOutcome> {
+  const point = await publishedPoint(projectId, ref)
+  if (!point) return { ok: false, code: 'VERSION_NOT_FOUND', error: 'No published version matches. deploy { action: "history" } lists them.' }
+  if (opts.approvedSteps !== undefined) {
+    const plan = await planRestoreTo(projectId, point.after)
+    const seen = Array.isArray(opts.approvedSteps) ? opts.approvedSteps.map(String) : null
+    if (!seen || seen.length !== plan.steps.length || plan.steps.some((s, i) => s.recordId !== seen[i])) {
+      return {
+        ok: false,
+        code: 'STALE',
+        error: `The history changed since this was approved, so nothing was restored. Ask again to see what restoring to v${point.version} would undo now.`,
+      }
+    }
+  }
+  const outcome = await restoreTo(projectId, point.after, { actorUserId: opts.actorUserId, mode: opts.via === 'APPROVAL' ? 'approved' : 'manual' })
+  let versionCurrent = false
+  if (!outcome.stoppedAt) {
+    const { markVersionCurrent } = await import('@/lib/deployment/rollback')
+    versionCurrent = await markVersionCurrent(projectId, point.version, opts.actorUserId, opts.via).catch(() => false)
+  }
+  return { ok: true, version: point.version, outcome, versionCurrent }
 }

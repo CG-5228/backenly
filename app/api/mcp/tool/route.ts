@@ -950,6 +950,7 @@ async function parkForApproval(
   let rowCount: number | null = null
   let toolArgs: Record<string, unknown> = args
   let restore: import('@/lib/changes/recovery').RestoreRequest | undefined
+  let versionRestore: import('@/lib/changes/range').VersionRestoreRequest | undefined
   // A restore request names the change and exactly what restoring it would do,
   // measured by Backenly now; one that cannot happen (unknown id, already
   // restored, a later change in the way, expired) is answered now rather than
@@ -974,16 +975,40 @@ async function parkForApproval(
     // A restore keeps what it removes and is itself recorded: it can be reapplied.
     reversible = true
   }
+  // A rollback is a restore to a published version: parked with Backenly's list
+  // of the changes it would undo, measured now. A version that does not exist,
+  // or that nothing has changed since, is answered now and nothing is queued.
+  if (resolution.target === 'rollback_deploy') {
+    const { describeVersionRestore } = await import('@/lib/changes/range')
+    const d = await describeVersionRestore(auth.projectId, { version: args.version, deploymentId: args.deploymentId })
+    if (!d.ok) {
+      const refused = d as Extract<typeof d, { ok: false }>
+      recordMcpCall({ ...auth, endpoint: ENDPOINT, startedAt }, { statusCode: refused.status, tool: callLabel, error: refused.code })
+      return NextResponse.json(
+        { ok: false, error: refused.error, code: refused.code, hint: 'deploy { action: "history" } lists the published versions; deploy { action: "changes" } lists what changed since.' },
+        { status: refused.status },
+      )
+    }
+    const ok = d as Extract<typeof d, { ok: true }>
+    versionRestore = { target: ok.target, detail: ok.detail, toolArgs: ok.toolArgs }
+    described = ok.target
+    toolArgs = { ...ok.toolArgs }
+    reversible = true
+  }
   try {
     const { createApprovalRequest } = await import('@/lib/mcp/approvals')
     const row = await createApprovalRequest({
       projectId: auth.projectId,
       userId: auth.userId,
       apiKeyId: auth.keyId,
-      message: `Requested by an agent over MCP: ${described}`,
+      // A rollback card's title is Backenly's sentence; its text is the list.
+      message: versionRestore
+        ? `Requested by an agent over MCP.\n${versionRestore.detail}`
+        : `Requested by an agent over MCP: ${described}`,
       danger: { tool: resolution.target, target: described, rowCount, reversible },
       toolArgs,
       restore,
+      versionRestore,
     })
     recordMcpCall(
       { ...auth, endpoint: ENDPOINT, startedAt },
@@ -1003,7 +1028,10 @@ async function parkForApproval(
           (resolution.target === 'revert_schema_change'
             ? 'Backenly recorded the restore with what it measured it would do; a person approves exactly that, ' +
               'and it runs only if the data still matches. Tell your human it is waiting, '
-            : 'The exact call you sent runs verbatim once a human approves it. Tell your human it is waiting, ') +
+            : resolution.target === 'rollback_deploy'
+              ? 'Backenly recorded the changes restoring to that version would undo; a person approves exactly that ' +
+                'list, and it runs only if the history has not changed since. Tell your human it is waiting, '
+              : 'The exact call you sent runs verbatim once a human approves it. Tell your human it is waiting, ') +
           'then poll check_approval every 15-30s until it is executed, rejected, failed or expired (24h).',
       },
       needsUser: true,

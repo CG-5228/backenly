@@ -91,6 +91,8 @@ interface AgentApproval {
   /** Absent on responses that predate it: those were all agent requests. */
   requestedBy?: 'agent' | 'backenly'
   changeId?: string | null
+  /** The published version a rollback request restores the backend to. */
+  version?: number | null
   rowCount: number | null
   reversible: boolean
   message: string
@@ -393,11 +395,12 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
         setRow(approvalId, { phase: 'verified' })
         const request = agentApprovals.find(a => a.id === approvalId)
         const restore = request?.tool === 'revert_schema_change'
+        const versionRestore = request?.tool === 'rollback_deploy'
         const fromBackenly = request?.requestedBy === 'backenly'
         flashBanner(
           decision === 'approve'
-            ? (restore ? 'Previous state restored' : 'Agent request executed')
-            : (restore ? 'Restore declined' : 'Agent request rejected'),
+            ? (restore ? 'Previous state restored' : versionRestore ? 'Restore ran' : 'Agent request executed')
+            : (restore || versionRestore ? 'Restore declined' : 'Agent request rejected'),
           decision === 'approve'
             ? (j?.resultSummary ? clip(String(j.resultSummary), 120) : 'the agent sees the result on its next poll')
             : fromBackenly ? 'the change stays as it is' : 'the agent is told not to retry',
@@ -685,7 +688,9 @@ function AgentRequestRow({
   // Restoring a change reads as what it does, whoever asked for it: Backenly
   // raises one when a change fails its checks and recovering it would affect
   // data written since. The details are on the change itself.
-  const restore = a.tool === 'revert_schema_change'
+  // A rollback is a restore too: of the backend to a published version, with
+  // Backenly's list of the changes it would undo as the card's text.
+  const restore = a.tool === 'revert_schema_change' || a.tool === 'rollback_deploy'
   const fromBackenly = a.requestedBy === 'backenly'
   // The card is the ONLY thing the human reads before approving — a merge
   // message carries the exact statements that reach production, and cutting
@@ -734,6 +739,14 @@ function AgentRequestRow({
                 className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200"
               >
                 View details
+              </a>
+            )}
+            {a.tool === 'rollback_deploy' && (
+              <a
+                href={`/app/projects/${projectId}/changes`}
+                className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200"
+              >
+                Open History
               </a>
             )}
           </MetaRow>

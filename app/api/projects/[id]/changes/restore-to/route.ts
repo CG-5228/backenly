@@ -16,28 +16,22 @@ export const dynamic = 'force-dynamic'
  * id, so a change that landed since they opened it is not undone unseen.
  *
  * When a version's point is reached in full, that version is also recorded as
- * the current one (lib/deployment/rollback.ts), since the backend is again
- * what was published then. Not before: a version marked current over a
- * backend that is not is the bookkeeping that used to pass for a rollback.
+ * the current one (lib/deployment/rollback.ts markVersionCurrent), since the
+ * backend is again what was published then. Not before: a version marked
+ * current over a backend that is not is the bookkeeping that used to pass for
+ * a rollback.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { withAuth } from '@/lib/auth/route-protection'
 import { canAdministerProject } from '@/lib/edition/guard'
-import { prisma } from '@/lib/db/prisma'
-import { planRestoreTo, pointOfPublish, restoreTo } from '@/lib/changes/range'
+import { planRestoreTo, publishedPoint, restoreTo, restoreToVersion } from '@/lib/changes/range'
 
 /** The point, from `after` or a published `version`; null when neither names one. */
 async function pointOf(projectId: string, after: unknown, version: unknown): Promise<{ after: number; version: number | null } | null> {
   if (version !== undefined && version !== null && version !== '') {
-    const v = Number(version)
-    if (!Number.isInteger(v) || v < 1) return null
-    const published = await prisma.deployment.findFirst({
-      where: { projectId, environment: 'live', status: 'live', version: v },
-      select: { completedAt: true, createdAt: true },
-    })
-    if (!published) return null
-    return { after: await pointOfPublish(projectId, published.completedAt ?? published.createdAt), version: v }
+    const point = await publishedPoint(projectId, { version })
+    return point ? { after: point.after, version: point.version } : null
   }
   const n = Number(after)
   return Number.isInteger(n) && n >= 0 ? { after: n, version: null } : null
@@ -72,12 +66,14 @@ export const POST = withAuth(async (request: NextRequest, { user, params }) => {
       { status: 409 },
     )
   }
-  const outcome = await restoreTo(projectId, point.after, { actorUserId: user.userId })
-  let versionCurrent = false
-  if (point.version !== null && !outcome.stoppedAt) {
-    const { rollbackDeploy } = await import('@/lib/deployment/rollback')
-    const moved = await rollbackDeploy({ projectId, userId: user.userId, version: point.version, confirmedBy: 'UI', force: true }).catch(() => null)
-    versionCurrent = moved?.kind === 'rolled_back'
+  if (point.version === null) {
+    return NextResponse.json({ success: true, outcome: await restoreTo(projectId, point.after, { actorUserId: user.userId }), version: null, versionCurrent: false })
   }
-  return NextResponse.json({ success: true, outcome, version: point.version, versionCurrent })
+  const done = await restoreToVersion(projectId, { version: point.version }, { actorUserId: user.userId, via: 'UI' })
+  if (!done.ok) {
+    const failed = done as Extract<typeof done, { ok: false }>
+    return NextResponse.json({ success: false, code: failed.code, error: failed.error }, { status: 404 })
+  }
+  const ok = done as Extract<typeof done, { ok: true }>
+  return NextResponse.json({ success: true, outcome: ok.outcome, version: ok.version, versionCurrent: ok.versionCurrent })
 })

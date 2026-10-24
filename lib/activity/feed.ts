@@ -237,6 +237,11 @@ function labelForAudit(
   if (t.includes('file') || t.includes('upload'))     return { kind: 'file',    label: meta?.bucket ? `File uploaded to ${meta.bucket} bucket` : 'File uploaded' }
   if (t.includes('table') || a.includes('create_table')) return { kind: 'table', label: meta?.tableName ? `Table "${meta.tableName}" created` : 'Table created' }
   if (t.includes('auth'))                              return { kind: 'auth',    label: 'Auth setting updated' }
+  // The backend restored to a published version, every change since undone
+  // (lib/deployment/rollback.ts markVersionCurrent).
+  if (a === 'version_restored') {
+    return { kind: 'deploy', label: d.version ? `Backend restored to v${d.version}` : 'Backend restored to an earlier version' }
+  }
   if (t.includes('deploy')) {
     if (a.includes('fail'))                                          return { kind: 'deploy', label: 'Deployment failed' }
     if (a.includes('rollback') || a.includes('rolled_back'))         return { kind: 'deploy', label: 'Older version recorded as current' }
