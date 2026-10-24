@@ -122,7 +122,7 @@ function plansFor(published: boolean): Plan[] {
         { text: `${PRO_INCLUDED.fnRuns / 1_000_000}M function runs a month`, note: then('fn_runs') },
         { text: 'Event triggers, outbound webhooks and custom domains' },
         { text: '5 team seats with project-level access' },
-        { text: 'Full deployment history and rollback' },
+        { text: 'Restore points kept for 30 days' },
         { text: '30 days of logs and email support' },
       ],
     },
@@ -189,7 +189,10 @@ function comparisonGroups(published: boolean): MatrixGroup[] {
         // (lib/changes/policy.ts). Whether a given change can still be restored
         // is decided per change, so this is retention, not a promise.
         { label: 'Schema change restore points kept', hint: 'Each change shows whether the state before it can still be restored', cells: ['7 days', '30 days', '90 days'] },
-        { label: 'Deployment history and rollback', cells: [false, 'Full history', 'Full history'] },
+        // Every plan lists every published version and restores from History; how
+        // far back a restore reaches is the row above. The Plan rows' rollback and
+        // history fields gate only APIs the console no longer calls.
+        { label: 'Deployment history and rollback', cells: ['Full history', 'Full history', 'Full history'] },
       ],
     },
     {
@@ -292,7 +295,7 @@ const faqs = [
   },
   {
     q: 'Are database, auth, storage and realtime paid add-ons?',
-    a: 'No. They are included on every plan. Paid plans raise capacity and add support, rollback history and advanced controls.',
+    a: 'No. They are included on every plan. Paid plans raise capacity, keep restore points longer, and add support and advanced controls.',
   },
   {
     q: 'Am I locked in? Can I get my data out?',
