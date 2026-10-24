@@ -303,6 +303,7 @@ class RegionalJobRefusal extends Error {}
 
 function failureSentence(type: string, region: CloudRegionId): string {
   if (type === 'maintenance_backfill') return `The backfill batch did not complete in ${region}. The reason is in that region's logs.`
+  if (type === 'evolution_backfill') return `The architecture change's copy batch did not complete in ${region}. The reason is in that region's logs.`
   return type === 'workspace_restore'
     ? `The restore did not complete in ${region}. The reason is in that region's logs.`
     : `The snapshot was not taken in ${region}. The reason is in that region's logs.`
@@ -317,6 +318,12 @@ async function runRegionalJob(type: string, payload: unknown): Promise<Record<st
     // A refusal is a result, read by the ladder; a batch that raised is retried.
     const { handleBackfillJob } = await import('@/lib/autonomy/maintenance/primitives/backfill-job')
     return (await handleBackfillJob(payload as any)) as unknown as Record<string, any>
+  }
+
+  if (type === 'evolution_backfill') {
+    // The same for an architecture change's copy (lib/structural-evolution/backfill-job.ts).
+    const { handleEvolutionBackfillJob } = await import('@/lib/structural-evolution/backfill-job')
+    return (await handleEvolutionBackfillJob(payload as any)) as unknown as Record<string, any>
   }
 
   const backups = await import('@/lib/services/workspace-backup')
@@ -380,6 +387,11 @@ export async function processBackgroundJobs(): Promise<{
               '@/lib/autonomy/maintenance/primitives/backfill-job'
             )
             result = await handleBackfillJob(job.payload as any)
+            break
+          }
+          case 'evolution_backfill': {
+            const { handleEvolutionBackfillJob } = await import('@/lib/structural-evolution/backfill-job')
+            result = await handleEvolutionBackfillJob(job.payload as any)
             break
           }
           case 'purge_project':
