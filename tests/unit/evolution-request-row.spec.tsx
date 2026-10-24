@@ -499,7 +499,8 @@ describe('in the "Waiting on you" queue', () => {
     expect(header.textContent).toContain('3')
     expect(header.textContent).not.toMatch(/in \d+ issue/)
     // The ordinary finding still renders as it always did, with its own fix.
-    expect(screen.getByText(/missing_index · warning/)).toBeTruthy()
+    const ordinary = screen.getByText('missing_index').parentElement!
+    expect(within(ordinary).getByText('Warning')).toBeTruthy()
     expect(screen.getByRole('button', { name: /Approve & fix/ })).toBeTruthy()
   })
 
