@@ -123,6 +123,20 @@ describe('the extraction ladder', () => {
     expect(plan({ facts: theirs }).planVersion).not.toBe(a.planVersion)
   })
 
+  it('does not invalidate consent when Backenly\'s own row capture comes or goes on the host', () => {
+    // lib/webhooks/capture.ts installs it after a table is added (the ladder's
+    // own included) and whenever a webhook or row function changes.
+    const a = plan()
+    const capture = (fn: string) => ({
+      name: 'backenly_webhook_capture',
+      definition: `CREATE TRIGGER backenly_webhook_capture AFTER UPDATE ON "workspace_test".orders FOR EACH ROW EXECUTE FUNCTION "workspace_test".${fn}()`,
+      functionSource: '...',
+    })
+    expect(plan({ facts: ordersFacts({ triggers: [capture('backenly_capture_webhook_event')] }) }).planVersion).toBe(a.planVersion)
+    // A trigger that only borrows the name is somebody else's, and counts.
+    expect(plan({ facts: ordersFacts({ triggers: [capture('audit_everything')] }) }).planVersion).not.toBe(a.planVersion)
+  })
+
   it('gives every rung a distinct idempotency key tied to the version', () => {
     const keys = plan().steps.map(s => s.idempotencyKey)
     expect(new Set(keys).size).toBe(keys.length)

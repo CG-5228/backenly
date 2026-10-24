@@ -36,6 +36,7 @@ import { closeMaintenanceLockPool } from '@/lib/autonomy/maintenance/single-flig
 import { closeChangeLockPool, withChangeLock } from '@/lib/changes/lock'
 import { analyzeStructuralEvolution } from '@/lib/structural-evolution'
 import { resolveExtractionPlan, isResolveRefusal } from '@/lib/structural-evolution/resolve'
+import { CAPTURE_TRIGGER } from '@/lib/changes/catalog'
 import { rehearseExtraction } from '@/lib/structural-evolution/rehearse'
 import { grantEvolutionApproval, isGrantRefusal, readLiveEvolutionApproval } from '@/lib/structural-evolution/consent'
 import { executeExtraction } from '@/lib/structural-evolution/execute'
@@ -651,7 +652,9 @@ describe('rollback', () => {
       ['withdraw_consent', 'done'],
     ])
     expect(await readTableFacts(workspaceOn(prisma, schema), 'order_refunds')).toBeNull()
-    expect((await readTableFacts(workspaceOn(prisma, schema), 'orders'))!.triggers).toEqual([])
+    // Nothing of the ladder is left on the host. Its one trigger is the row
+    // capture for refund-mailer, which Backenly's own sync keeps, not the ladder.
+    expect((await readTableFacts(workspaceOn(prisma, schema), 'orders'))!.triggers.map(t => t.name)).toEqual([CAPTURE_TRIGGER])
     expect(await hostSnapshot()).toEqual(before)
     expect(await readLiveEvolutionApproval(projectId, planId)).toBeNull()
 

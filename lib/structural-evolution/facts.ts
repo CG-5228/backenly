@@ -38,6 +38,7 @@
 import { createHash } from 'node:crypto'
 import type { WorkspaceRawClient } from '@/lib/data-plane/regional'
 import type { WorkspaceAt } from './workspace'
+import { PLATFORM_OBJECTS } from '@/lib/changes/catalog'
 
 /** Every object a ladder creates carries this prefix, and nothing else may. */
 export const LADDER_OBJECT_PREFIX = 'bkn_evo_'
@@ -503,9 +504,21 @@ export async function readTableFacts(at: WorkspaceAt, table: string): Promise<Ta
 }
 
 const isLadderObject = (name: string) => name.startsWith(LADDER_OBJECT_PREFIX)
+/**
+ * Backenly's row-event capture and presence triggers: plumbing their own syncs
+ * install and remove outside any change (lib/changes/catalog.ts). A sync runs
+ * after a table is added, the ladder's own new table included, and whenever a
+ * webhook or row function is edited, so counting them would withdraw consent
+ * over something the plan's SQL never reads. Known by name AND by the platform
+ * function it runs, so a trigger that only borrows the name still counts.
+ */
+const isPlatformTrigger = (t: { name: string; definition: string }) =>
+  (PLATFORM_OBJECTS.triggers as readonly string[]).includes(t.name) &&
+  PLATFORM_OBJECTS.functions.some(fn => new RegExp(`EXECUTE FUNCTION "?[^"\\s.]+"?\\.${fn}\\(\\)$`).test(t.definition))
 
 /**
- * The host's shape, minus everything a ladder put there.
+ * The host's shape, minus everything a ladder put there and Backenly's own
+ * capture and presence triggers.
  *
  * Stable under the ladder's own execution and sensitive to everybody else's
  * DDL — see the module header. Statistics are excluded: they move on every
@@ -519,7 +532,7 @@ export function basisFingerprint(f: TableFacts): string {
     k: f.constraints.filter(c => !isLadderObject(c.name)).map(c => [c.name, c.kind, c.definition]),
     i: f.indexes.map(i => i.definition),
     p: f.policies.filter(p => !isLadderObject(p.name)).map(p => [p.name, p.command, p.roles, p.using, p.withCheck]),
-    tg: f.triggers.filter(t => !isLadderObject(t.name)).map(t => t.definition),
+    tg: f.triggers.filter(t => !isLadderObject(t.name) && !isPlatformTrigger(t)).map(t => t.definition),
     in: f.inboundForeignKeys.filter(i => !isLadderObject(i.name)).map(i => [i.fromSchema, i.fromTable, i.name, i.columns]),
     g: f.grants.map(g => `${g.grantee}:${g.privilege}`).sort(),
   }
