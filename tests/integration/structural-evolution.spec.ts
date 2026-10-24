@@ -669,7 +669,7 @@ describe('rollback', () => {
       select: { status: true, source: true, actorUserId: true, groupId: true },
     })
     expect(undos.map(u => u.status)).toEqual(['partially_applied', 'healthy'])
-    for (const u of undos) expect(u).toMatchObject({ source: 'dashboard', actorUserId: ownerId, groupId: `evolution:${planId}` })
+    for (const u of undos) expect(u).toMatchObject({ source: 'dashboard', actorUserId: ownerId, groupId: `evolution:${planId}:undo` })
   })
 
   it('has nothing left to undo the second time', async () => {

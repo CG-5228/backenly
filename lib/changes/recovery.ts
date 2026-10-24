@@ -280,6 +280,13 @@ export interface Availability {
  */
 export const ARCHITECTURE_CHANGE_GROUP = 'evolution:'
 
+/**
+ * Marks the engine's own undo within that group (`evolution:<plan>:undo`), so
+ * History can tell a change that is still in place from one undone in full,
+ * which leaves nothing of it behind (lib/changes/range.ts).
+ */
+export const ARCHITECTURE_UNDO_SUFFIX = ':undo'
+
 /** The statuses a restore may start from, by mode. */
 function restorableFrom(mode: RecoveryMode): ChangeStatus[] {
   if (mode === 'automatic') return ['verification_failed', 'partially_applied']

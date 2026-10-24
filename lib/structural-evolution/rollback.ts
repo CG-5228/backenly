@@ -207,10 +207,13 @@ async function undo(input: { projectId: string; planId: string; requestedBy: str
   // stays closed, exactly as the engine reports it, until undo is asked again.
   const { withGovernedChange, withChangeAttribution, expectEffect } = await import('@/lib/changes/ledger')
   const { ChangeInProgressError } = await import('@/lib/changes/lock')
+  // The change's own group, marked as its undo (ARCHITECTURE_UNDO_SUFFIX in
+  // lib/changes/recovery.ts): restore to a point passes over a change whose
+  // newest entry is a finished undo, since nothing of it is left.
   const attribution =
     input.requestedBy === AUTOMATIC_REQUESTER
-      ? { source: 'autonomy' as const, groupId: `evolution:${planId}` }
-      : { source: 'dashboard' as const, actorUserId: input.requestedBy, groupId: `evolution:${planId}` }
+      ? { source: 'autonomy' as const, groupId: `evolution:${planId}:undo` }
+      : { source: 'dashboard' as const, actorUserId: input.requestedBy, groupId: `evolution:${planId}:undo` }
   let governed: { result: boolean; change: { status: string; verification: { checks: Array<{ outcome: string; label: string; detail: string }> } | null } | null }
   try {
     governed = await withChangeAttribution(attribution, () =>
