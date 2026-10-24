@@ -40,7 +40,7 @@
  * retried scheduler pass cannot record the same entry twice.
  */
 
-import { FLAGS } from '@/lib/config/flags'
+import { FLAGS, evolutionAllowedFor } from '@/lib/config/flags'
 import { getProjectAutonomyLevel } from '@/lib/autonomy/autonomy-level'
 import { heldForIncident } from '@/lib/autonomy/change-freeze'
 import { canTransition, canUndoFrom, userFacingStatus, type LifecycleState } from './lifecycle'
@@ -144,16 +144,25 @@ const base = (d: DecisionRef): Omit<EvolutionRecord, 'event'> => ({
   subject: d.subject,
 })
 
-/** Is this deployment allowed to run rungs at all? */
-export function executionEnabled(): { enabled: boolean; reason: string | null } {
-  return FLAGS.ENABLE_EVOLUTION_MUTATIONS
-    ? { enabled: true, reason: null }
-    : {
-        enabled: false,
-        reason:
-          'Architecture changes are switched off in this deployment (ENABLE_EVOLUTION_MUTATIONS). ' +
-          'Backenly still proposes, rehearses and records them; nothing runs until an operator turns this on.',
-      }
+/** May rungs run for this project: the deployment's switch, then the rollout's list? */
+export function executionEnabled(projectId: string): { enabled: boolean; reason: string | null } {
+  if (!FLAGS.ENABLE_EVOLUTION_MUTATIONS) {
+    return {
+      enabled: false,
+      reason:
+        'Architecture changes are switched off in this deployment (ENABLE_EVOLUTION_MUTATIONS). ' +
+        'Backenly still proposes, rehearses and records them; nothing runs until an operator turns this on.',
+    }
+  }
+  if (!evolutionAllowedFor(projectId)) {
+    return {
+      enabled: false,
+      reason:
+        'Architecture changes are rolling out a few projects at a time, and this project is not on the list yet (EVOLUTION_PROJECT_ALLOWLIST). ' +
+        'Backenly still proposes, rehearses and records them; nothing runs until it is.',
+    }
+  }
+  return { enabled: true, reason: null }
 }
 
 /**
@@ -166,6 +175,9 @@ export function executionEnabled(): { enabled: boolean; reason: string | null } 
 export async function continuation(projectId: string): Promise<Continuation> {
   if (!FLAGS.ENABLE_EVOLUTION_MUTATIONS) {
     return { unattended: false, byHand: false, why: "Backenly isn't running architecture changes in this deployment right now." }
+  }
+  if (!evolutionAllowedFor(projectId)) {
+    return { unattended: false, byHand: false, why: "Backenly isn't running architecture changes for this project right now." }
   }
   if (!FLAGS.ENABLE_EVOLUTION_SCHEDULER) {
     return { unattended: false, byHand: true, why: "This deployment doesn't carry architecture changes on by itself." }
@@ -737,7 +749,7 @@ export async function approveRequest(input: {
     payload: { findingId, spec: ev.spec, summary: ev.summary, approvalId: granted.approvalId },
   })
 
-  const exec = executionEnabled()
+  const exec = executionEnabled(projectId)
   const runs = await continuation(projectId)
   // Requests are raised only where approved changes carry on by themselves;
   // a deployment or a dial that changed since is said, never papered over.
@@ -872,7 +884,7 @@ export async function advance(input: {
   const primitive = primitiveById(summary.primitive)
   if (!primitive) return { state: summary.state, message: 'This change was made by a primitive this deployment does not have.' }
   const d = refOf(summary)
-  const exec = executionEnabled()
+  const exec = executionEnabled(projectId)
 
   // The end of "before": captured once, immediately before the first rung
   // that could change anything.
@@ -1053,11 +1065,11 @@ export async function resume(input: { projectId: string; decisionId: string; use
     return { ok: false, status: 409, error: 'This change is not stopped.' }
   }
   // Never "Resumed." when nothing can run: consent stays as it was.
-  if (!executionEnabled().enabled) {
+  if (!executionEnabled(projectId).enabled) {
     return {
       ok: false,
       status: 409,
-      error: "Backenly isn't running architecture changes in this deployment right now, so this one can't carry on yet. Your app works as before, and undo is still available.",
+      error: `${runs.why?.replace(/\.$/, '') ?? "Backenly isn't running architecture changes right now"}, so this one can't carry on yet. Your app works as before, and undo is still available.`,
     }
   }
 
@@ -1450,7 +1462,11 @@ export async function sweepArchitecture(input: { projectId: string; now?: Date; 
   }
   for (const d of decisions.filter(x => x.state === 'stable')) await longHorizon(projectId, d, now, input.policy ?? DEFAULT_POLICY)
 
-  const exec = executionEnabled()
+  // Outside the rollout's list, what already ran is still watched (above,
+  // reads only), but nothing is carried on and nothing new is looked for.
+  if (!evolutionAllowedFor(projectId)) return { projectId, disposition: 'swept', observed, advanced }
+
+  const exec = executionEnabled(projectId)
   const resumable = decisions.filter(x => x.state && ADVANCEABLE.includes(x.state))
   let frozen = false
   if (
@@ -1645,7 +1661,7 @@ export async function architectureSummary(projectId: string, opts: { detail?: bo
     recommendations: p.recommendations ?? [],
     noChange: p.noChange ?? [],
     watching: p.watching ?? 0,
-    execution: executionEnabled(),
+    execution: executionEnabled(projectId),
     analyzedAt: lastPass ? lastPass.at.toISOString() : null,
   }
 }

@@ -33,6 +33,32 @@ import {
   type PlanTraits,
 } from '@/lib/evolution-engine/policy'
 import { observationVerdict, CONSISTENCY_SIGNAL } from '@/lib/evolution-engine/observe'
+import { evolutionAllowedFor } from '@/lib/config/flags'
+
+// ── Rollout list ─────────────────────────────────────────────────────────────
+
+describe('the rollout list', () => {
+  const original = process.env.EVOLUTION_PROJECT_ALLOWLIST
+  afterEach(() => {
+    if (original === undefined) delete process.env.EVOLUTION_PROJECT_ALLOWLIST
+    else process.env.EVOLUTION_PROJECT_ALLOWLIST = original
+  })
+
+  it('covers every project when it is unset or empty', () => {
+    delete process.env.EVOLUTION_PROJECT_ALLOWLIST
+    expect(evolutionAllowedFor('p-1')).toBe(true)
+    process.env.EVOLUTION_PROJECT_ALLOWLIST = ' , '
+    expect(evolutionAllowedFor('p-1')).toBe(true)
+  })
+
+  it('covers only the ids it lists, separated by commas or whitespace, matched whole', () => {
+    process.env.EVOLUTION_PROJECT_ALLOWLIST = 'p-1, p-2\np-3'
+    expect(['p-1', 'p-2', 'p-3'].map(evolutionAllowedFor)).toEqual([true, true, true])
+    expect(evolutionAllowedFor('p-4')).toBe(false)
+    expect(evolutionAllowedFor('p-')).toBe(false)
+    expect(evolutionAllowedFor('p-10')).toBe(false)
+  })
+})
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 

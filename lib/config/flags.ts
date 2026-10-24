@@ -323,6 +323,21 @@ export function isFlagEnabled(name: keyof typeof FLAGS): boolean {
 }
 
 /**
+ * The projects architecture changes may run for while they roll out:
+ * EVOLUTION_PROJECT_ALLOWLIST, project ids separated by commas or whitespace.
+ * Unset or empty, every project.
+ *
+ * It narrows the two evolution flags and never widens them: a listed project
+ * still needs ENABLE_EVOLUTION_MUTATIONS to run a rung, and the scheduler to
+ * carry one on by itself. A project taken off the list keeps what already ran:
+ * its changes are still observed and judged, and undo never checks this list.
+ */
+export function evolutionAllowedFor(projectId: string): boolean {
+  const ids = (process.env.EVOLUTION_PROJECT_ALLOWLIST ?? '').split(/[\s,]+/).filter(Boolean)
+  return ids.length === 0 || ids.includes(projectId)
+}
+
+/**
  * Phase 10 client mirror — `'use client'` components cannot read server flags,
  * so the project page checks `NEXT_PUBLIC_ENABLE_PHASE_10_BUILD_HISTORY` at
  * build time. Set both env vars together for end-to-end activation.

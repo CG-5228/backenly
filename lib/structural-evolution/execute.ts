@@ -23,15 +23,16 @@
  *                                      and the ladder stops until it finishes
  *   tier 3 is never run                `contract` is reached, recorded as a
  *                                      person's to do, and left
- *   mutations are off by default       FLAGS.ENABLE_EVOLUTION_MUTATIONS, ANDed
- *                                      with the caller's wish, never ORed
+ *   mutations are off by default       FLAGS.ENABLE_EVOLUTION_MUTATIONS and the
+ *                                      rollout's project list, ANDed with the
+ *                                      caller's wish, never ORed
  *
  * Rollback is NOT automatic. A failed rung halts the ladder and records why;
  * undoing is a separate decision (./rollback.ts) with its own guard.
  */
 
 import { prisma } from '@/lib/db'
-import { FLAGS } from '@/lib/config/flags'
+import { FLAGS, evolutionAllowedFor } from '@/lib/config/flags'
 import { withMaintenanceSingleFlight } from '@/lib/autonomy/maintenance/single-flight'
 import { readLiveEvolutionApproval } from './consent'
 import { requiredTier, type ExtractionPlan, type ExtractionStep } from './plan'
@@ -71,7 +72,7 @@ const NON_MUTATING: ReadonlyArray<ExtractionStep['kind']> = ['rehearse', 'verify
 export async function executeExtraction(input: {
   projectId: string
   planId: string
-  /** ANDed with FLAGS.ENABLE_EVOLUTION_MUTATIONS. A caller can narrow, never widen. */
+  /** ANDed with FLAGS.ENABLE_EVOLUTION_MUTATIONS and evolutionAllowedFor. A caller can narrow, never widen. */
   mutationsEnabled?: boolean
 }): Promise<ExtractionRunOutcome> {
   const flight = await withMaintenanceSingleFlight(input.projectId, () => runLadder(input))
@@ -94,7 +95,7 @@ async function runLadder(input: {
   mutationsEnabled?: boolean
 }): Promise<ExtractionRunOutcome> {
   const { projectId, planId } = input
-  const mutationsEnabled = (input.mutationsEnabled ?? true) && FLAGS.ENABLE_EVOLUTION_MUTATIONS
+  const mutationsEnabled = (input.mutationsEnabled ?? true) && FLAGS.ENABLE_EVOLUTION_MUTATIONS && evolutionAllowedFor(projectId)
 
   const refuse = async (reason: string, because: StopReason, plan?: ExtractionPlan): Promise<ExtractionRunOutcome> => {
     const executionId = plan ? await openExecution(projectId, plan, 'refused', reason) : null

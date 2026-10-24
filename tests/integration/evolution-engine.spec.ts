@@ -69,6 +69,7 @@ jest.setTimeout(300_000)
 
 const originalMutations = process.env.ENABLE_EVOLUTION_MUTATIONS
 const originalScheduler = process.env.ENABLE_EVOLUTION_SCHEDULER
+const originalAllowlist = process.env.EVOLUTION_PROJECT_ALLOWLIST
 const HOUR = 3_600_000
 
 // A deployment that carries approved changes on by itself, as one that asks
@@ -82,6 +83,8 @@ afterAll(async () => {
   else process.env.ENABLE_EVOLUTION_MUTATIONS = originalMutations
   if (originalScheduler === undefined) delete process.env.ENABLE_EVOLUTION_SCHEDULER
   else process.env.ENABLE_EVOLUTION_SCHEDULER = originalScheduler
+  if (originalAllowlist === undefined) delete process.env.EVOLUTION_PROJECT_ALLOWLIST
+  else process.env.EVOLUTION_PROJECT_ALLOWLIST = originalAllowlist
   await closeMaintenanceLockPool()
 })
 
@@ -538,6 +541,20 @@ describe('the scheduler', () => {
     expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
   })
 
+  it('carries nothing on, and looks for nothing new, for a project that is not on the rollout list', async () => {
+    process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
+    process.env.EVOLUTION_PROJECT_ALLOWLIST = 'another-project'
+    try {
+      const r = await sweepArchitecture({ projectId: f.projectId })
+      expect(r).toMatchObject({ disposition: 'swept', observed: 0, advanced: 0 })
+      expect(r).not.toHaveProperty('proposals')
+      expect((await stateOf(f.projectId, decisionId)).state).toBe('approved')
+      expect(await readTableFacts(workspaceOn(prisma, f.schema), 'order_refunds')).toBeNull()
+    } finally {
+      delete process.env.EVOLUTION_PROJECT_ALLOWLIST
+    }
+  })
+
   it('holds an approved change where it is while the project is mid-incident, and says so', async () => {
     process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
     await incident()
@@ -568,11 +585,13 @@ describe('the scheduler', () => {
 
 describe('asking only for a change that then finishes on its own', () => {
   let f: Fixture
-  const setup = async (o: { mutations: boolean; scheduler: boolean; autonomy?: 'OFF' | 'BALANCED' }) => {
+  const setup = async (o: { mutations: boolean; scheduler: boolean; autonomy?: 'OFF' | 'BALANCED'; allowlist?: string }) => {
     if (o.mutations) process.env.ENABLE_EVOLUTION_MUTATIONS = 'true'
     else delete process.env.ENABLE_EVOLUTION_MUTATIONS
     if (o.scheduler) process.env.ENABLE_EVOLUTION_SCHEDULER = 'true'
     else delete process.env.ENABLE_EVOLUTION_SCHEDULER
+    if (o.allowlist !== undefined) process.env.EVOLUTION_PROJECT_ALLOWLIST = o.allowlist
+    else delete process.env.EVOLUTION_PROJECT_ALLOWLIST
     await prisma.project.update({ where: { id: f.projectId }, data: { autonomyLevel: o.autonomy ?? 'BALANCED' } as any })
   }
 
@@ -588,6 +607,7 @@ describe('asking only for a change that then finishes on its own', () => {
     ['changes are not run here', { mutations: false, scheduler: true }, "Backenly isn't running architecture changes in this deployment right now."],
     ['nothing carries changes on here', { mutations: true, scheduler: false }, "this deployment doesn't carry architecture changes on by itself."],
     ['autonomy is off for the project', { mutations: true, scheduler: true, autonomy: 'OFF' as const }, 'autonomy is off for this project, so Backenly does not carry changes on by itself.'],
+    ['the project is not on the rollout list', { mutations: true, scheduler: true, allowlist: 'another-project' }, "Backenly isn't running architecture changes for this project right now."],
   ])('asks for nothing when %s, and says why', async (_label, o, why) => {
     await setup(o)
     const pass = await proposeChanges(f.projectId)
@@ -637,6 +657,16 @@ describe('asking only for a change that then finishes on its own', () => {
     // Nothing resumes where nothing can run, and it says so instead of "Resumed.".
     const refused = await resume({ projectId: f.projectId, decisionId: req.ev.decisionId, userId: f.ownerId })
     expect(isActionRefusal(refused) && refused.error).toMatch(/^Backenly isn't running architecture changes in this deployment right now, so this one can't carry on yet\./)
+
+    // On, but not for this project yet: the same wait, said for the project.
+    await setup({ mutations: true, scheduler: true, allowlist: 'another-project' })
+    c = await view()
+    expect(c).toMatchObject({ waiting: "Backenly isn't running architecture changes for this project right now.", actions: { pause: false, resume: false } })
+    const refusedHere = await resume({ projectId: f.projectId, decisionId: req.ev.decisionId, userId: f.ownerId })
+    expect(isActionRefusal(refusedHere) && refusedHere.error).toMatch(/^Backenly isn't running architecture changes for this project right now, so this one can't carry on yet\./)
+    // Listed, it runs like any other project.
+    await setup({ mutations: true, scheduler: true, allowlist: `another-project,${f.projectId}` })
+    expect((await view()).status).toMatchObject({ label: 'In progress' })
 
     // Runs here, but nothing carries it on: a person may push it on, and only that.
     await setup({ mutations: true, scheduler: false })
